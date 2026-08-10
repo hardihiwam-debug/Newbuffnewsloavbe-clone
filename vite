@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Root-level wrapper: the Freebuff hosting builder runs "vite build" from the
+# project root but does not have node_modules/.bin on PATH.  Forward to the
+# real vite binary so the build command always resolves.
+exec "$(dirname "$0")/node_modules/.bin/vite" "$@"
