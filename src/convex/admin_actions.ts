@@ -98,6 +98,10 @@ export const refreshBotInfo = action({
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args);
     const me = await telegramCall<{ username?: string; first_name?: string }>("getMe");
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "admin", level: "success",
+      message: `Bot connection test passed (@${me.username ?? "unknown"})`,
+    });
     return { username: me.username ?? null, name: me.first_name ?? null };
   },
 });
@@ -106,7 +110,7 @@ export const refreshBotInfo = action({
 // at runtime via the dashboard without redeploying.
 export const setTranslationModel = action({
   args: { pin: v.optional(v.string()), model: v.string() },
-  handler: async (_ctx, args) => {
+  handler: async (ctx, args) => {
     const fallback = (process.env["ADMIN_PIN"] ?? FALLBACK_OWNER_PIN).trim();
     const supplied = (args.pin ?? "").trim();
     if (!supplied || supplied !== fallback) throw new Error("Unauthorized");
@@ -123,6 +127,10 @@ export const setTranslationModel = action({
     // Persist into the env so subsequent pipeline runs pick it up. The Convex
     // runtime reads from process.env each call.
     process.env["GEMINI_TRANSLATION_MODEL"] = normalized;
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "translation", level: "info",
+      message: `Translation model switched to ${normalized}`,
+    });
     return { ok: true, model: normalized, supported };
   },
 });
@@ -200,6 +208,11 @@ export const syncBotChats = action({
       });
     }
 
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "chat", level: "info",
+      message: `Chat sync ran — ${found.length} chat(s) found`,
+      detail: found.length ? found.map((f: any) => f.title ?? f.username ?? f.chatId).join(", ").slice(0, 240) : undefined,
+    });
     return {
       count: found.length,
       found,
@@ -237,6 +250,9 @@ export const sendTestMessage = action({
       active: true,
       lastSeenAt: new Date().toISOString(),
     });
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "admin", level: "info", message: `Test message sent to chat ${args.chatId}`,
+    });
     return { ok: true, chatId: args.chatId, botUsername: me.username ?? null };
   },
 });
@@ -254,6 +270,11 @@ export const setWebhook = action({
       url: `${args.baseUrl.replace(/\/$/, "")}/telegram/webhook`,
       secret_token: secret,
       allowed_updates: ["message", "edited_message", "channel_post", "my_chat_member"],
+    });
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "admin", level: "info",
+      message: "Telegram webhook registered",
+      detail: `${args.baseUrl.replace(/\/$/, "")}/telegram/webhook`,
     });
     return { ok: true };
   },
@@ -322,6 +343,12 @@ export const testPoll = action({
       closedAt: new Date(Date.now() + openPeriodSec * 1000).toISOString(),
       createdAt: new Date().toISOString(),
     });
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "poll", level: "info",
+      message: `Test poll sent to chat ${args.chatId}: ${generated.question.slice(0, 100)}`,
+      detail: `${lang} · ${generated.options.length} options`,
+      chatId: args.chatId,
+    });
     return {
       ok: true,
       chatId: args.chatId,
@@ -340,6 +367,10 @@ export const runPipeline = action({
     let result: Record<string, any>;
     if (args.action === "ingest") result = (await ctx.runAction(internal.pipeline.ingest, {})) as Record<string, any>;
     else result = (await ctx.runAction(internal.pipeline.publish, { force: 3 })) as Record<string, any>;
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "admin", level: "info",
+      message: args.action === "ingest" ? "Manual ingest triggered from console" : "Manual publish triggered from console",
+    });
     return { result };
   },
 });

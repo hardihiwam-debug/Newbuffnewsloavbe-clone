@@ -70,6 +70,21 @@ http.route({
       lastSeenAt: new Date().toISOString(),
     });
 
+    // Log membership events (bot added/removed) — regular messages aren't
+    // logged here to avoid flooding the activity feed.
+    if (removed || update.my_chat_member) {
+      const { logActivity } = await import("./db");
+      const name = chat.title ?? chat.username ?? String(chat.id);
+      await ctx.runMutation(logActivity, {
+        type: "chat",
+        level: removed ? "warning" : "info",
+        message: removed
+          ? `Bot left or was kicked from ${name}`
+          : `Bot ${update.my_chat_member?.new_chat_member?.status ?? "added"} in ${name}`,
+        chatId: chat.id,
+      });
+    }
+
     return Response.json({ ok: true });
   }) as any,
 });

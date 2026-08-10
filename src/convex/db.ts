@@ -323,6 +323,52 @@ export const logTranslationFailure = internalMutation({
   },
 });
 
+// Unified activity log with retention: entries are auto-deleted once they're
+// older than 48h, and the table is capped at the newest 500 entries so a busy
+// bot can't consume unbounded database storage.
+export const logActivity = internalMutation({
+  args: {
+    type: v.string(),
+    level: v.optional(v.string()),
+    message: v.string(),
+    detail: v.optional(v.string()),
+    chatId: v.optional(v.number()),
+    createdAt: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const createdAt = args.createdAt ?? new Date().toISOString();
+    await ctx.db.insert("activityLog", {
+      type: args.type,
+      level: args.level ?? "info",
+      message: args.message.slice(0, 320),
+      detail: args.detail ? args.detail.slice(0, 600) : undefined,
+      chatId: args.chatId,
+      createdAt,
+    });
+
+    // Retention 1: drop anything older than 48 hours.
+    const cutoff = new Date(Date.now() - 48 * 3_600_000).toISOString();
+    const expired = await ctx.db
+      .query("activityLog")
+      .withIndex("by_createdAt", (q) => q.lt("createdAt", cutoff))
+      .take(500);
+    for (const doc of expired) await ctx.db.delete(doc._id);
+
+    // Retention 2: keep only the newest 500 entries.
+    const newest = await ctx.db
+      .query("activityLog")
+      .withIndex("by_createdAt")
+      .order("desc")
+      .take(501);
+    if (newest.length > 500) {
+      const keep = new Set(newest.slice(0, 500).map((d) => d._id));
+      for (const doc of newest.slice(500)) {
+        await ctx.db.delete(doc._id);
+      }
+    }
+  },
+});
+
 export const claimQueueItems = internalMutation({
   args: { ids: v.array(v.string()) },
   handler: async (ctx, { ids }) => {

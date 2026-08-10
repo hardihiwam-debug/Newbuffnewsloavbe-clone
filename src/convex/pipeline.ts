@@ -84,6 +84,9 @@ export async function runIngest(ctx: any): Promise<Record<string, any>> {
   const settings = (await ctx.runQuery(internal.db.getSettings)) as SettingsDoc | null;
   if (!settings) throw new Error("Settings not found");
   if (isPaused(settings)) {
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "system", level: "warning", message: "Ingest skipped — bot is paused",
+    });
     return { fetched: 0, queued: 0, breaking: 0, errors: ["bot paused"] };
   }
 
@@ -433,7 +436,15 @@ export async function runIngest(ctx: any): Promise<Record<string, any>> {
     });
 
     stats["queued"] += 1;
-    if (breaking) stats["breaking"] += 1;
+    if (breaking) {
+      stats["breaking"] += 1;
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "breaking",
+        level: "warning",
+        message: `Breaking: ${headline.slice(0, 140)}`,
+        detail: `${category} · ${article.sourceName ?? hostname(article.url)}`,
+      });
+    }
     window.unshift({ title: headline, trust, key });
   }
 
@@ -449,8 +460,28 @@ export async function runIngest(ctx: any): Promise<Record<string, any>> {
   // Prune old data
   await ctx.runMutation(internal.db.pruneOldData);
 
+  // Activity log
+  await ctx.runMutation(internal.db.logActivity, {
+    type: "ingest",
+    level: stats["queued"] > 0 ? "success" : "info",
+    message: `Ingest cycle: ${stats["fetched"]} fetched, ${stats["queued"]} queued, ${stats["breaking"]} breaking, ${stats["signals"]} telegram signals`,
+    detail: stats["errors"].length
+      ? `Errors: ${(stats["errors"] as string[]).slice(0, 3).join(" | ")}`
+      : undefined,
+  });
+  for (const err of stats["errors"] as string[]) {
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "ingest",
+      level: "warning",
+      message: `Ingest error: ${String(err).slice(0, 220)}`,
+    });
+  }
+
   // Breaking news bypass
   if (stats["breaking"] > 0) {
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "breaking", level: "success", message: `${stats["breaking"]} breaking item(s) — scheduling instant publish`,
+    });
     await ctx.scheduler.runAfter(0, internal.pipeline.publish, { breakingOnly: true });
   }
 
@@ -545,7 +576,12 @@ export async function runPublish(
 ): Promise<Record<string, any>> {
   const settings = (await ctx.runQuery(internal.db.getSettings)) as SettingsDoc | null;
   if (!settings) throw new Error("Settings not found");
-  if (isPaused(settings)) return { sent: 0, chats: 0, skipped: "bot paused", items: [] };
+  if (isPaused(settings)) {
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "system", level: "warning", message: "Publish skipped — bot is paused",
+    });
+    return { sent: 0, chats: 0, skipped: "bot paused", items: [] };
+  }
 
   const night = isNight(settings);
   const result: any = { sent: 0, chats: 0, skipped: "", items: [] };
@@ -554,11 +590,17 @@ export async function runPublish(
     const next = settings.nextPublishAt ? Date.parse(settings.nextPublishAt) : 0;
     if (next && Date.now() < next) {
       result["skipped"] = "waiting for next scheduled slot";
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "publish", level: "info", message: "Publish cycle skipped — waiting for next scheduled slot",
+      });
       return result;
     }
   }
   if (opts.breakingOnly && night && !settings.breakingInterruptsNight) {
     result["skipped"] = "night quiet window; breaking interrupts disabled";
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "publish", level: "info", message: "Breaking publish skipped — night quiet window",
+    });
     return result;
   }
 
@@ -626,7 +668,13 @@ export async function runPublish(
   }
 
   const items = clusters.map((c) => ({ ...c.lead, _members: c.members }));
-  if (!items.length) { result["skipped"] = "queue empty"; return result; }
+  if (!items.length) {
+    result["skipped"] = "queue empty";
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "publish", level: "info", message: "Publish cycle skipped — queue is empty",
+    });
+    return result;
+  }
 
   const chats = (await ctx.runQuery(internal.db.listAllChats)) as Array<any>;
   const activeChats = chats.filter((c: any) => c.active);
@@ -710,6 +758,12 @@ export async function runPublish(
               modelsTried: translated.modelsTried,
               detail: translated.detail,
               createdAt: new Date().toISOString(),
+            });
+            await ctx.runMutation(internal.db.logActivity, {
+              type: "translation",
+              level: "error",
+              message: `Sorani translation failed: ${item.headline.slice(0, 110)}`,
+              detail: `${(translated.modelsTried ?? []).join(", ")} — ${translated.detail ?? ""}`.slice(0, 280),
             });
           }
         }
@@ -817,6 +871,13 @@ export async function runPublish(
                       : undefined,
                   createdAt: new Date().toISOString(),
                 });
+                await ctx.runMutation(internal.db.logActivity, {
+                  type: "poll",
+                  level: "info",
+                  message: `Poll sent: ${generated.question.slice(0, 110)}`,
+                  detail: `chat ${chat.chatId} · ${pollLang}`,
+                  chatId: Number(chat.chatId),
+                });
               }
             }
           }
@@ -832,6 +893,11 @@ export async function runPublish(
         const msg = err instanceof Error ? err.message : String(err);
         if (/chat not found|bot was kicked|blocked/i.test(msg)) {
           await ctx.runMutation(internal.db.deactivateChat, { id: chat._id });
+          await ctx.runMutation(internal.db.logActivity, {
+            type: "chat",
+            level: "warning",
+            message: `Chat ${chat.chatId} deactivated — bot kicked, blocked, or chat not found`,
+          });
         }
       }
     }
@@ -847,6 +913,14 @@ export async function runPublish(
     result["items"].push(
       memberIds.length > 1 ? `${item.headline} (+${memberIds.length - 1} sources)` : item.headline,
     );
+    if (sentThisItem > 0) {
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "publish",
+        level: "success",
+        message: `Published: ${item.headline.slice(0, 140)}`,
+        detail: `${sentThisItem} chat(s) · ${item.category}${item.breaking ? " · breaking" : ""}`,
+      });
+    }
   }
 
   if (!opts.breakingOnly) {

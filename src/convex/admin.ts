@@ -2,6 +2,7 @@ import { query, mutation } from "./_generated/server";
 import { v } from "convex/values";
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { getNewdataKey, getTelegramToken } from "./secrets";
+import { internal } from "./_generated/api";
 
 const FALLBACK_OWNER_EMAILS = ["akam09890@gmail.com"];
 const FALLBACK_OWNER_PIN = "200006";
@@ -91,11 +92,14 @@ export const getDashboard = query({
       .withIndex("by_createdAt").order("desc").take(50);
     const polls = await ctx.db.query("polls")
       .withIndex("by_createdAt").order("desc").take(100);
+    const recentActivity = await ctx.db.query("activityLog")
+      .withIndex("by_createdAt").order("desc").take(100);
     return {
       settings, isOwner, chats, sources, topics,
       queue: queue.slice(0, 50), history,
       translationFailures: tfails,
       polls,
+      recentActivity,
       botConfigured: Boolean(getTelegramToken()),
       newsdataConfigured: Boolean(getNewdataKey()),
     };
@@ -109,6 +113,10 @@ export const saveSettings = mutation({
     const s = await ctx.db.query("settings").first();
     if (!s) throw new Error("Settings not found");
     await ctx.db.patch(s._id, { ...args.patch, updatedAt: new Date().toISOString() });
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "admin", level: "info", message: "Settings updated",
+      detail: Object.keys(args.patch ?? {}).slice(0, 8).join(", ") || undefined,
+    });
   },
 });
 
@@ -116,12 +124,22 @@ export const updateChat = mutation({
   args: { ...pinArg, id: v.string(), active: v.optional(v.boolean()), language: v.optional(v.union(v.string(), v.null())), pollsEnabled: v.optional(v.union(v.boolean(), v.null())), remove: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args);
-    if (args.remove) { await ctx.db.delete(args.id as any); return; }
+    if (args.remove) {
+      await ctx.db.delete(args.id as any);
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "chat", level: "info", message: "Chat removed from dashboard", detail: args.id,
+      });
+      return;
+    }
     const patch: Record<string, unknown> = {};
     if (args.active !== undefined) patch.active = args.active;
     if (args.language !== undefined) patch.language = args.language || undefined;
     if (args.pollsEnabled !== undefined) patch.pollsEnabled = args.pollsEnabled ?? undefined;
     await ctx.db.patch(args.id as any, patch);
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "chat", level: "info", message: "Chat updated",
+      detail: Object.keys(patch).map((k) => `${k}=${String(patch[k])}`).join(", ") || undefined,
+    });
   },
 });
 
@@ -129,16 +147,31 @@ export const upsertTopic = mutation({
   args: { ...pinArg, id: v.optional(v.string()), query: v.optional(v.string()), category: v.optional(v.string()), enabled: v.optional(v.boolean()), remove: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args);
-    if (args.remove && args.id) { await ctx.db.delete(args.id as any); return; }
+    if (args.remove && args.id) {
+      await ctx.db.delete(args.id as any);
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "admin", level: "info", message: `Topic removed: ${args.query ?? args.id}`,
+      });
+      return;
+    }
     if (args.id) {
       const patch: Record<string, unknown> = {};
       if (args.enabled !== undefined) patch.enabled = args.enabled;
       if (args.query) patch.query = args.query;
       if (args.category) patch.category = args.category;
       await ctx.db.patch(args.id as any, patch);
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "admin", level: "info",
+        message: args.enabled !== undefined
+          ? `Topic ${args.enabled ? "enabled" : "disabled"}: ${args.query ?? ""}`
+          : `Topic updated: ${args.query ?? args.id}`,
+      });
     } else if (args.query) {
       await ctx.db.insert("topicQueries", {
         query: args.query, category: args.category ?? "iran", enabled: true, createdAt: new Date().toISOString(),
+      });
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "admin", level: "info", message: `Topic added: ${args.query}`, detail: args.category ?? "iran",
       });
     }
   },
@@ -148,7 +181,13 @@ export const upsertSource = mutation({
   args: { ...pinArg, id: v.optional(v.string()), name: v.optional(v.string()), kind: v.optional(v.string()), secretRef: v.optional(v.union(v.string(), v.null())), priority: v.optional(v.number()), enabled: v.optional(v.boolean()), remove: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args);
-    if (args.remove && args.id) { await ctx.db.delete(args.id as any); return; }
+    if (args.remove && args.id) {
+      await ctx.db.delete(args.id as any);
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "admin", level: "info", message: `Provider removed: ${args.name ?? args.id}`,
+      });
+      return;
+    }
     if (args.id) {
       const patch: Record<string, unknown> = {};
       if (args.enabled !== undefined) patch.enabled = args.enabled;
@@ -157,11 +196,20 @@ export const upsertSource = mutation({
       if (args.secretRef !== undefined) patch.secretRef = args.secretRef || undefined;
       if (args.priority !== undefined) patch.priority = args.priority;
       await ctx.db.patch(args.id as any, patch);
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "admin", level: "info",
+        message: args.enabled !== undefined
+          ? `Provider ${args.enabled ? "enabled" : "disabled"}: ${args.name ?? args.id}`
+          : `Provider updated: ${args.name ?? args.id}`,
+      });
     } else if (args.name && args.kind) {
       await ctx.db.insert("sources", {
         name: args.name, kind: args.kind, secretRef: args.secretRef ?? undefined,
         config: args.kind === "telegram" ? { channel: args.name.replace(/^@/, "").trim() } : {},
         priority: args.priority ?? 100, usedToday: 0, quotaDate: new Date().toISOString().slice(0, 10), enabled: true, createdAt: new Date().toISOString(),
+      });
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "admin", level: "info", message: `Provider added: ${args.name}`, detail: `${args.kind} · priority ${args.priority ?? 100}`,
       });
     }
   },
@@ -176,6 +224,11 @@ export const setPauseState = mutation({
     await ctx.db.patch(s._id, {
       botPaused: args.paused, botPausedReason: args.paused ? (args.reason ?? "Paused by admin") : undefined,
       botPausedAt: args.paused ? new Date().toISOString() : undefined, nextPublishAt: args.paused ? undefined : s.nextPublishAt,
+    });
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "system",
+      level: args.paused ? "warning" : "success",
+      message: args.paused ? `Bot paused${args.reason ? ` — ${args.reason}` : ""}` : "Bot services resumed",
     });
   },
 });
@@ -201,7 +254,13 @@ export const upsertTranslationKey = mutation({
   args: { ...pinArg, id: v.optional(v.string()), provider: v.string(), label: v.string(), apiKey: v.optional(v.string()), model: v.string(), enabled: v.optional(v.boolean()), priority: v.optional(v.number()), remove: v.optional(v.boolean()) },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args);
-    if (args.remove && args.id) { await ctx.db.delete(args.id as any); return; }
+    if (args.remove && args.id) {
+      await ctx.db.delete(args.id as any);
+      await ctx.runMutation(internal.db.logActivity, {
+        type: "translation", level: "info", message: `Translation key removed: ${args.label}`,
+      });
+      return;
+    }
     const row: Record<string, unknown> = {
       provider: args.provider, label: args.label, model: args.model,
       enabled: args.enabled ?? true, priority: args.priority ?? 100, updatedAt: new Date().toISOString(),
@@ -214,5 +273,10 @@ export const upsertTranslationKey = mutation({
         ...row as any, apiKey: args.apiKey.trim(), createdAt: new Date().toISOString(), consecutiveFailures: 0,
       });
     }
+    await ctx.runMutation(internal.db.logActivity, {
+      type: "translation", level: "info",
+      message: args.id ? `Translation key updated: ${args.label}` : `Translation key added: ${args.label}`,
+      detail: `${args.provider} · ${args.model}`,
+    });
   },
 });

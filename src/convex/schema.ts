@@ -139,6 +139,15 @@ const schema = defineSchema({
     updatedAt: v.optional(v.string()),
   }).index("by_provider", ["provider"]),
 
+  activityLog: defineTable({
+    type: v.string(), // ingest | publish | breaking | poll | translation | chat | admin | system
+    level: v.string(), // info | success | warning | error
+    message: v.string(),
+    detail: v.optional(v.string()),
+    chatId: v.optional(v.number()),
+    createdAt: v.string(),
+  }).index("by_createdAt", ["createdAt"]).index("by_type", ["type"]),
+
   polls: defineTable({
     dedupKey: v.string(),
     chatId: v.number(),

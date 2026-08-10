@@ -179,7 +179,7 @@ export async function translateTelegramToEnglish(texts: string[]): Promise<strin
     {
       role: "system",
       content:
-        "Translate Arabic or Persian breaking-news posts into concise professional English. Preserve names, numbers, attribution and factual uncertainty. Remove only labels such as عاجل. Return ONLY a JSON array of strings in the same order. Never summarize away facts.",
+        "Translate Arabic or Persian breaking-news posts into concise professional English. Preserve names, numbers, attribution and factual uncertainty. Remove only labels such as عاجل. Never summarize away facts. Return ONLY a JSON object mapping each item's index to its translation, e.g. {\"1\": \"translation one\", \"2\": \"translation two\"}.",
     },
     { role: "user", content: JSON.stringify(texts) },
   ];
@@ -189,11 +189,12 @@ export async function translateTelegramToEnglish(texts: string[]): Promise<strin
   } catch {
     raw = await openrouterChat(messages, { jsonMode: true, max_tokens: 2000 });
   }
-  const parsed = extractJson(raw);
-  if (!Array.isArray(parsed) || parsed.length !== texts.length) {
+  const parsed = coerceArray(extractJson(raw));
+  if (!parsed) {
     throw new Error("Telegram translation shape mismatch");
   }
-  return parsed.map((value) => String(value).trim());
+  // Salvage truncated responses: missing entries fall back to the original.
+  return texts.map((text, index) => String(parsed[index] ?? text).trim());
 }
 
 function extractJson(text: string): unknown {
@@ -214,6 +215,35 @@ function extractJson(text: string): unknown {
     }
   }
   throw new Error("No parseable JSON in model output");
+}
+
+// Coerce arbitrary model JSON into an order-aligned array. JSON-object mode
+// (Groq/OpenRouter response_format) makes models ignore "return an array", so
+// we accept whatever they actually return:
+//   1) a plain array                       → as-is
+//   2) an object wrapping an array         → {"items": [...]} → the array
+//   3) a single object item                → {"headline":..., "summary":...}
+//   4) a keyed object of items             → {"1": {...}, "2": {...}}
+// Returns null when nothing usable is found.
+function coerceArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    // (3) single structured item
+    if (typeof obj.headline === "string" || typeof obj.summary === "string" || typeof obj.question === "string") {
+      return [obj];
+    }
+    // (2) first array value anywhere in the object
+    for (const v of Object.values(obj)) {
+      if (Array.isArray(v)) return v;
+    }
+    // (4) keyed object: values that are all objects or all strings
+    const values = Object.values(obj).filter((v) => v !== null && v !== undefined);
+    if (values.length > 0 && values.every((v) => typeof v === "object" || typeof v === "string")) {
+      return values as unknown[];
+    }
+  }
+  return null;
 }
 
 const CATEGORY_GUIDE = `
@@ -258,8 +288,8 @@ export async function classifyBatch(
 
   let parsed: unknown[];
   try {
-    const json = extractJson(raw);
-    if (!Array.isArray(json)) throw new Error("classification not an array");
+    const json = coerceArray(extractJson(raw));
+    if (!json) throw new Error("classification not an array");
     parsed = json;
   } catch {
     const labels = raw.toLowerCase().match(/\b(?:middle-east|economic-impact|iraq|analysis|war|iran|proxies|usa|oil|gold|none)\b/g) ?? [];
@@ -306,7 +336,7 @@ async function runRewrite(items: Array<{
   const messages = [
     {
       role: "system",
-      content: `You are a wire editor for an Iraqi, Muslim, pro-Iran regional news channel. Return ONLY a JSON array with one {"headline": string, "summary": string} object per input, in order.
+      content: `You are a wire editor for an Iraqi, Muslim, pro-Iran regional news channel. Return ONLY a JSON object mapping each item's number to its rewrite, one {"headline": string, "summary": string} per input, e.g. {"1": {"headline": "...", "summary": "..."}, "2": {"headline": "...", "summary": "..."}}.
 Headline: factual, under 110 characters, no clickbait or feed labels.
 Summary: 2-3 complete standalone sentences, ending normally; include who did what, where, and why it matters. Never end with an ellipsis or an unfinished clause. Attribute disputed claims. Do not add facts. Do not adopt hostile or demoralising framing about Iran. Professional English only.`,
     },
@@ -331,16 +361,18 @@ Summary: 2-3 complete standalone sentences, ending normally; include who did wha
       raw = await chat("google/gemini-2.5-flash", messages, { max_tokens: 4000 });
     }
   }
-  const parsed = extractJson(raw);
-  if (!Array.isArray(parsed) || parsed.length !== items.length) {
+  const parsed = coerceArray(extractJson(raw));
+  if (!parsed) {
     throw new Error(
-      `rewrite batch shape mismatch (expected ${items.length} items, got ${Array.isArray(parsed) ? parsed.length : "non-array"})`,
+      `rewrite batch shape mismatch (expected ${items.length} items, got unusable output)`,
     );
   }
-  return parsed.map((value, index) => {
-    const row = value as { headline?: string; summary?: string };
-    const fallback = items[index];
-    let summary = String(row.summary ?? fallback?.description ?? "").trim();
+  // Salvage truncated output: entries are order-aligned, so anything missing
+  // at the tail falls back to the original title/description instead of
+  // rejecting the whole batch (which used to empty the queue every cycle).
+  return items.map((item, index) => {
+    const row = (parsed[index] ?? {}) as { headline?: string; summary?: string };
+    let summary = String(row.summary ?? item?.description ?? "").trim();
     if (/(\.\.\.|…)$/.test(summary)) {
       const withoutEllipsis = summary.replace(/(\.\.\.|…)$/, "").trim();
       const lastCompleteSentence = withoutEllipsis.match(/^([\s\S]*[.!?])\s+[^.!?]*$/)?.[1];
@@ -348,7 +380,7 @@ Summary: 2-3 complete standalone sentences, ending normally; include who did wha
     }
     if (!/[.!?]$/.test(summary) && summary.length > 0) summary += ".";
     return {
-      headline: String(row.headline ?? fallback?.title ?? "").trim(),
+      headline: String(row.headline ?? item?.title ?? "").trim(),
       summary,
     };
   });

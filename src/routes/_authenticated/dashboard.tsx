@@ -175,6 +175,7 @@ function Dashboard() {
           <TabsTrigger value="sources">Sources &amp; topics</TabsTrigger>
           <TabsTrigger value="translation">Translation</TabsTrigger>
           <TabsTrigger value="polls">Polls</TabsTrigger>
+          <TabsTrigger value="activity">Activity</TabsTrigger>
         </TabsList>
 
         {/* QUEUE */}
@@ -461,6 +462,13 @@ function Dashboard() {
             </div>
             <TestPollSender onSend={(chatId) => testPoll({ ...pinArgs, chatId }).then((r: any) => toast.success(`Poll sent: ${r.question}`)).catch(onError)} />
           </Panel>
+        {/* ACTIVITY */}
+        <TabsContent value="activity" className="mt-4">
+          <Panel title="Recent activity" hint="Every pipeline event, admin action, chat change, and error. Auto-pruned: entries older than 48 hours are deleted, and only the newest 500 are kept.">
+            <ActivityFeed items={data.recentActivity ?? []} />
+          </Panel>
+        </TabsContent>
+
           <Panel title="Recent polls" hint="Telegram keeps vote counts — refresh to see updates.">
             {((data as any).polls ?? []).length === 0 ? (
               <p className="text-sm text-muted-foreground">No polls yet. Hit &ldquo;Send poll&rdquo; above to send one now.</p>
@@ -681,6 +689,87 @@ function AddTopic({ onAdd }: { onAdd: (v: { query: string; category: string }) =
         {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
       </select>
       <Button size="sm" variant="secondary" onClick={() => { if (query.trim()) { onAdd({ query: query.trim(), category }); setQuery(""); } }}>Add topic</Button>
+    </div>
+  );
+}
+
+const ACTIVITY_TYPES = [
+  { value: "all", label: "All" },
+  { value: "ingest", label: "🔄 Ingest" },
+  { value: "publish", label: "📨 Publish" },
+  { value: "breaking", label: "🚨 Breaking" },
+  { value: "poll", label: "📊 Poll" },
+  { value: "translation", label: "🌐 Translation" },
+  { value: "chat", label: "💬 Chat" },
+  { value: "admin", label: "🛠 Admin" },
+  { value: "system", label: "⚙️ System" },
+];
+
+const ACTIVITY_TYPE_VARIANT: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
+  breaking: "destructive",
+  publish: "default",
+  ingest: "secondary",
+  poll: "secondary",
+  translation: "outline",
+  chat: "outline",
+  admin: "outline",
+  system: "outline",
+};
+
+const ACTIVITY_LEVEL_DOT: Record<string, string> = {
+  success: "bg-emerald-500",
+  warning: "bg-amber-500",
+  error: "bg-red-500",
+  info: "bg-slate-400",
+};
+
+function timeAgo(iso: string): string {
+  const ms = Date.now() - Date.parse(iso);
+  if (Number.isNaN(ms) || ms < 0) return "";
+  const m = Math.floor(ms / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function ActivityFeed({ items }: { items: any[] }) {
+  const [filter, setFilter] = useState("all");
+  const shown = filter === "all" ? items : items.filter((a) => a.type === filter);
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-2">
+        {ACTIVITY_TYPES.map((t) => (
+          <Button key={t.value} size="sm" variant={filter === t.value ? "default" : "secondary"} onClick={() => setFilter(t.value)}>
+            {t.label}
+          </Button>
+        ))}
+      </div>
+      {shown.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          No activity yet{filter !== "all" ? ` for “${filter}”` : ""}. Events appear here as the bot fetches, publishes, and runs.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {shown.map((a: any) => (
+            <li key={a._id} className="rounded-md border border-border p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className={`h-2 w-2 shrink-0 rounded-full ${ACTIVITY_LEVEL_DOT[a.level] ?? ACTIVITY_LEVEL_DOT.info}`} />
+                <Badge variant={ACTIVITY_TYPE_VARIANT[a.type] ?? "outline"}>{a.type}</Badge>
+                <span className="min-w-0 flex-1 text-sm font-medium">{a.message}</span>
+                <span className="shrink-0 text-xs text-muted-foreground" title={new Date(a.createdAt).toLocaleString()}>
+                  {timeAgo(a.createdAt)}
+                </span>
+              </div>
+              {a.detail ? <p className="mt-1 pl-4 text-xs text-muted-foreground">{a.detail}</p> : null}
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-xs text-muted-foreground">
+        Auto-retention: entries older than 48 hours are deleted, and the log is capped at the newest 500 events.
+      </p>
     </div>
   );
 }
