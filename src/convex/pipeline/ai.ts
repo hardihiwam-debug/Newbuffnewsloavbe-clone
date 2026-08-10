@@ -185,9 +185,9 @@ export async function translateTelegramToEnglish(texts: string[]): Promise<strin
   ];
   let raw: string;
   try {
-    raw = await groqChat(messages, { jsonMode: true, max_tokens: 600 });
+    raw = await groqChat(messages, { jsonMode: true, max_tokens: 2000 });
   } catch {
-    raw = await openrouterChat(messages, { jsonMode: true, max_tokens: 600 });
+    raw = await openrouterChat(messages, { jsonMode: true, max_tokens: 2000 });
   }
   const parsed = extractJson(raw);
   if (!Array.isArray(parsed) || parsed.length !== texts.length) {
@@ -200,8 +200,20 @@ function extractJson(text: string): unknown {
   const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
   const start = cleaned.search(/[[{]/);
   if (start === -1) throw new Error("No JSON in model output");
-  const end = Math.max(cleaned.lastIndexOf("]"), cleaned.lastIndexOf("}"));
-  return JSON.parse(cleaned.slice(start, end + 1));
+  // Find the true end of the JSON value: walk from the last occurrence and
+  // validate it parses; if the tail contains trailing prose, trim it off.
+  let end = Math.max(cleaned.lastIndexOf("]"), cleaned.lastIndexOf("}"));
+  while (end > start) {
+    const candidate = cleaned.slice(start, end + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // The last } / ] may be inside trailing prose — step back to the next one.
+      const before = cleaned.slice(start, end);
+      end = Math.max(before.lastIndexOf("]"), before.lastIndexOf("}"));
+    }
+  }
+  throw new Error("No parseable JSON in model output");
 }
 
 const CATEGORY_GUIDE = `
@@ -307,18 +319,24 @@ Summary: 2-3 complete standalone sentences, ending normally; include who did wha
     },
   ];
   // Prefer Groq for speed, then OpenRouter (verified working), then Gemini.
+  // max_tokens is high (4000): a 10-item batch of headline+summary objects
+  // easily exceeds 700 tokens, and truncated JSON fails the shape check.
   let raw: string;
   try {
-    raw = getGroqKey() ? await groqChat(messages, { jsonMode: true, max_tokens: 700 }) : await openrouterChat(messages, { jsonMode: true, max_tokens: 700 });
+    raw = getGroqKey() ? await groqChat(messages, { jsonMode: true, max_tokens: 4000 }) : await openrouterChat(messages, { jsonMode: true, max_tokens: 4000 });
   } catch {
     try {
-      raw = await openrouterChat(messages, { jsonMode: true, max_tokens: 700 });
+      raw = await openrouterChat(messages, { jsonMode: true, max_tokens: 4000 });
     } catch {
-      raw = await chat("google/gemini-2.5-flash", messages, { max_tokens: 700 });
+      raw = await chat("google/gemini-2.5-flash", messages, { max_tokens: 4000 });
     }
   }
   const parsed = extractJson(raw);
-  if (!Array.isArray(parsed) || parsed.length !== items.length) throw new Error("rewrite batch shape mismatch");
+  if (!Array.isArray(parsed) || parsed.length !== items.length) {
+    throw new Error(
+      `rewrite batch shape mismatch (expected ${items.length} items, got ${Array.isArray(parsed) ? parsed.length : "non-array"})`,
+    );
+  }
   return parsed.map((value, index) => {
     const row = value as { headline?: string; summary?: string };
     const fallback = items[index];

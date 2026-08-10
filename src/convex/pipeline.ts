@@ -285,8 +285,11 @@ export async function runIngest(ctx: any): Promise<Record<string, any>> {
   let categories: Array<Category | null> = [];
   let rewritten: Array<{ headline: string; summary: string }> = [];
   if (fresh.length) {
-    for (let offset = 0; offset < fresh.length; offset += 40) {
-      const batch = fresh.slice(offset, offset + 40);
+    // Small batches: LLMs truncate JSON output on long prompts (max_tokens
+    // caps), and a truncated array makes the whole batch fail the shape check.
+    // 10 items keeps output well under the token cap.
+    for (let offset = 0; offset < fresh.length; offset += 10) {
+      const batch = fresh.slice(offset, offset + 10);
       try {
         categories.push(...await classifyBatch(
           batch.map((s) => ({ title: s.article.title, description: s.article.description })),
