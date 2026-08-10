@@ -404,6 +404,25 @@ function Dashboard() {
               onSave={(model) => setTranslationModel({ ...(pinArgs as any), model }).then((r: any) => toast.success(`Switched translation model to ${r.model}`)).catch(onError)}
             />
           </Panel>
+          <Panel title="Translation history" hint="Every successful English → Kurdish Sorani translation, with the model that produced it.">
+            {((data as any).translationHistory ?? []).length === 0 ? (
+              <p className="text-sm text-muted-foreground">No translations yet. Kurdish Sorani translations appear here after the bot publishes to a Kurdish-configured chat.</p>
+            ) : (
+              <ul className="space-y-3 text-sm">
+                {((data as any).translationHistory).map((t: any) => (
+                  <li key={t._id} className="rounded-md border border-border p-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="default">{t.model}</Badge>
+                      {t.chatId ? <span className="text-xs text-muted-foreground">chat {String(t.chatId)}</span> : null}
+                      <span className="text-xs text-muted-foreground">· {new Date(t.createdAt).toLocaleString()}</span>
+                    </div>
+                    <p className="mt-2 font-medium text-muted-foreground">{t.englishText.slice(0, 200)}</p>
+                    <p className="mt-1 text-base leading-relaxed">{t.kurdishText.slice(0, 300)}</p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Panel>
           <Panel title="Translation failures" hint="Every configured provider/key failed or returned invalid Sorani.">
             {(data.translationFailures ?? []).length === 0 ? (
               <p className="text-sm text-muted-foreground">No failures logged.</p>

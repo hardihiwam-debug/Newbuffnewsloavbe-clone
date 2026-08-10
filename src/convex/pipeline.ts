@@ -747,6 +747,15 @@ export async function runPublish(
               headline: h ?? headline,
               summary: rest.join("\n\n") || summary,
             });
+            // Log successful translation for the history dashboard.
+            await ctx.runMutation(internal.db.logTranslationSuccess, {
+              englishText: `${headline}\n\n${summary}`,
+              kurdishText: translated.text,
+              model: translated.modelsTried[0] ?? "unknown",
+              chatId: chat.chatId,
+              dedupKey: item.dedupKey,
+              createdAt: new Date().toISOString(),
+            });
           } else {
             // Translation failed — cache null so we fall through to English
             // instead of retrying on every chat. The news still gets delivered.

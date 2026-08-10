@@ -148,6 +148,15 @@ const schema = defineSchema({
     createdAt: v.string(),
   }).index("by_createdAt", ["createdAt"]).index("by_type", ["type"]),
 
+  translationHistory: defineTable({
+    englishText: v.string(),
+    kurdishText: v.string(),
+    model: v.string(),
+    chatId: v.optional(v.number()),
+    dedupKey: v.optional(v.string()),
+    createdAt: v.string(),
+  }).index("by_createdAt", ["createdAt"]),
+
   polls: defineTable({
     dedupKey: v.string(),
     chatId: v.number(),

@@ -94,10 +94,13 @@ export const getDashboard = query({
       .withIndex("by_createdAt").order("desc").take(100);
     const recentActivity = await ctx.db.query("activityLog")
       .withIndex("by_createdAt").order("desc").take(100);
+    const translationHistory = await ctx.db.query("translationHistory")
+      .withIndex("by_createdAt").order("desc").take(50);
     return {
       settings, isOwner, chats, sources, topics,
       queue: queue.slice(0, 50), history,
       translationFailures: tfails,
+      translationHistory,
       polls,
       recentActivity,
       botConfigured: Boolean(getTelegramToken()),

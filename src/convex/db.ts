@@ -323,6 +323,39 @@ export const logTranslationFailure = internalMutation({
   },
 });
 
+export const logTranslationSuccess = internalMutation({
+  args: {
+    englishText: v.string(),
+    kurdishText: v.string(),
+    model: v.string(),
+    chatId: v.optional(v.number()),
+    dedupKey: v.optional(v.string()),
+    createdAt: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("translationHistory", {
+      englishText: args.englishText.slice(0, 2000),
+      kurdishText: args.kurdishText.slice(0, 2000),
+      model: args.model,
+      chatId: args.chatId,
+      dedupKey: args.dedupKey,
+      createdAt: args.createdAt ?? new Date().toISOString(),
+    });
+
+    // Keep only the newest 200 entries to prevent unbounded growth.
+    const newest = await ctx.db
+      .query("translationHistory")
+      .withIndex("by_createdAt")
+      .order("desc")
+      .take(201);
+    if (newest.length > 200) {
+      for (const doc of newest.slice(200)) {
+        await ctx.db.delete(doc._id);
+      }
+    }
+  },
+});
+
 // Unified activity log with retention: entries are auto-deleted once they're
 // older than 48h, and the table is capped at the newest 500 entries so a busy
 // bot can't consume unbounded database storage.
