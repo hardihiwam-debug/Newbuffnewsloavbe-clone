@@ -4,7 +4,7 @@
   "sideEffects": false,
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
+    "dev": "sh ./scripts/dev.sh",
     "build": "./node_modules/.bin/vite build",
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
