@@ -1,9 +1,11 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
+import { adminApi } from "@/lib/adminApi";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
+import { AdminError } from "@/lib/adminApi";
 
 const PIN_STORAGE_KEY = "freebuff_admin_pin";
 
@@ -38,13 +40,26 @@ function SignIn() {
     e.preventDefault();
     setBusy(true);
     try {
-      // The PIN is verified server-side on every dashboard query/mutation.
-      // Store it locally so the dashboard hooks can pass it through.
+      // Verify the PIN against the Supabase admin edge function BEFORE
+      // storing anything locally. A wrong PIN used to sail through and
+      // leave the dashboard stuck on "Loading console…" — now it's
+      // rejected right here on the form.
+      await adminApi.verifyPin({ pin: pin.trim() });
       localStorage.setItem(PIN_STORAGE_KEY, pin.trim());
       toast.success("PIN accepted. Opening console…");
       navigate({ to: "/dashboard" });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Sign-in failed");
+      const msg =
+        err instanceof AdminError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "";
+      if (/pin/i.test(msg)) {
+        toast.error("Incorrect PIN — try again");
+      } else {
+        toast.error(msg || "Sign-in failed — is the Supabase backend reachable?");
+      }
     } finally {
       setBusy(false);
     }

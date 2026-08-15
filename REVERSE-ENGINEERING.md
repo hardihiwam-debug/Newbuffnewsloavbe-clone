@@ -1,1408 +1,278 @@
-# Lodev News Bot — Reverse Engineering & Rebuild Specification
+# Reverse Engineering — Current Architecture (2026-08)
 
-This document is the authoritative implementation specification for rebuilding,
-deploying, or repairing the Lodev News Bot.
-
-The application is a private, single-admin operations console for an automated
-Telegram news bot covering Iran–U.S. developments, Iraq, the wider Middle East,
-Iran-aligned armed groups, and related oil/gold market reactions.
-
-**Important:** this document is an implementation specification, not a promise
-that a hosting provider can be remotely powered off by browser code. The
-application can provide a global emergency stop for all bot/application
-workflows. Actually stopping the Vercel/Lovable/Supabase hosting services
-themselves requires the corresponding provider controls/API and must not be
-faked as an in-app feature.
+This document describes how the Iran Desk Bot actually works today. The
+backend was migrated off Convex to **Supabase** (Postgres + Edge Functions).
+Any note referencing Convex, a local dev backend, or a `/convex` proxy is
+obsolete and should be ignored.
 
 ---
 
-## 1. Current architecture
-
-| Layer | Current technology |
-|---|---|
-| Frontend/server framework | TanStack Start v1, React 19, Vite 7 |
-| Styling | Tailwind CSS v4 |
-| Database/auth | Supabase Postgres + Auth + RLS |
-| Scheduled jobs | Supabase `pg_cron` + `pg_net` calling public cron routes |
-| AI | Existing classifier/rewrite providers + Vercel AI Gateway for the required MiniMax M3 translation path |
-| Messaging | Telegram Bot API |
-| News | NewsData.io + Bing News RSS + direct publisher RSS feeds + monitored public Telegram channels |
-| Deployment target | Must remain portable to a new Lovable/Supabase project or another supported host |
-
-The application has no public news website. The web UI is an admin console.
-
----
-
-# 2. CRITICAL SECURITY REQUIREMENTS
-
-## 2.1 Never commit AI/API secrets
-
-The Vercel AI Gateway key supplied during development must **not** be written
-into source files, Markdown, Git history, database rows, browser code, or the
-ZIP archive.
-
-Use:
-
-```text
-AI_GATEWAY_API_KEY=<server-side secret>
-```
-
-Only server-side code may read it.
-
-If an API key has already been pasted into chat, committed to Git, or exposed in
-a public repository, treat it as compromised and rotate/revoke it before
-production deployment.
-
-Never expose `AI_GATEWAY_API_KEY` as `VITE_*`.
-
-## 2.2 Portable environment configuration
-
-Use environment variables rather than hard-coded project identifiers.
-
-Required/optional server variables should be documented in `.env.example`:
-
-```text
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-SUPABASE_PUBLISHABLE_KEY=
-SUPABASE_PROJECT_ID=
-
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_WEBHOOK_SECRET=
-
-NEWSDATA_API_KEY=
-
-AI_GATEWAY_API_KEY=
-AI_GATEWAY_MODEL=minimax/minimax-m3
-
-OWNER_EMAIL=
-OWNER_BOOTSTRAP_SECRET=
-```
-
-Do not copy real secrets into `.env.example`.
-
----
-
-# 3. OWNER / DEPLOYMENT ACCESS BUG — FIX THIS
-
-## Current problem
-
-The current database uses a "first signed-up user becomes admin" trigger.
-
-That is fragile when:
-
-- the original Supabase project is recreated;
-- an existing account is imported;
-- the owner signs in after another account already exists;
-- the project is moved to another Supabase instance;
-- the owner changes email;
-- the Auth database and application database are restored separately.
-
-Being the GitHub/Lovable/Vercel project owner does **not automatically make the
-Supabase Auth user an application admin**.
-
-This is the likely reason an owner can still receive `Forbidden: not an admin`
-and therefore cannot run ingest/publish.
-
-## Required fix
-
-Replace the brittle "first user only" assumption with an explicit owner
-bootstrap mechanism.
-
-Recommended behavior:
-
-1. `OWNER_EMAIL` is configured server-side.
-2. On authenticated server requests, resolve the current Supabase Auth user.
-3. If the authenticated user's email exactly matches `OWNER_EMAIL`, ensure that
-   user's UUID exists in `admin_users`.
-4. Do not grant admin access based on GitHub username, browser state, or a
-   client-side flag.
-5. Optionally support a one-time `OWNER_BOOTSTRAP_SECRET` for a fresh database.
-6. The bootstrap secret must:
-   - work only once;
-   - be server-side only;
-   - never be returned to the browser;
-   - be invalidated after successful claim.
-7. Keep all normal admin RLS policies based on `is_admin(auth.uid())`.
-8. Provide a visible admin status diagnostic showing:
-   - signed-in email;
-   - current user UUID;
-   - `is_admin` result;
-   - owner-email match;
-   - database project ID.
-9. Never silently give admin to arbitrary authenticated users.
-
-### Rebuild-safe admin flow
-
-For a fresh deployment:
-
-```text
-Create Supabase project
-        ↓
-Run migrations
-        ↓
-Configure OWNER_EMAIL
-        ↓
-Create/sign in owner Auth account
-        ↓
-Server ensures owner UUID exists in admin_users
-        ↓
-Owner can access dashboard and run pipeline
-```
-
-This must work even if the owner is not the first Auth user.
-
----
-
-# 4. GLOBAL STOP / EMERGENCY SHUTDOWN
-
-Add a prominent red **STOP ALL** button to the admin dashboard.
-
-This is a global application kill switch.
-
-## STOP ALL must stop
-
-- scheduled ingest;
-- scheduled publishing;
-- manual "Fetch now";
-- manual "Publish";
-- Telegram webhook processing that would mutate/process bot work;
-- AI translation/classification/rewrite work started after the stop;
-- queue claims;
-- new Telegram sends;
-- new background pipeline actions.
-
-## Database setting
-
-Add to `settings`:
-
-```text
-system_paused boolean NOT NULL DEFAULT false
-system_pause_reason text
-system_paused_at timestamptz
-system_paused_by uuid
-```
-
-Every entry point must check this flag.
-
-Required checks:
-
-```text
-/api/public/cron/ingest
-/api/public/cron/publish
-/api/public/telegram/webhook
-runIngest()
-runPublish()
-manual admin pipeline actions
-```
-
-The check must happen before expensive work.
-
-## In-flight jobs
-
-STOP ALL cannot reliably terminate a server process that is already inside an
-external HTTP request. Therefore:
-
-- check the pause flag between pipeline stages;
-- check it before every AI request;
-- check it before every Telegram send;
-- check it before queue claim;
-- check it before final database commit.
-
-If paused, safely return:
-
-```text
-stopped_by_admin
-```
-
-and do not continue.
-
-Any queue item already in `publishing` must be safely returned to `queued`
-unless a Telegram delivery has definitely succeeded.
-
-## UI
-
-The dashboard header must show:
-
-```text
-● RUNNING
-```
-
-or:
-
-```text
-■ STOPPED
-```
-
-When stopped:
-
-- disable Fetch now;
-- disable Publish;
-- disable automatic processing;
-- show the reason/time;
-- show a **RESUME SERVICES** button.
-
-STOP ALL should require confirmation because it is destructive to automation.
-
-## Do not pretend to stop hosting
-
-The button must **not** claim it shut down Vercel, Supabase, or the website
-server itself.
-
-It stops Lodev's application services/workflows.
-
-Actually deleting/stopping hosting infrastructure belongs to the hosting
-provider's dashboard/API.
-
----
-
-# 5. QUEUE STATUS — STANDARDIZE
-
-The queue schema and documentation must use one status vocabulary.
-
-Use:
-
-```text
-queued
-publishing
-published
-duplicate
-expired
-rejected-language
-rejected-policy
-```
-
-Do **not** use `sent` as a queue status.
-
-When delivery succeeds:
-
-```text
-queue.status = 'published'
-```
-
-`published_history` is the delivery ledger.
-
-Any code/documentation saying:
-
-```text
-queue.status = 'sent'
-```
-
-must be removed.
-
----
-
-# 6. EVENT-LEVEL DEDUPLICATION
-
-Headline/token similarity alone is insufficient.
-
-The same event can be described very differently by Reuters, AP, Iranian
-media, Israeli media, Telegram channels, and local outlets.
-
-Build an event fingerprint from normalized structured facts:
-
-```text
-people
-countries
-locations
-action
-target
-date/time
-event aliases
-organizations
-weapons/platforms
-```
-
-Example:
-
-```text
-Iran launches missiles at Israel
-Iran confirms another missile wave
-Iranian missiles target Israeli territory
-```
-
-These should map to the same event when the underlying event is identical.
-
-## Event fingerprint
-
-Persist an event identity/fingerprint for queue/history records.
-
-Suggested representation:
-
-```json
-{
-  "people": [],
-  "countries": ["Iran", "Israel"],
-  "locations": [],
-  "action": "missile_launch",
-  "target": "Israel",
-  "date_bucket": "2026-08-10",
-  "aliases": ["missile wave", "missile launch", "Iranian strike"]
-}
-```
-
-The exact implementation may use deterministic hashing plus normalized
-semantic fields.
-
----
-
-# 7. EVENT COOLDOWN
-
-Cooldown applies to the **event**, not the headline.
-
-Default:
-
-```text
-72 hours
-```
-
-But make cooldown configurable by event type:
-
-| Event type | Default cooldown |
-|---|---:|
-| Breaking attack | 6h |
-| Leader statement | 12h |
-| Military development | 12h |
-| Diplomatic development | 24h |
-| Economic/market event | 12h |
-| Analysis | 48h |
-
-The cooldown must not blindly suppress meaningful developments.
-
----
-
-# 8. NEW-DEVELOPMENT TEST
-
-A related event is publishable when it contains materially new information.
-
-Examples:
-
-### Duplicate
-
-```text
-Iran launches missiles.
-Iran confirms missile launch.
-```
-
-If they describe the same launch with no material new information:
-reject the second.
-
-### New development
-
-```text
-US intercepts Iranian missiles.
-```
-
-Publish.
-
-```text
-Iran says another wave is imminent.
-```
-
-Publish.
-
-```text
-Casualty count rises from 4 to 12.
-```
-
-Publish/update.
-
-```text
-Israel officially confirms the strike.
-```
-
-Publish if it adds meaningful confirmation.
-
-Before rejecting an event collision, compare the new article's facts with the
-latest published event state.
-
-Store structured new-information reasons where possible:
-
-```text
-new_casualties
-new_location
-new_target
-new_actor
-new_response
-new_confirmation
-new_denial
-new_damage
-new_timing
-new_military_action
-new_statement
-no_material_change
-```
-
----
-
-# 9. TELEGRAM CHANNEL INGESTION
-
-Public Telegram channels are signals/sources, not automatic truth.
-
-The system must:
-
-1. fetch recent posts;
-2. normalize Arabic/Persian text;
-3. translate Arabic/Persian to English before semantic event comparison;
-4. merge rapid same-channel bulletins;
-5. detect the underlying event;
-6. preserve new details;
-7. avoid repeatedly publishing the same claim.
-
-## Attribution
-
-Never convert an attributed claim into a confirmed fact.
-
-Use:
-
-```text
-Iran says...
-Israel says...
-US officials say...
-The Pentagon says...
-According to...
-```
-
-If the claim is unverified, retain the attribution.
-
----
-
-# 10. SOURCE COMPETITION
-
-Do not globally penalize a source because it published several stories.
-
-A source penalty/damping rule must apply only when the source is repeatedly
-covering the **same event**.
-
-Bad behavior:
-
-```text
-Source A publishes 5 unrelated important stories
-→ Source A gets globally penalized
-```
-
-Correct behavior:
-
-```text
-Source A publishes 5 updates about the same event
-→ damp Source A only for that event
-```
-
-High-value sources may still win when they add authoritative new information.
-
----
-
-# 11. STALE-NEWS HANDLING
-
-Do not use one universal freshness window.
-
-Use:
-
-| Category | Freshness |
-|---|---:|
-| Breaking/conflict | 3–6h |
-| Normal news | ~10h |
-| Analysis | ~24h |
-
-The exact value should be configurable.
-
-Never allow an old article to outrank a genuinely new development merely because
-the old source has a higher static score.
-
----
-
-# 12. AI CLASSIFICATION FALLBACK
-
-Regex classification is a fallback only.
-
-If AI classification fails:
-
-- mark classification as fallback;
-- assign lower confidence;
-- do not treat regex output as equivalent to AI semantic classification;
-- prevent weak regex matches from automatically promoting irrelevant stories.
-
-Suggested fields:
-
-```text
-classification_method = ai | fallback_regex
-classification_confidence = 0.0 - 1.0
-```
-
-If confidence is too low, reject or hold for review rather than pollute the
-queue.
-
----
-
-# 13. AI REWRITE QUALITY
-
-Every rewritten story should answer:
-
-```text
-What happened?
-Who did it?
-Where?
-When?
-Why does it matter?
-```
-
-Only include information actually supported by the source.
-
-Never invent:
-
-- casualties;
-- locations;
-- military actions;
-- motivations;
-- official confirmations;
-- dates;
-- quotes.
-
-If the source does not provide enough information, write a shorter factual
-summary instead of filling gaps with speculation.
-
-## Required structure
-
-A good summary should naturally communicate:
-
-```text
-What happened → who/where/when → why it matters
-```
-
----
-
-# 14. CLAIM / FACT SEPARATION
-
-For contested reporting, preserve attribution.
-
-Examples:
-
-```text
-Iran says...
-Israel says...
-US officials say...
-The Pentagon said...
-According to Iranian state media...
-```
-
-Never rewrite:
-
-```text
-Iran says X
-```
-
-as:
-
-```text
-Iran did X
-```
-
-unless independently established by the source material.
-
----
-
-# 15. BREAKING NEWS
-
-Breaking-news logic is independent from normal cadence.
-
-A breaking item may bypass the normal posting interval, but it must still pass:
-
-```text
-junk
-respect
-language
-relevance
-event dedup
-minimum quality
-claim/fact safety
-```
-
-Breaking priority must not be implemented as an absurd numeric score such as
-`+1000`.
-
-Use a priority tier or normalized multiplier.
-
-Example:
-
-```text
-priority tier:
-breaking = 3
-normal = 2
-analysis = 1
-```
-
-Then combine with normalized freshness, source trust, event novelty, and
-category rotation.
-
----
-
-# 16. SCORING
-
-Replace the current arbitrary scoring dominance with normalized components.
-
-Suggested components:
-
-```text
-freshness_score
-source_trust_score
-event_novelty_score
-category_rotation_score
-leader_statement_score
-breaking_priority
-source_event_damping
-market_relevance_score
-```
-
-Breaking should be a priority tier/multiplier rather than a huge additive
-number.
-
----
-
-# 17. MARKET STORY FILTER
-
-Gold and oil must remain connected to monitored geopolitical events.
-
-Allow:
-
-```text
-Gold rises as Iran tensions escalate.
-Oil rises amid Strait of Hormuz disruption.
-```
-
-Reject:
-
-```text
-Generic gold technical analysis.
-Unrelated oil-company earnings.
-Unrelated commodity commentary.
-```
-
-Market stories require an actual connection to the monitored event set.
-
----
-
-# 18. REJECTION REASONS
-
-Do not store only an opaque rejection string.
-
-Use structured reasons such as:
-
-```text
-junk
-non_english
-stale
-duplicate_url
-duplicate_event
-irrelevant
-respect
-low_quality
-market_irrelevant
-ai_failure
-low_confidence
-policy
-translation_failure
-```
-
-Optional human-readable detail may accompany the structured code.
-
-This makes the pipeline debuggable.
-
----
-
-# 19. OBSERVABILITY
-
-Every ingest run should report the funnel:
-
-```text
-fetched
-cleaned
-junk
-respect
-language
-stale
-duplicate_url
-classified
-irrelevant
-duplicate_event
-rewritten
-queued
-```
-
-Every publish run should report:
-
-```text
-eligible
-cadence_blocked
-expired
-duplicate_event
-claimed
-translated
-translation_failed
-sent
-failed
-stopped_by_admin
-```
-
-The dashboard should expose these counters for the latest run.
-
----
-
-# 20. PUBLISHING RACE CONDITIONS
-
-Publishing must be protected against overlapping cron/manual executions.
-
-Use one transactional reservation/claim flow around:
-
-```text
-cadence check
-reservation
-queue claim
-```
-
-Do not rely on separate unprotected reads and writes.
-
-Use row locking/advisory locking or an atomic conditional update.
-
-A second publish invocation must receive:
-
-```text
-already_locked
-```
-
-or safely exit without sending.
-
-Never allow two workers to claim the same queue item.
-
----
-
-# 21. TRANSLATION — MANDATORY MODEL POLICY
-
-## Kurdish Sorani
-
-For Kurdish Sorani translation, use **only MiniMax M3** through Vercel AI
-Gateway.
-
-Model identifier:
-
-```text
-minimax/minimax-m3
-```
-
-Vercel documents this exact model identifier for AI Gateway. MiniMax M3 is
-available through the gateway and supports automatic prompt caching. citeturn1search0turn1search1
-
-### Remove from Sorani translation
-
-Do not use:
-
-```text
-google/gemini-3.6-flash
-Gemini translation fallback
-Groq translation fallback
-another translation model
-```
-
-There must be exactly one Sorani translation model:
-
-```text
-MiniMax M3
-```
-
-If MiniMax fails, do **not** silently switch to another paid model.
-
-The item should remain retryable or follow the configured destination-language
-policy.
-
----
-
-# 22. VERCEL AI GATEWAY / $5 MONTHLY BUDGET
-
-Vercel currently states that free users who have not made a payment receive
-**$5 of AI Gateway credits every 30 days**. AI Gateway routes models through
-one endpoint and supports usage/cost monitoring. citeturn0search0turn0search1
-
-The application must therefore be designed as a strict low-budget system.
-
-## Required environment variable
-
-```text
-AI_GATEWAY_API_KEY
-```
-
-Never expose it to the browser.
-
-## Required gateway endpoint
-
-Use Vercel AI Gateway rather than a direct MiniMax provider credential.
-
-The implementation must keep the model fixed:
-
-```text
-minimax/minimax-m3
-```
-
-Do not allow an arbitrary model string from the browser.
-
----
-
-# 23. MINIMIZE TOKEN CONSUMPTION
-
-The $5 monthly budget is a hard operational constraint.
-
-Translation must be optimized as follows:
-
-### A. Translate only at final delivery
-
-Do NOT translate every fetched article.
-
-Do NOT translate every queued article.
-
-Do NOT translate every candidate.
-
-Only translate the final item that is actually going to a Sorani destination.
-
-### B. Translate once per item
-
-If multiple Sorani chats receive the same item:
-
-```text
-English item
-      ↓
-one MiniMax M3 translation
-      ↓
-reuse exact translated result for all Sorani chats
-```
-
-Do not make one AI request per chat.
-
-### C. Cache translations
-
-Persist:
-
-```text
-dedup_key
-source_hash
-target_language
-model
-translated_headline
-translated_summary
-created_at
-```
-
-If the source text has not changed, reuse the cached translation.
-
-### D. Short prompts
-
-Do not send the entire article, metadata, RSS payload, or previous history.
-
-Send only:
-
-```text
-headline
-summary
-translation instructions
-```
-
-### E. Constrain output
-
-Require:
-
-```text
-Kurdish Sorani only
-Arabic-script Sorani
-headline + summary only
-no explanation
-no notes
-no translation commentary
-```
-
-Use an appropriate low output-token ceiling.
-
-### F. Avoid retries
-
-Do not perform repeated automatic retries that can consume the budget.
-
-Recommended:
-
-```text
-maximum 1 immediate retry
-then queue for later retry
-```
-
-A retry should occur only when there is a transient transport failure, not
-because the model generated an imperfect sentence.
-
-### G. Hard budget guard
-
-Before an AI call, check the application's tracked monthly spend.
-
-When the configured safety limit is reached, stop new translation calls.
-
-Suggested internal guard:
-
-```text
-monthly_ai_budget_usd = 5.00
-monthly_ai_soft_limit_usd = 4.50
-```
-
-The exact provider billing amount remains authoritative, but the application
-should maintain its own conservative counter.
-
----
-
-# 24. SORANI VALIDATION
-
-Sorani output must be validated without rejecting legitimate Latin tokens.
-
-Allowed examples:
-
-```text
-USA
-US
-NATO
-F-35
-X
-URLs
-@handles
-acronyms
-proper names
-```
-
-Validation should check that the natural-language portion is Sorani
-Arabic-script text.
-
-Do not use a simplistic rule such as:
-
-```text
-contains any Latin character → reject
-```
-
-If validation fails:
-
-```text
-translation_failure
-```
-
-and retry according to the single-model retry policy.
-
-Never substitute Gemini or another model.
-
----
-
-# 25. TRANSLATION FAILURE POLICY
-
-If the destination chat requires Sorani:
-
-```text
-MiniMax translation fails
-        ↓
-do not send bad Sorani
-        ↓
-keep item retryable / queued
-        ↓
-log translation failure
-```
-
-English fallback is allowed only if that destination chat is explicitly
-configured to accept English.
-
-Never send English into a Sorani-only destination just because translation
-failed.
-
----
-
-# 26. AI COST ARCHITECTURE
-
-To protect the $5 budget:
-
-```text
-FETCH
-  ↓
-cheap deterministic filters
-  ↓
-URL dedup
-  ↓
-freshness
-  ↓
-relevance
-  ↓
-event similarity
-  ↓
-only then expensive AI
-  ↓
-queue
-  ↓
-final selection
-  ↓
-MiniMax M3 Sorani translation ONLY if needed
-  ↓
-Telegram
-```
-
-Never call the translation model during ingestion.
-
-Never call translation for rejected/duplicate/stale articles.
-
----
-
-# 27. TELEGRAM PUBLISHING
-
-Before every send:
-
-1. check global stop;
-2. check queue status;
-3. check duplicate/event state;
-4. check destination language;
-5. translate only if required;
-6. validate translation;
-7. check global stop again;
-8. send;
-9. record successful delivery;
-10. set queue status to `published`.
-
-If Telegram returns an error:
-
-- do not mark as published;
-- record the error;
-- keep the item retryable when safe.
-
----
-
-# 28. DEPLOYMENT PORTABILITY
-
-The project must be deployable into a new environment without relying on the
-original project ID.
-
-Avoid hard-coded:
-
-```text
-Supabase project ID
-Supabase URL
-Lovable project ID
-Vercel project ID
-webhook URL
-AI model credentials
-Telegram secrets
-```
-
-Webhook URLs must be generated from the current deployment origin.
-
-Fresh deployment checklist:
-
-```text
-1. Create new Supabase project.
-2. Apply every migration in order.
-3. Configure environment variables.
-4. Create owner Auth account.
-5. Run owner bootstrap.
-6. Verify is_admin.
-7. Configure Telegram bot token.
-8. Register webhook.
-9. Configure cron/pg_net.
-10. Verify STOP ALL.
-11. Verify RESUME.
-12. Verify ingest.
-13. Verify queue.
-14. Verify publish.
-15. Verify Sorani translation with MiniMax M3.
-16. Verify duplicate-event rejection.
-```
-
----
-
-# 29. CRON SAFETY
-
-Every public cron endpoint must:
-
-- authenticate the cron request;
-- check `system_paused`;
-- avoid concurrent execution;
-- return quickly when stopped;
-- never expose secrets;
-- report structured run status.
-
-When stopped:
-
-```json
-{
-  "ok": false,
-  "status": "stopped_by_admin"
-}
-```
-
-Do not return a fake success that makes the dashboard think the bot is
-running.
-
----
-
-# 30. ADMIN DASHBOARD REQUIREMENTS
-
-The dashboard must show:
-
-### Header
-
-```text
-Lodev News
-RUNNING / STOPPED
-[ STOP ALL ]
-```
-
-When stopped:
-
-```text
-Lodev News
-STOPPED
-Reason: ...
-Paused: ...
-[ RESUME SERVICES ]
-```
-
-### Owner diagnostics
-
-Show:
-
-```text
-Signed-in email
-Admin: YES/NO
-Owner match: YES/NO
-Database connection: OK/ERROR
-Telegram: CONNECTED/ERROR
-AI Gateway: CONFIGURED/MISSING
-MiniMax M3: CONFIGURED/MISSING
-```
-
-Never display actual secrets.
-
-### Pipeline stats
-
-```text
-Fetched
-Rejected
-Duplicates
-AI classified
-Queued
-Published
-Translation failures
-Stopped runs
-```
-
----
-
-# 31. CURRENT SOURCE/DATA RULES
-
-Keep the existing useful source architecture:
-
-- NewsData.io quota-capped;
-- Bing News RSS;
-- direct publisher feeds;
-- Iranian sources such as Press TV, IRNA, Mehr, Tasnim and Fars;
-- monitored public Telegram channels.
-
-Do not let any single feed flood the queue.
-
-Source diversity must be event-aware rather than globally punitive.
-
----
-
-# 32. NEWS QUALITY RULES
-
-The system must reject:
-
-- obvious spam;
-- irrelevant stories;
-- stale stories;
-- non-English source material where English is required;
-- unrelated gold/oil content;
-- low-quality automated content;
-- duplicate URLs;
-- duplicate events with no new information.
-
-The system must preserve:
-
-- legitimate Iranian viewpoints;
-- competing claims;
-- official statements;
-- meaningful corrections;
-- casualty updates;
-- new military developments;
-- diplomatic developments;
-- new evidence/confirmation/denial.
-
----
-
-# 33. REQUIRED REJECTION AUDIT
-
-Every rejection should be explainable.
-
-Example:
-
-```json
-{
-  "decision": "reject",
-  "reason": "duplicate_event",
-  "event_id": "...",
-  "similar_event": "...",
-  "new_information": false,
-  "source": "..."
-}
-```
-
-This is essential for debugging why an article did not publish.
-
----
-
-# 34. WHAT NOT TO IMPLEMENT
-
-Do not add features that cannot be reliably implemented by this application.
-
-In particular:
-
-- Do not claim that an in-app button physically shuts down Vercel/Supabase.
-- Do not claim GitHub ownership automatically grants Supabase admin access.
-- Do not use a browser-only secret for AI or Telegram.
-- Do not make an AI fallback consume another paid model when the requirement is
-  MiniMax-only Sorani translation.
-- Do not treat Telegram posts as independently verified facts.
-- Do not suppress every related story merely because the event cooldown exists.
-
-The correct solution is a cooperative application-level emergency stop plus
-provider-level controls for actual infrastructure shutdown.
-
----
-
-# 35. ACCEPTANCE TESTS
-
-A rebuild is not complete until all tests pass.
-
-## Admin
-
-- Owner can sign in after a fresh database.
-- Owner is admin even if another user was created first.
-- Non-owner authenticated users are not automatically admins.
-- Admin diagnostics correctly show authorization state.
-
-## Stop
-
-- STOP ALL pauses cron ingest.
-- STOP ALL pauses cron publish.
-- STOP ALL blocks manual ingest.
-- STOP ALL blocks manual publish.
-- STOP ALL prevents new Telegram sends.
-- STOP ALL prevents new AI requests.
-- RESUME restores normal operation.
-- No false "service stopped" claim is shown for hosting infrastructure.
-
-## Queue
-
-- `published` is the only successful queue status.
-- No code uses `sent`.
-- Concurrent publish calls cannot send the same item twice.
-
-## Dedup
-
-- Same URL is rejected.
-- Same event with different wording is rejected.
-- Same event with meaningful new information is allowed.
-- Source competition is event-specific.
-- 72h default cooldown works.
-- Event-type cooldown overrides work.
-
-## Translation
-
-- Gemini is not called.
-- Only `minimax/minimax-m3` is used for Sorani.
-- One translation is reused across multiple Sorani chats.
-- Translation occurs only after final item selection.
-- Cached translations do not cause another AI request.
-- Latin tokens such as `USA`, `NATO`, `F-35`, `X` and URLs do not cause false
-  Sorani validation failures.
-- No automatic fallback to another paid translation model.
-
-## Budget
-
-- AI calls are counted.
-- Monthly soft limit is enforced.
-- Translation is not performed during ingest.
-- Duplicate/stale/rejected articles do not consume translation tokens.
-- Prompts contain only necessary text.
-
-## Deployment
-
-- Project works with a new Supabase project.
-- No original project ID is required in source code.
-- Owner bootstrap works.
-- Telegram webhook uses the current deployment origin.
-- Secrets are server-side only.
-
----
-
-# 36. AUTHORITATIVE MODEL CONFIGURATION
-
-For Sorani translation:
-
-```text
-Provider: Vercel AI Gateway
-Model: minimax/minimax-m3
-API key: AI_GATEWAY_API_KEY
-```
-
-No Gemini translation.
-
-Vercel currently lists MiniMax M3 at the model identifier
-`minimax/minimax-m3`; the gateway page also states that free users receive
-$5 of credits every 30 days. citeturn1search1turn0search1
-
-Vercel's current AI Gateway documentation also describes usage/cost
-observability and API-key management, which should be used to monitor the
-monthly budget. citeturn0search0
-
----
-
-# 37. FINAL IMPLEMENTATION PRIORITY
-
-Implement in this order:
-
-### P0 — Security / control
-
-1. Rotate any exposed AI key.
-2. Fix owner/admin bootstrap.
-3. Add global STOP ALL.
-4. Add RESUME.
-5. Add stop checks to every pipeline entry point.
-6. Remove secrets from source/client.
-
-### P1 — Correctness
-
-7. Standardize queue status to `published`.
-8. Fix publishing race conditions.
-9. Implement event fingerprint.
-10. Implement event-level cooldown.
-11. Implement material-new-information test.
-12. Fix source damping to be event-specific.
-13. Fix stale-news windows.
-14. Make fallback classification lower-confidence.
-15. Fix attribution/fact handling.
-
-### P2 — AI / cost
-
-16. Remove Gemini Sorani translation.
-17. Use only `minimax/minimax-m3` for Sorani.
-18. Translate only at final delivery.
-19. Cache translations.
-20. Reuse one translation across chats.
-21. Add monthly budget guard.
-22. Minimize prompts/output.
-23. Never silently fall back to another paid translation model.
-
-### P3 — Quality / operations
-
-24. Improve normalized scoring.
-25. Add structured rejection reasons.
-26. Add pipeline observability.
-27. Add owner/deployment diagnostics.
-28. Make deployment portable.
-29. Add acceptance tests.
-
-This document supersedes older statements in the repository that mention
-`sent`, Gemini Sorani translation, global source penalties, a single universal
-freshness window, or the first-user-only admin assumption.
+## 1. Stack
+
+- **Frontend**: React 19 + Vite + TanStack Router (file-based routes), Tailwind
+  CSS v4, shadcn/ui components, Recharts (dashboard analytics).
+- **Backend / database**: Supabase project `ljvdaajfbkqeodglghwn`. Postgres
+  stores all state (settings, sources, queue, history, translation cache).
+  Two **Edge Functions** do the work:
+  - `admin` — PIN-gated JSON API the SPA calls directly.
+  - `pipeline` — the full news pipeline (ingest → classify → filter → rewrite
+    → dedup → translate → publish → bulletin), triggered by cron.
+- **Scheduler**: `pg_cron` ticks the `pipeline` function every minute
+  (`supabase/migrations/0002_cron.sql`). The function self-gates on editable
+  interval settings and the day/night posting windows — cron is just a ticker.
+- **Runtime**: Bun for installs/scripts. Vite dev server binds `0.0.0.0` with
+  HMR disabled (Freebuff requirement).
+- **Deployment**: Freebuff-managed hosting (`vite build` → `dist/`), preview
+  via `freebuff-preview`. Edge Functions are deployed separately via the
+  Supabase CLI (`supabase functions deploy`).
+
+The SPA is a static build. It talks to the cloud Supabase `admin` function
+(URL + anon key baked in by `vite.config.ts`), never a local backend, so
+settings/queue/history persist across preview restarts. Every admin call is
+PIN-gated server-side; the service-role key never leaves the Edge Functions.
+
+## 2. Backend layout
+
+| File | Role |
+| --- | --- |
+| `supabase/migrations/0001_init.sql` | All tables + indexes |
+| `supabase/migrations/0002_cron.sql` | `pg_cron` minute ticker → `pipeline` Edge Function |
+| `supabase/migrations/0003_cache_and_retention.sql` | Translation cache column/index + queue status index |
+| `supabase/functions/pipeline/index.ts` | Entire news pipeline (fetch → gates → AI → publish → bulletin) + retention |
+| `supabase/functions/admin/index.ts` | PIN-gated admin API (getDashboard, saveSettings, sources, keys, runPipeline, clearQueue, …) |
+| `src/lib/supabase.ts` | Supabase JS client (anon key, calls the `admin` function) |
+| `src/lib/adminApi.ts` | Typed client wrapper for every `admin` action |
+| `src/lib/supabaseAdminHooks.ts` | React hooks/queries used by the dashboard + settings |
+| `scripts/admin_smoke.sh` | Live smoke test against the deployed `admin` function |
+| `scripts/apply_supabase_migrations.mjs` | Applies `supabase/migrations/*.sql` via the Management API |
+| `scripts/backfill_convex_data.mjs` | Replays dedup memory + published history from the Convex export |
+| `scripts/restore_from_convex_export.mjs` | One-off Convex → Supabase data restore (topics/chats) |
+
+## 3. Scheduler
+
+`supabase/migrations/0002_cron.sql` schedules `iran-desk-pipeline` on
+`* * * * *`. Each tick POSTs to the `pipeline` Edge Function with an
+`x-internal-secret` header; the function rejects calls without the matching
+secret, so only cron (or an operator with the secret) can trigger it.
+
+Inside `pipeline`, each work type self-gates on an **editable minutes setting**
+(defaults in parentheses):
+
+| Work | Setting | Default |
+| --- | --- | --- |
+| ingest (web + Telegram) | `ingestIntervalMinutes` | 15 |
+| publish | window-gap logic (see below) | day 6–16 min / night 10–20 min |
+| bulletin | `bulletinIntervalMinutes` | 15 |
+
+Manual runs (`runPipeline` from the dashboard, or a `clearQueue` auto-refetch)
+bypass the interval. All runs respect `botPaused` (STOP ALL).
+
+### Publish cadence + double-send protection
+
+Every publish trigger routes through `windowGapOk` + a serialization lock:
+
+1. **Randomized min–max gap** (`dayMinMinutes`–`dayMaxMinutes` by day,
+   `nightMinMinutes`–`nightMaxMinutes` at night; defaults 6–16 / 10–20) is the
+   effective gap between posts, floored by `minPostGapMinutes`. A gap is drawn
+   fresh each cycle from the current window's range — this is the
+   "slower at night" behaviour.
+2. **Serialization lock** (`settings.publishRunLockAt`, `acquireLock` /
+   `releaseLock`). Only one publish run is in flight at a time across cron /
+   breaking / manual. A crashed run's stale lock is reclaimable after **10
+   minutes** (was 25 — lowered because Supabase kills Edge Functions at their
+   execution-time limit and a killed run skips the release).
+
+The wrapper also writes `lastPublishedAt` whenever a cycle actually sent
+something, so the gap gate always has a fresh timestamp.
+
+## 4. Ingest pipeline (`runIngest` in `pipeline/index.ts`)
+
+1. **Telegram signals** (`fetchTelegramChannel`) — monitored channels are
+   plain DB rows (`kind: "telegram"`). Posts are cleaned, foreign-language
+   posts are translated to English via Gemini (telegram job only — the web
+   job skips translation to avoid double-billing Gemini), merged into
+   "bulletin" chunks, and each channel's daily-post/flood counters are
+   updated. Per-channel boost (0 normal / 1 fast / 2 instant) is read from the
+   source row config.
+2. **Web fetches** (web/all jobs only) — NewsData.io (quota-aware) + Google
+   News RSS queries + direct publisher feeds. Capped at **100 fetched per
+   cycle** to keep the queue bounded.
+3. **Deterministic gates**, in order, short-circuiting:
+   1. `sourceBanGate` — banned domains/sources
+   2. `junkGate` — junk domains + junk title patterns + too-short titles
+   3. `respectGate` — disrespect toward Kurds/Muslims, negative unsourced
+      Iran framing
+   4. `relevanceGate` — must be Iran-conflict/market relevant
+   5. `englishGate` — English text only
+   6. `freshnessGate` — generous windows (14h conflict / 48h long-tail / 22h)
+   - Then exact-key check against stored `raw_articles` (canonical key from
+     `canonicalKey`, never regenerated).
+4. **Classification + rewrite**:
+   - classification → semantic category; on failure → `keywordCategory` fallback.
+   - rewrite → clean headline + richer 2–3 sentence summary (Groq). Telegram
+     posts skip rewriting (published verbatim).
+5. **Post-AI gates**: near-duplicate collision handling against the queued
+   window (higher-trust source wins), event-cooldown against published
+   history (cross-language aware).
+6. **Score** each survivor: category priority + freshness + per-category
+   quota penalty + rotation bonus + breaking bonus + leader-statement bonus +
+   severity bonus + telegram boost + source penalty.
+7. **Insert** into `queue` with `eventId`, importance, score, scoreParts,
+   sourceText (pre-rewrite original), breaking flag. Breaking items trigger
+   an immediate breaking publish.
+8. **Source-quality tally** — every accepted/rejected article is attributed
+   back to its source row; a source with `sourceAutoPauseThreshold`
+   consecutive rejections (default 8) is auto-disabled (see §7).
+
+## 5. Publish pipeline (`runPublish`)
+
+1. Paused check, orphaned `publishing` recovery, expire items older than 14h
+   by original publish date.
+2. Candidate pool = up to 500 queued items, sorted by **decayed** score
+   (freshness re-evaluated now, not at ingest time).
+3. **Cluster selection** (`selectPublishCandidates`, shared with the preview
+   dry-run): one cluster per distinct event and one cluster lead per source.
+   Cluster threshold `eventSimilarityThreshold` (0.52 default). Cron sends 1
+   story; manual "Publish top 3" forces 3.
+4. Per item: policy gates → repeated/dedup checks → **AI final dedup**
+   (Groq/OpenRouter/Cloudflare) on borderline candidates only.
+5. Image/video resolution once per item: Telegram items use the authoritative
+   `t.me/s/CHANNEL/POST_ID` per-post page (never the channel avatar); videos
+   are sent as video (with the real video URL, not a thumbnail) — see §9.
+6. Per active chat: global language wins (`defaultLanguage`); Sorani
+   translation is **cached by content hash** (`translation_history.cache_key`)
+   and reused across chats/later publishes. Translation chain: Gemini
+   3.6-flash → 3.5-flash → 3.5-flash-lite (per-key round-robin + throttle) →
+   MiniMax M3 (normal + strict retry) → English fallback. Groq is never used
+   for translation.
+7. Delivery outcome (photo vs video vs text) is recorded on history rows;
+   chats the bot provably can't post to are deactivated.
+8. Optional polls on breaking items (cadence + per-chat + hourly cap).
+9. Send delay between posts (`sendDelayMs`), funnel stats updated reactively.
+
+### Preview next batch (dry-run)
+
+`previewNextBatch` runs the same candidate selection, clustering, and
+deterministic publish gates — with **no** AI calls, claims, translation, or
+sends. The dashboard button shows each candidate with a `ready` / `duplicate`
+/ `policy` status and reason.
+
+## 6. Daily bulletin (`sendBulletin`)
+
+- Fires at `bulletinTime` in the configured `timezone`, once per local day,
+  looking back `bulletinHours` (24 default).
+- Summarises recent published stories with AI, with light editorial cleanup.
+
+## 7. Source quality + auto-pause
+
+- Every article that enters the funnel is attributed to a source row.
+- `recordSourceQualityBatch` tallies `publishedCount` / `rejectedCount` /
+  `consecutiveRejects` per source in one batched write.
+- When `sourceAutoPauseEnabled` (default on) and a source hits
+  `sourceAutoPauseThreshold` consecutive rejections (default 8), the source
+  is disabled (`enabled=false`, `autoPaused=true`, `autoPauseReason` set).
+  Manually toggling the source back on clears the flags and resets the streak.
+
+## 8. AI providers
+
+| Provider | Env key(s) | Used for |
+| --- | --- | --- |
+| Groq | `GROQ_API_KEY` | AI decision path (dedup, rewrite) — first choice |
+| OpenRouter | `OPENROUTER_API_KEY` | AI decision path fallback |
+| Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | AI decision path last resort |
+| Google Gemini (direct REST) | `GEMINI_API_KEY_1..6` | Translation chain (3.6 → 3.5 → 3.5-lite), telegram-to-English |
+| MiniMax M3 | `MINIMAX_API_KEY` (Vercel AI Gateway key) | Translation fallback |
+
+- Per-key throttle state lives in the `gemini_throttle` table and every call
+  is logged to `gemini_call_log` so per-minute vs daily quota exhaustion is
+  visible per key × model in the dashboard.
+- The AI **decision** path is Groq → OpenRouter → Cloudflare only — never
+  Gemini — and its usage is recorded per day/provider/kind in `ai_usage`.
+
+## 9. Telegram specifics
+
+- **Webhook**: the `admin` function's `setWebhook`/`syncBotChats` actions
+  manage the bot; the fallback bot token comes from `TELEGRAM_BOT_TOKEN`.
+- **Channel fetch** uses public `t.me/s/<channel>` pages — no API ID/hash/bot
+  token needed.
+- **Post media**: images are parsed from the per-post preview page. For
+  videos, `extractPostVideo`/`fetchTelegramPostVideo` capture the actual video
+  URL (and a thumbnail) so the bot sends a real video, not a thumbnail-as-photo
+  — channel avatars, og images, favicons, and logos are rejected. No media →
+  text-only post (never an avatar placeholder).
+
+## 10. Secrets & configuration
+
+Secrets live in Supabase Edge Function secrets and/or the Freebuff Keys tab.
+Required names: `ADMIN_PIN`, `OWNER_EMAILS`, `TELEGRAM_BOT_TOKEN`,
+`NEWSDATA_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `MINIMAX_API_KEY`,
+`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `GEMINI_API_KEY_1..6`,
+`GEMINI_TRANSLATION_MODEL` (optional). The Supabase service-role key is a
+deployed-function secret only. Public values (`VITE_SUPABASE_URL`,
+`VITE_SUPABASE_ANON_KEY`) are baked into the SPA by `vite.config.ts`. Do not
+hardcode secrets in source.
+
+## 11. Admin console
+
+- PIN sign-in (`ADMIN_PIN`) → `/dashboard` (protected route).
+- Dashboard: stat cards (queued, published 24h, active chats, polls,
+  translation fails, AI tokens), 14-day analytics chart, live pipeline funnel,
+  queue status tabs (queued / published / rejected / last 100 with score
+  breakdowns), manual **Fetch now / Preview next batch / Publish top 3 /
+  Clear queue** (clears the queue then auto-refetches), STOP ALL / RESUME,
+  and a preview dialog for the next publish batch.
+- Settings: Publishing (speed, format, scheduler intervals, AI dedup window,
+  bulletin, language, posting windows, breaking criteria, glossary),
+  Sources & Translation (providers, Telegram channels, topic queries,
+  translation provider/model, translation keys, Gemini key usage, translation
+  history/failures, source quality + auto-pause), and System (bot connection,
+  chats, polls).
+- Every settings control saves automatically and persists in Postgres.
+
+The `admin` function actions: `verifyPin`, `getDashboard`, `saveSettings`,
+`setPauseState`, `setTranslationModel`, `updateChat`, `addChat`, `upsertTopic`,
+`upsertSource`, `listTranslationKeys`, `upsertTranslationKey`,
+`listTranslationModels`, `testTranslationKey`, `testSource`, `refreshBotInfo`,
+`setWebhook`, `syncBotChats`, `sendTestMessage`, `testPoll`, `testGeminiKeys`,
+`revealGeminiKey`, `runPipeline`, `clearQueue`, `previewNextBatch`.
+
+## 12. Database usage minimization
+
+To stay inside the Supabase free plan:
+
+- **Translation cache** — same input text is translated once
+  (`translation_history.cache_key`, unique index), not re-billed per chat.
+- **Ingest cap 100/cycle** — queue growth is bounded.
+- **Dedup-only `raw_articles`** — the row stores just `dedup_key` + title/url;
+  no full `payload`, body text, or media, so dedup memory stays tiny.
+- **Queue pruning** — queued >48h → expired; published/duplicate/rejected
+  >7d → deleted.
+- **Retention** (`pruneQueueAndRetain`, runs every cycle):
+  - `raw_articles` >21d deleted
+  - `published_history`, `translation_history`, `clusters`, `activity_log`
+    >30d deleted
+  - `translation_failures`, `gemini_call_log` >14d deleted
+  - `ai_usage` >60d deleted
+
+## 13. Testing
+
+- `sh ./scripts/admin_smoke.sh` — live smoke test of the deployed `admin`
+  function (PIN gate, getDashboard shape, translation keys/models, unknown
+  action → 404). 9 checks.
+- Unit + wiring tests in `scripts/*_tests.ts` run with
+  `bun test ./scripts/<file>_tests.ts` (editorial gates, AI dedup, rewrite
+  prompts, source-quality, publish-cadence wiring).
+- Typecheck: `bun tsc -b --noEmit` (run by the platform after every turn).
+
+## 14. Deployment
+
+- Build = `vite build` → static `dist/`. No server starts at build time.
+- Preview = Vite dev server on `0.0.0.0` with the platform's PORT.
+- Edge Functions are deployed with
+  `supabase functions deploy admin` / `supabase functions deploy pipeline`
+  (Supabase CLI + access token) — they are **not** part of the Vite build.
+- Production env vars are separate from sandbox `.env`: manage via
+  `freebuff-deploy env` or the Deploy UI. Secrets live in the Keys tab and in
+  Supabase function secrets.
+- The Supabase project URL is pinned in `vite.config.ts` (and `0002_cron.sql`).
+  If the project is ever recreated, both must be updated.

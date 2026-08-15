@@ -262,7 +262,7 @@ queue — scored items awaiting publish, score components, breaking flag
 
 published_history — dedup key, chat_id, published_at, original publish
 
-timestamp, source name , my newsdata io api key pub_03222875f0e146b6bc15f37cb4dad540                 my @connector:telegram:"Telegram" Bot token @secret:TELEGRAM_BOT_TOKEN  Show usernames that has joined this bot or if u can show the channel namel that this bot exist
+timestamp, source name. NewsData.io API key is stored as a server-side secret (NEWSDATA_API_KEY). Telegram bot token is stored as a server-side secret (TELEGRAM_BOT_TOKEN). Show usernames that have joined this bot or the channel names that this bot exists in.
 
 This project was built with [Lovable](https://lovable.dev).
 

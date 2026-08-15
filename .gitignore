@@ -38,6 +38,9 @@ dist-ssr
 # Local Convex state
 .convex/
 
+# Supabase CLI link state (auto-generated)
+supabase/.temp/
+
 # Stale original-project copy (the real project lives at the repo root)
 /project/
 

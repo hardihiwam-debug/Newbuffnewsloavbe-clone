@@ -140,6 +140,9 @@
   body {
     background-color: var(--color-background);
     color: var(--color-foreground);
+    /* Mobile safety net: never allow a stray fixed-width control to make the
+       console scroll horizontally on phones. */
+    overflow-x: clip;
   }
 }
 
@@ -163,4 +166,13 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   backdrop-filter: blur(8px);
+}
+
+/* Mobile polish: the model-picker select has a desktop min-width that can
+   overflow very narrow phones; let it flex within its row instead. */
+@media (max-width: 640px) {
+  select.min-w-72 {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
 }
