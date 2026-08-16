@@ -713,7 +713,7 @@ const NEGATIVE_IRAN_PATTERNS: RegExp[] = [
 ];
 const SOFT_NEWS_PATTERNS: RegExp[] = [
   /\b(football|soccer|volleyball|basketball|wrestling|weightlifting|futsal|goalkeep\w*|striker|midfielder|league|premier league|world cup|olympic|championship|tournament|match|derby|coach|club|esteghlal|persepolis|sepahan|tractor)\b/i,
-  /\b(film|movie|cinema|festival|actor|actress|director'?s cut|box office|series|drama|music|singer|concert|album|art exhibition|museum|carpet weaving|handicraft)\b/i,
+  /\b(film|movie|cinema|festival|actor|actress|director'?s cut|box office|series|drama|music|singer|concert|album|art exhibition|exhibition|gallery|artwork(?:s)?|painting|sculpture|photography|pottery|ceramic|theatre|theater|dance|ballet|opera|poetry|poem|museum|carpet weaving|handicraft)\b/i,
   /\b(recipe|cuisine|restaurant|tourism|tourist|travel guide|hotel|resort|nowruz celebration|fashion|celebrity|royal family|dating|horoscope)\b/i,
   /\b(earthquake drill|weather forecast|air pollution index|traffic accident|road crash|bus crash|train derail)\b/i,
   /\b(school shooting|mass shooting)\b/i,
@@ -756,15 +756,26 @@ function respectGate(a: Article): { ok: boolean; reason?: string } {
 function relevanceGate(a: Article): { ok: boolean; reason?: string } {
   const text = `${a.title} ${a.description ?? ""}`;
   if (SOFT_NEWS_PATTERNS.some((p) => p.test(text))) return gateOk(false, "off-beat soft news");
-  const hits = BEAT_PATTERNS.filter((p) => p.test(text)).length;
-  if (hits === 0) return gateOk(false, "unrelated to the conflict beat");
-  if (hits === 1 && BEAT_PATTERNS[6]!.test(text) && !/iran|iraq|us |u\.s\./i.test(text)) {
-    return gateOk(false, "only tangential regional mention");
+
+  // Core beat: Iran, Iraq, proxies, nuclear, oil/energy, Middle-East region.
+  const core = [BEAT_PATTERNS[0], BEAT_PATTERNS[1], BEAT_PATTERNS[2], BEAT_PATTERNS[3], BEAT_PATTERNS[5], BEAT_PATTERNS[6]].some((p) => p!.test(text));
+  // US military engagement in the region (Centcom / carrier groups).
+  const usRegional = /\b(centcom|pentagon|us (navy|military|forces|troops)|carrier strike group)\b/i.test(text);
+  if (core || usRegional) {
+    const genericWarMention = /\biran war\b/i.test(text);
+    const concreteEvent = /\b(attack|strike|missile|drone|killed|wounded|ceasefire|agreement|talks|negotiat|sanction|export|oil|hormuz|nuclear|military|government|minister|president|leader|commander|parliament|statement|announc|warn|percent|%)\b/i.test(text);
+    if (genericWarMention && !concreteEvent) return gateOk(false, "Iran war is only a passing mention");
+    return gateOk(true, "");
   }
-  const genericWarMention = /\biran war\b/i.test(text);
-  const concreteEvent = /\b(attack|strike|missile|drone|killed|wounded|ceasefire|agreement|talks|negotiat|sanction|export|oil|hormuz|nuclear|military|government|minister|president|leader|commander|parliament|statement|announc|warn|percent|%)\b/i.test(text);
-  if (genericWarMention && !concreteEvent) return gateOk(false, "Iran war is only a passing mention");
-  return gateOk(true, "");
+
+  // Operator carve-out: only MAJOR Russia–Ukraine war news (invasion,
+  // offensive, casualties, mass strikes) — never routine "drone hit a
+  // warehouse" noise.
+  const ru = /\b(russia|russian|ukrain\w*|kyiv|moscow|zelensky|putin|kremlin|donbass|crimea)\b/i.test(text);
+  const ruMajor = /\b(invasion|offensive|counter[- ]?offensive|front[- ]?line|escalat\w+|ceasefire|peace (talks|deal|negotiat\w+)|surrender|casualt\w*|\d+\s+(killed|dead)|deadly|massacre|mass[- ]?grave|mobiliz\w+|annex\w+|territor\w+|massive (airstrike|strike|attack|barrage)|missile barrage|energy (grid|infrastructure)|blackout)\b/i.test(text);
+  if (ru && ruMajor) return gateOk(true, "");
+
+  return gateOk(false, "unrelated to the conflict beat");
 }
 
 const NON_LATIN_SCRIPT = /[\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0900-\u097F\u0980-\u09FF\u0A00-\u0D7F\u0E00-\u0E7F\u10A0-\u10FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/u;
@@ -913,7 +924,7 @@ type ExtractedFacts = {
 };
 
 async function groqExtractFacts(items: Array<{ title: string; description: string | null }>): Promise<Array<ExtractedFacts | null>> {
-  if (!GROQ_API_KEY || items.length === 0) return items.map(() => null);
+  if (items.length === 0) return [];
   const messages = [
     {
       role: "system",
@@ -924,46 +935,80 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
       content: JSON.stringify(items.map((item, i) => ({ [String(i + 1)]: { title: item.title, description: item.description?.slice(0, 3000) ?? null } }))),
     },
   ];
-  try {
-    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
-      body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages, temperature: 0.1, max_tokens: 6000, response_format: { type: "json_object" } }),
-      signal: AbortSignal.timeout(60_000),
-    });
-    const raw = await res.text();
-    if (!res.ok) throw new Error(`Groq ${res.status}`);
-    const json = JSON.parse(raw) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
-    };
-    const content = json.choices?.[0]?.message?.content ?? "";
-    const parsed = JSON.parse(content) as Record<string, Record<string, unknown>>;
-    recordAiUsage("groq", "rewrite", Number(json.usage?.prompt_tokens ?? 0), Number(json.usage?.completion_tokens ?? 0));
-    return items.map((item, i) => {
-      const row = parsed[String(i + 1)] ?? {};
-      const headline = String(row.headline ?? "").trim() || item.title;
-      let summary = String(row.summary ?? "").trim();
-      if (!summary) summary = item.description ?? "";
-      if (!/[.!?]$/.test(summary) && summary.length > 0) summary += ".";
-      const facts: Record<string, unknown> = {
-        event: row.event ?? null,
-        actor: row.actor ?? null,
-        action: row.action ?? null,
-        target: row.target ?? null,
-        location: row.location ?? null,
-        time: row.time ?? null,
-        claimed_result: row.claimed_result ?? null,
-        confirmed_result: row.confirmed_result ?? null,
-        source_attribution: row.source_attribution ?? null,
-        confidence: row.confidence ?? null,
-        numbers: Array.isArray(row.numbers) ? row.numbers : [],
+
+  // Provider chain: Groq → OpenRouter → Cloudflare, all OpenAI-compatible
+  // chat/completions endpoints. First usable response wins; the rewrite never
+  // blocks the pipeline — if none are configured we fall back to source text.
+  const providers: Array<{ name: string; url: string; key: string; model: string }> = [];
+  if (GROQ_API_KEY) providers.push({ name: "groq", url: "https://api.groq.com/openai/v1/chat/completions", key: GROQ_API_KEY, model: "llama-3.3-70b-versatile" });
+  if (OPENROUTER_API_KEY) providers.push({ name: "openrouter", url: "https://openrouter.ai/api/v1/chat/completions", key: OPENROUTER_API_KEY, model: "meta-llama/llama-3.3-70b-instruct" });
+  if (CLOUDFLARE_API_TOKEN && CLOUDFLARE_ACCOUNT_ID) providers.push({ name: "cloudflare", url: `https://api.cloudflare.com/client/v4/accounts/${enc(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`, key: CLOUDFLARE_API_TOKEN, model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" });
+  if (providers.length === 0) return items.map(() => null);
+
+  let lastError = "";
+  for (const p of providers) {
+    try {
+      const res = await fetch(p.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.key}` },
+        body: JSON.stringify({
+          model: p.model,
+          messages,
+          temperature: 0.1,
+          max_tokens: 6000,
+          // Cloudflare's OpenAI-compat layer rejects response_format, so only
+          // force JSON mode on Groq/OpenRouter.
+          ...(p.name === "cloudflare" ? {} : { response_format: { type: "json_object" } }),
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const raw = await res.text();
+      if (!res.ok) throw new Error(`${p.name} ${res.status}`);
+      const json = JSON.parse(raw) as {
+        choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
-      return { headline, summary, facts };
-    });
-  } catch {
-    return items.map(() => null);
+      if (json.choices?.[0]?.finish_reason === "length") {
+        throw new Error(`${p.name} response truncated (max_tokens) — batch too large`);
+      }
+      let content = json.choices?.[0]?.message?.content ?? "";
+      content = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+      const firstBrace = content.indexOf("{");
+      if (firstBrace > 0) content = content.slice(firstBrace);
+      const parsed = JSON.parse(content) as Record<string, Record<string, unknown>>;
+      recordAiUsage(p.name, "rewrite", Number(json.usage?.prompt_tokens ?? 0), Number(json.usage?.completion_tokens ?? 0));
+      return items.map((item, i) => {
+        const row = parsed[String(i + 1)] ?? {};
+        const headline = String(row.headline ?? "").trim() || item.title;
+        let summary = String(row.summary ?? "").trim();
+        if (!summary) summary = item.description ?? "";
+        if (!/[.!?]$/.test(summary) && summary.length > 0) summary += ".";
+        const facts: Record<string, unknown> = {
+          event: row.event ?? null,
+          actor: row.actor ?? null,
+          action: row.action ?? null,
+          target: row.target ?? null,
+          location: row.location ?? null,
+          time: row.time ?? null,
+          claimed_result: row.claimed_result ?? null,
+          confirmed_result: row.confirmed_result ?? null,
+          source_attribution: row.source_attribution ?? null,
+          confidence: row.confidence ?? null,
+          numbers: Array.isArray(row.numbers) ? row.numbers : [],
+        };
+        return { headline, summary, facts };
+      });
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
   }
+  await logActivity(
+    "ingest",
+    "error",
+    `AI rewrite failed on all providers — falling back to source text for ${items.length} item(s)`,
+    lastError,
+  );
+  return items.map(() => null);
 }
 
 // ── AI: Gemini direct translation (Sorani) ─────────────────────────────────
@@ -981,7 +1026,11 @@ function validateSorani(text: string): boolean {
   const latin = (text.match(/[A-Za-z]/g) ?? []).length;
   const arabic = (text.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/g) ?? []).length;
   if (arabic < 2) return false;
-  if (latin > Math.max(24, arabic * 0.35)) return false;
+  // A real Sorani translation of a Lebanon/Israel story keeps many Latin
+  // proper nouns (Israel, Merkava, place names). Reject only when Latin
+  // clearly dominates the Sorani script — English output has ~0 Arabic
+  // chars and is already rejected above.
+  if (latin > Math.max(50, arabic)) return false;
   return SORANI_ALLOWED.test(text);
 }
 
@@ -2087,7 +2136,15 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     extractionIdx.push(i);
     toExtract.push({ title: item.article.title, description: item.article.description });
   }
-  const extractedArr = await groqExtractFacts(toExtract);
+  // Chunk the Groq rewrite so a single response never overflows max_tokens.
+  // A truncated JSON body used to throw in groqExtractFacts, which silently
+  // dropped the WHOLE batch back to raw source text — the duplicated
+  // "title — outlet" posts visible in the channel.
+  const extractedArr: Array<ExtractedFacts | null> = [];
+  const GROQ_CHUNK_SIZE = 5;
+  for (let c = 0; c < toExtract.length; c += GROQ_CHUNK_SIZE) {
+    extractedArr.push(...(await groqExtractFacts(toExtract.slice(c, c + GROQ_CHUNK_SIZE))));
+  }
   const extracted = new Map<number, ExtractedFacts>();
   extractionIdx.forEach((idx, j) => {
     const ex = extractedArr[j];
@@ -2295,6 +2352,24 @@ function queueEffectiveScore(q: Record<string, unknown>): number {
 }
 
 
+// Operator-configured footer hyperlinks (settings.post_links). Stored as a
+// jsonb array of { url, text } — appended to the bottom of every post.
+function parsePostLinks(raw: unknown): Array<{ url: string; text: string }> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ url: string; text: string }> = [];
+  for (const entry of raw) {
+    let link = entry;
+    if (typeof link === "string") {
+      try { link = JSON.parse(link); } catch { continue; }
+    }
+    if (!link || typeof link !== "object") continue;
+    const url = String((link as { url?: unknown }).url ?? "").trim();
+    const text = String((link as { text?: unknown }).text ?? "").trim();
+    if (url && text) out.push({ url, text });
+  }
+  return out;
+}
+
 async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | null): Promise<Record<string, unknown>> {
   const result: Record<string, unknown> = { sent: 0, items: [] as string[] };
   const chats = await listActiveChats();
@@ -2475,7 +2550,7 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
           finalSummary = parts.slice(1).join("\n\n") || translated.text;
         }
       } else {
-        await logActivity("translation", "warning", `Sorani unavailable — published English fallback: ${headline.slice(0, 110)}`);
+        await logActivity("translation", "warning", `Sorani unavailable — published English fallback (all providers exhausted): ${headline.slice(0, 110)}`);
         // Record the failure so the dashboard "Translation fails" stat is
         // honest instead of always reading 0.
         await rest("translation_failures", {
@@ -2522,6 +2597,7 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
       showTimestamp: settings.post_show_timestamp as boolean | undefined,
       breakingPrefix: settings.breaking_prefix as string | null | undefined,
       linkPreview: settings.link_previews as boolean | undefined,
+      links: parsePostLinks(settings.post_links),
     };
 
     let sentThisItem = 0;

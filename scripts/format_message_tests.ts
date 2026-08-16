@@ -56,3 +56,22 @@ test("no brand line is appended beyond the configured footer", () => {
   expect(out).not.toMatch(/🟧 Powered by/);
   expect(out).not.toMatch(/Powered by Freebuff · freebuff\.com/);
 });
+
+test("custom footer links render as the last lines", () => {
+  const out = formatMessage(basePost, {
+    links: [
+      { url: "https://example.com/support", text: "Support us" },
+      { url: "https://example.com/news", text: "More news" },
+    ],
+  });
+  expect(out).toContain('<a href="https://example.com/support">Support us</a>');
+  expect(out).toContain('<a href="https://example.com/news">More news</a>');
+  // They must be the final lines, after the footer.
+  expect(out.trimEnd().endsWith('<a href="https://example.com/news">More news</a>')).toBe(true);
+});
+
+test("custom footer links skip empty entries", () => {
+  const out = formatMessage(basePost, { links: [{ url: "", text: "" }, { url: "https://x.io", text: "X" }] });
+  expect(out).toContain('<a href="https://x.io">X</a>');
+  expect(out).not.toContain('href=""');
+});

@@ -238,6 +238,9 @@ export function keywordCategory(text: string): string | null {
     // them immediately instead of parking them in the queue.
     if (/strike|missile|drone|attack|airstrike|air strike|bomb|shelling|barrage|killed|kills|casualt|invasion|troops|hostage|military operation/.test(t)) return "war";
     if (/israel|palestin|gaza|lebanon|syria|yemen|saudi|qatar|uae|turkey/.test(t)) return "middle-east";
+    // Operator carve-out: major Russia–Ukraine war news (already admitted by
+    // the ingest relevanceGate) is published as a "war" item.
+    if (/russia|russian|ukrain|kyiv|moscow|zelensky|putin|kremlin|donbass|crimea/.test(t)) return "war";
     return null;
   }
   if (/hezbollah|houthi|kataib|militia|hamas|axis of resistance/.test(t)) return "proxies";
@@ -306,6 +309,7 @@ export type PostFormat = {
   showTimestamp?: boolean;
   breakingPrefix?: string | null;
   linkPreview?: boolean;
+  links?: Array<{ url: string; text: string }> | null;
 };
 const DEFAULT_FOOTER = "⚡ Delivered by Freebuff";
 const DEFAULT_EMOJI = "🗞";
@@ -338,6 +342,12 @@ export function formatMessage(post: Post, fmt: PostFormat = {}): string {
     lines.push(`<a href="${escapeHtml(post.url)}">${escapeHtml(linkLabel || "")}</a>`);
   }
   if (footer) lines.push("", `<i>${escapeHtml(footer)}</i>`);
+  // Operator-configured hyperlinks are the very last lines of every post.
+  for (const link of fmt.links ?? []) {
+    const url = String(link?.url ?? "").trim();
+    const label = String(link?.text ?? "").trim();
+    if (url && label) lines.push(`<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`);
+  }
   return lines.join("\n");
 }
 

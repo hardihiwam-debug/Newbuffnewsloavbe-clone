@@ -266,6 +266,11 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
   const pollsRaw = await rest<unknown[]>("polls", { query: "order=created_at.desc&limit=100" });
   const activityRaw = await rest<unknown[]>("activity_log", { query: "order=created_at.desc&limit=100" });
   const transHistRaw = await rest<unknown[]>("translation_history", { query: "order=created_at.desc&limit=50" });
+  // Event clusters (the backend's cross-outlet event grouping). The Events
+  // page renders these as the newsroom's developing-story board.
+  const clustersRaw = await rest<unknown[]>("clusters", {
+    query: "order=last_seen_at.desc.nullslast&limit=100",
+  });
 
   // 14-day analytics series (real counts from retained history/polls).
   const since14 = new Date(Date.now() - 14 * 86_400_000).toISOString();
@@ -388,6 +393,7 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     translationFailures: snakeArray(transFailRaw),
     translationHistory: snakeArray(transHistRaw),
     polls: snakeArray(pollsRaw),
+    clusters: snakeArray(clustersRaw),
     recentActivity: snakeArray(activityRaw),
     analytics: days,
     queuedTotal,
@@ -1243,6 +1249,36 @@ async function editQueueItem(p: {
   return { ok: true, id: p.id };
 }
 
+// ── Action: setQueueStatus ─────────────────────────────────────────────────
+// Hold / reject / requeue a queue item. The pipeline only ever auto-publishes
+// rows with status='queued' (listQueued filters status=eq.queued), so setting
+// a row to 'held' or 'rejected' genuinely gates it out of every publish cycle
+// until the operator decides otherwise. Used by the Inbox / Review actions.
+async function setQueueStatus(p: { id: string; status: "held" | "rejected" | "queued" }): Promise<unknown> {
+  if (!p.id) throw new HttpError(400, "id is required");
+  const status = String(p.status ?? "");
+  if (!["held", "rejected", "queued"].includes(status)) {
+    throw new HttpError(400, `invalid status: ${status}`);
+  }
+  const row = await rest<Array<Record<string, unknown>>>("queue", {
+    query: `id=eq.${encodeURIComponent(p.id)}&limit=1`,
+  });
+  if (!Array.isArray(row) || row.length === 0) throw new HttpError(404, "Queue item not found");
+  await rest("queue", {
+    method: "PATCH",
+    query: `id=eq.${encodeURIComponent(p.id)}`,
+    body: { status },
+    prefer: "return=minimal",
+  });
+  await logActivity({
+    type: "admin",
+    level: status === "rejected" ? "warning" : "info",
+    message: status === "queued" ? "Queue item requeued" : `Queue item ${status}`,
+    detail: String(row[0].headline ?? p.id).slice(0, 80),
+  });
+  return { ok: true, id: p.id, status };
+}
+
 // ── Action: publishQueueItem ────────────────────────────────────────────────
 // Publish a single queued item immediately, bypassing the normal sort order.
 // Forwards to the pipeline's publish mode with an explicit id so the operator
@@ -1296,6 +1332,7 @@ const handlers: Record<string, (p: any) => Promise<unknown>> = {
   previewNextBatch,
   editQueueItem,
   publishQueueItem,
+  setQueueStatus,
 };
 
 // ── CORS helpers (so the SPA can call directly without a proxy) ─────────────

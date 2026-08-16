@@ -1,6 +1,7 @@
 import { createFileRoute, Outlet, useNavigate } from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { useEffect } from "react";
 import { readStoredPin } from "@/routes/index";
+import { AppShell } from "@/components/AppShell";
 
 export const Route = createFileRoute("/_authenticated")({
   component: ProtectedLayout,
@@ -24,5 +25,9 @@ function ProtectedLayout() {
     );
   }
 
-  return <Outlet />;
+  return (
+    <AppShell>
+      <Outlet />
+    </AppShell>
+  );
 }

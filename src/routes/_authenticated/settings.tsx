@@ -14,7 +14,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
-import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { Separator } from "@/components/ui/separator";
 import {
   AlertDialog,
@@ -56,7 +55,11 @@ import {
   CalendarClock,
   Package,
   Vote,
-  ChevronDown,
+  SlidersHorizontal,
+  Send,
+  RadioTower,
+  Server,
+  ShieldCheck,
 } from "lucide-react";
 import { clearStoredPin, readStoredPin } from "@/routes/index";
 
@@ -267,6 +270,8 @@ function IconBtn({
 }
 
 /* ── Main component ─────────────────────────────────────── */
+type SettingsCat = "general" | "publishing" | "ai" | "sources" | "translation" | "telegram" | "scheduler" | "system" | "security";
+
 function SettingsPage() {
   const navigate = useNavigate();
   const pin = readStoredPin();
@@ -306,7 +311,7 @@ function SettingsPage() {
     saveSettings({ ...pinArgs, patch }).catch(onError);
   };
 
-  const [activeTab, setActiveTab] = useState<"publishing" | "sources" | "system">("publishing");
+  const [activeTab, setActiveTab] = useState<SettingsCat>("general");
   const [webhookUrl, setWebhookUrl] = useState("");
   const [geminiTest, setGeminiTest] = useState<any | null>(null);
   const [geminiTesting, setGeminiTesting] = useState(false);
@@ -318,6 +323,33 @@ function SettingsPage() {
   const [currentModel, setCurrentModel] = useState("");
   // Bot info learned from the "Refresh bot info" action (username/name only).
   const [botInfo, setBotInfo] = useState<{ username?: string | null; name?: string | null } | null>(null);
+  // Operator-configured footer hyperlinks (post_links jsonb) — seeded once
+  // from the server, then treated as local state so typing isn't clobbered
+  // by the 5s poll while an edit is in flight.
+  const [postLinks, setPostLinks] = useState<Array<{ url: string; text: string }>>([]);
+  const [postLinksSeeded, setPostLinksSeeded] = useState(false);
+  useEffect(() => {
+    if (postLinksSeeded || !data?.settings) return;
+    setPostLinksSeeded(true);
+    const raw = (data.settings as Record<string, any>)?.postLinks;
+    const parsed: Array<{ url: string; text: string }> = [];
+    if (Array.isArray(raw)) {
+      for (const entry of raw) {
+        let link = entry as any;
+        if (typeof link === "string") { try { link = JSON.parse(link); } catch { continue; } }
+        if (!link || typeof link !== "object") continue;
+        const url = String(link.url ?? "").trim();
+        const text = String(link.text ?? "").trim();
+        if (url && text) parsed.push({ url, text });
+      }
+    }
+    setPostLinks(parsed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data?.settings, postLinksSeeded]);
+  const commitPostLinks = (next: Array<{ url: string; text: string }>) => {
+    setPostLinks(next);
+    save({ postLinks: next });
+  };
   useEffect(() => {
     if (!pin) return;
     listTranslationModels({ pin }).then((r) => {
@@ -377,10 +409,16 @@ function SettingsPage() {
     navigate({ to: "/", replace: true });
   }
 
-  const tabs = [
-    { id: "publishing" as const, label: "Publishing" },
-    { id: "sources" as const, label: "Sources & Translation" },
-    { id: "system" as const, label: "System" },
+  const tabs: Array<{ id: SettingsCat; label: string; icon: any }> = [
+    { id: "general", label: "General", icon: SlidersHorizontal },
+    { id: "publishing", label: "Publishing", icon: Send },
+    { id: "ai", label: "AI & Quality", icon: Cpu },
+    { id: "sources", label: "Sources", icon: RadioTower },
+    { id: "translation", label: "Translation", icon: Languages },
+    { id: "telegram", label: "Telegram", icon: Hash },
+    { id: "scheduler", label: "Scheduler", icon: Clock },
+    { id: "system", label: "System", icon: Server },
+    { id: "security", label: "Security", icon: ShieldCheck },
   ];
 
   /* ── Publishing helpers ──────────────────────────── */
@@ -416,10 +454,10 @@ function SettingsPage() {
             variant="ghost"
             size="sm"
             className="h-8 gap-1.5 text-muted-foreground hover:text-foreground"
-            onClick={() => navigate({ to: "/dashboard" })}
+            onClick={() => navigate({ to: "/overview" })}
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Pipeline
+            Overview
           </Button>
           <div>
             <h1 className="text-xl font-semibold text-card-foreground">Settings</h1>
@@ -442,62 +480,37 @@ function SettingsPage() {
         Every setting saves automatically. Nothing resets on login, refresh, or redeploy.
       </div>
 
-      {/* ── Tabs ───────────────────────────────────── */}
-      <div className="mb-6">
-        {/* Desktop tabs */}
-        <div className="hidden sm:inline-flex rounded-lg bg-muted p-1 gap-1">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setActiveTab(t.id)}
-              className={`rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-                activeTab === t.id
-                  ? "bg-primary text-primary-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-        {/* Mobile drawer */}
-        <div className="sm:hidden">
-          <Sheet>
-            <SheetTrigger asChild>
-              <Button variant="outline" size="sm" className="gap-1.5">
-                {tabs.find((t) => t.id === activeTab)?.label} <ChevronDown className="h-3 w-3" />
-              </Button>
-            </SheetTrigger>
-            <SheetContent side="left" className="w-56">
-              <div className="flex flex-col gap-1 mt-8">
-                {tabs.map((t) => (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() => setActiveTab(t.id)}
-                    className={`rounded-md px-3 py-2 text-left text-sm font-medium transition-colors ${
-                      activeTab === t.id
-                        ? "bg-primary text-primary-foreground"
-                        : "text-muted-foreground hover:bg-muted"
-                    }`}
-                  >
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-            </SheetContent>
-          </Sheet>
-        </div>
-      </div>
-
+      {/* ── Settings navigation ───────────────────── */}
+      <div className="mb-6 grid gap-4 lg:grid-cols-[180px_1fr]">
+        <nav className="flex gap-1 overflow-x-auto pb-1 lg:flex-col lg:overflow-visible lg:pb-0">
+          {tabs.map((t) => {
+            const Icon = t.icon;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setActiveTab(t.id)}
+                className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors lg:w-full ${
+                  activeTab === t.id
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {t.label}
+              </button>
+            );
+          })}
+        </nav>
+        <div className="min-w-0">
       {/* ════════════════════════════════════════════════
             PUBLISHING TAB
           ════════════════════════════════════════════════ */}
-      {activeTab === "publishing" && (
+      {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 auto-rows-min gap-4">
           {/* Publishing Speed */}
-          <Card icon={Gauge} title="Publishing Speed" hint="Delay between consecutive posts">
+                    {activeTab === "publishing" && (
+<Card icon={Gauge} title="Publishing Speed" hint="Delay between consecutive posts">
             <div className="flex items-end gap-3">
               <CompactInput
                 label="Delay (seconds)"
@@ -514,9 +527,11 @@ function SettingsPage() {
               </span>
             </div>
           </Card>
+          )}
 
           {/* Post Format */}
-          <Card icon={FileText} title="Post Format" hint="Customise how posts appear in Telegram">
+                    {activeTab === "general" && (
+<Card icon={FileText} title="Post Format" hint="Customise how posts appear in Telegram">
             <div className="space-y-3">
               <CompactInput
                 label="Footer text"
@@ -564,11 +579,58 @@ function SettingsPage() {
                 onChange={(v) => save({ enrichSummaries: v })}
                 hint="Fetches the full article when the feed snippet is short, so posts are complete without opening the source link."
               />
+              <Separator className="!my-2" />
+              <div>
+                <Label className="text-xs">Footer hyperlinks</Label>
+                <p className="mb-2 text-[10px] text-muted-foreground">
+                  Shown as the last line of every post — add, edit or remove.
+                </p>
+                {postLinks.length === 0 ? (
+                  <p className="mb-2 text-[10px] text-muted-foreground/70">No links yet.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {postLinks.map((link, i) => (
+                      <div key={i} className="flex items-center gap-2">
+                        <Input
+                          value={link.text}
+                          onChange={(e) => commitPostLinks(postLinks.map((l, j) => (j === i ? { ...l, text: e.target.value } : l)))}
+                          placeholder="Label"
+                          className="h-8 text-xs"
+                        />
+                        <Input
+                          value={link.url}
+                          onChange={(e) => commitPostLinks(postLinks.map((l, j) => (j === i ? { ...l, url: e.target.value } : l)))}
+                          placeholder="https://…"
+                          className="h-8 text-xs"
+                        />
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-8 w-8 shrink-0 p-0 text-destructive"
+                          onClick={() => commitPostLinks(postLinks.filter((_, j) => j !== i))}
+                        >
+                          ✕
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-2 h-8 text-[11px]"
+                  onClick={() => commitPostLinks([...postLinks, { url: "", text: "" }])}
+                >
+                  + Add link
+                </Button>
+              </div>
             </div>
           </Card>
+          )}
 
           {/* Scheduler */}
-          <Card icon={Clock} title="Scheduler" hint="How often each job runs (live, no redeploy)">
+                    {activeTab === "scheduler" && (
+<Card icon={Clock} title="Scheduler" hint="How often each job runs (live, no redeploy)">
             <div className="space-y-3">
               <CompactInput
                 label="News search + queue (minutes)"
@@ -604,9 +666,11 @@ function SettingsPage() {
               />
             </div>
           </Card>
+          )}
 
           {/* AI Dedup */}
-          <Card icon={Cpu} title="AI Dedup" hint="Final duplicate check (Groq/OpenRouter/Cloudflare)">
+                    {activeTab === "ai" && (
+<Card icon={Cpu} title="AI Dedup" hint="Final duplicate check (Groq/OpenRouter/Cloudflare)">
             <div className="space-y-3">
               <CompactToggle
                 label="Enable AI final dedup"
@@ -652,9 +716,11 @@ function SettingsPage() {
               />
             </div>
           </Card>
+          )}
 
           {/* News quality */}
-          <Card icon={Gauge} title="News quality" hint="Breaking recency, fact consistency and update cadence">
+                    {activeTab === "ai" && (
+<Card icon={Gauge} title="News quality" hint="Breaking recency, fact consistency and update cadence">
             <div className="space-y-3">
               <CompactInput
                 label="Breaking max age (hours)"
@@ -702,9 +768,11 @@ function SettingsPage() {
               />
             </div>
           </Card>
+          )}
 
           {/* Daily Bulletin */}
-          <Card icon={BookOpen} title="Daily Bulletin" hint="Auto-generated morning summary">
+                    {activeTab === "publishing" && (
+<Card icon={BookOpen} title="Daily Bulletin" hint="Auto-generated morning summary">
             <div className="space-y-3">
               <CompactInput
                 label="Bulletin time"
@@ -727,9 +795,11 @@ function SettingsPage() {
               />
             </div>
           </Card>
+          )}
 
           {/* Language */}
-          <Card icon={Languages} title="Language" hint="Default output language">
+                    {activeTab === "general" && (
+<Card icon={Languages} title="Language" hint="Default output language">
             <CompactSelect
               label="News language"
               value={s["defaultLanguage"] ?? "en"}
@@ -741,9 +811,11 @@ function SettingsPage() {
               ]}
             />
           </Card>
+          )}
 
           {/* Posting Windows */}
-          <Card
+                    {activeTab === "publishing" && (
+<Card
             icon={CalendarClock}
             title="Posting Windows"
             hint="Spacing between posts = this window's Min–Max (randomized). Night also gates breaking unless interrupted"
@@ -784,9 +856,11 @@ function SettingsPage() {
               </div>
             </div>
           </Card>
+          )}
 
           {/* Breaking-News Criteria */}
-          <Card
+                    {activeTab === "general" && (
+<Card
             icon={Flame}
             title="Breaking-News Criteria"
             hint="Toggle categories that trigger breaking alerts"
@@ -811,9 +885,11 @@ function SettingsPage() {
               />
             </div>
           </Card>
+          )}
 
           {/* Translation Glossary */}
-          <Card
+                    {activeTab === "translation" && (
+<Card
             icon={ScrollText}
             title="Translation Glossary"
             hint="One term per line: English = Kurdish Sorani"
@@ -831,16 +907,18 @@ function SettingsPage() {
               {(s["translationGlossary"] ?? "").length} characters
             </p>
           </Card>
+          )}
         </div>
-      )}
+      }
 
       {/* ════════════════════════════════════════════════
             SOURCES & TRANSLATION TAB
           ════════════════════════════════════════════════ */}
-      {activeTab === "sources" && (
+      {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 auto-rows-min gap-4">
           {/* Providers */}
-          <Card
+                    {activeTab === "sources" && (
+<Card
             icon={Package}
             title="Providers"
             hint={`${sources.length} source${sources.length !== 1 ? "s" : ""} configured`}
@@ -891,9 +969,11 @@ function SettingsPage() {
               → paste it in the Secret ref field above. RSS feeds: use the feed URL as the secret ref.
             </div>
           </Card>
+          )}
 
           {/* Telegram Channels */}
-          <Card
+                    {activeTab === "telegram" && (
+<Card
             icon={Hash}
             title="Telegram Channels"
             hint="Monitored channels"
@@ -950,9 +1030,11 @@ function SettingsPage() {
               </div>
             </div>
           </Card>
+          )}
 
           {/* Source Quality */}
-          <Card
+                    {activeTab === "sources" && (
+<Card
             icon={Activity}
             title="Source Quality"
             hint="Track per-source accept/reject rates and auto-pause junk feeds"
@@ -981,9 +1063,11 @@ function SettingsPage() {
               </p>
             </div>
           </Card>
+          )}
 
           {/* Topic Queries */}
-          <Card
+                    {activeTab === "telegram" && (
+<Card
             icon={Filter}
             title="Topic Queries"
             hint={`${topics.length} topic${topics.length !== 1 ? "s" : ""}`}
@@ -1017,9 +1101,11 @@ function SettingsPage() {
               )}
             </div>
           </Card>
+          )}
 
           {/* Translation Provider */}
-          <Card icon={Cpu} title="Translation Provider" hint="Model selection">
+                    {activeTab === "translation" && (
+<Card icon={Cpu} title="Translation Provider" hint="Model selection">
             <div className="space-y-2">
               <CompactSelect
                 label="Gemini model"
@@ -1050,9 +1136,11 @@ function SettingsPage() {
               </Button>
             </div>
           </Card>
+          )}
 
           {/* Translation API Keys */}
-          <Card
+                    {activeTab === "translation" && (
+<Card
             icon={Terminal}
             title="Translation API Keys"
             hint={`${tkeys.length} stored${envGeminiCount > 0 ? ` · ${envGeminiCount} env` : ""}`}
@@ -1150,9 +1238,11 @@ function SettingsPage() {
               </div>
             ) : null}
           </Card>
+          )}
 
           {/* Gemini Key Usage */}
-          <Card
+                    {activeTab === "translation" && (
+<Card
             icon={Flame}
             title="Gemini Key Usage"
             hint="Per-key × per-model usage + live quota check"
@@ -1284,9 +1374,11 @@ function SettingsPage() {
               </div>
             ) : null}
           </Card>
+          )}
 
           {/* Translation History */}
-          <Card
+                    {activeTab === "translation" && (
+<Card
             icon={Clock}
             title="Translation History"
             hint={`${translationHistory.length} recent`}
@@ -1342,9 +1434,11 @@ function SettingsPage() {
               )}
             </div>
           </Card>
+          )}
 
           {/* Translation Failures */}
-          <Card
+                    {activeTab === "translation" && (
+<Card
             icon={AlertTriangle}
             title="Translation Failures"
             hint={`${translationFailures.length} recent`}
@@ -1378,16 +1472,18 @@ function SettingsPage() {
               )}
             </div>
           </Card>
+          )}
         </div>
-      )}
+      }
 
       {/* ════════════════════════════════════════════════
             SYSTEM TAB
           ════════════════════════════════════════════════ */}
-      {activeTab === "system" && (
+      {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 auto-rows-min gap-4">
           {/* Bot Connection */}
-          <Card
+                    {activeTab === "telegram" && (
+<Card
             icon={Wifi}
             title="Bot Connection"
             hint="Telegram bot status"
@@ -1455,9 +1551,11 @@ function SettingsPage() {
               />
             </div>
           </Card>
+          )}
 
           {/* Chats */}
-          <Card
+                    {activeTab === "telegram" && (
+<Card
             icon={MessageCircle}
             title="Chats"
             hint={`${chats.length} chat${chats.length !== 1 ? "s" : ""}`}
@@ -1536,9 +1634,11 @@ function SettingsPage() {
               </div>
             </div>
           </Card>
+          )}
 
           {/* Polls */}
-          <Card icon={Vote} title="Polls" hint="Send a test poll">
+                    {activeTab === "telegram" && (
+<Card icon={Vote} title="Polls" hint="Send a test poll">
             <div className="space-y-2">
               <input id="poll-chat-id" type="number" placeholder="e.g. -1001234567890" className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm text-foreground" />
               <Button
@@ -1557,9 +1657,11 @@ function SettingsPage() {
               </Button>
             </div>
           </Card>
+          )}
 
           {/* Recent Polls */}
-          <Card
+                    {activeTab === "telegram" && (
+<Card
             icon={BarChart3}
             title="Recent Polls"
             hint={`${polls.length} poll${polls.length !== 1 ? "s" : ""}`}
@@ -1616,8 +1718,83 @@ function SettingsPage() {
               )}
             </div>
           </Card>
+          )}
+        </div>
+      }
+      </div>
+      </div>
+      {/* ════════════════════════════════════════════════
+            SYSTEM TAB
+          ════════════════════════════════════════════════ */}
+      {activeTab === "system" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 auto-rows-min gap-4">
+          <Card icon={Server} title="System Status" hint="Deployed backend health" className="lg:col-span-2">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Schema</p>
+                <p className={`mt-0.5 text-xs font-medium ${(data as any).schemaMigrations?.ok ? "text-emerald-400" : "text-destructive"}`}>
+                  {(data as any).schemaMigrations?.ok ? "migrations 0001–0011 applied" : "migrations missing — pipeline cannot queue"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Telegram bot</p>
+                <p className={`mt-0.5 text-xs font-medium ${(data as any).botConfigured ? "text-emerald-400" : "text-destructive"}`}>
+                  {(data as any).botConfigured ? "token configured" : "no token"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">NewsData</p>
+                <p className={`mt-0.5 text-xs font-medium ${(data as any).newsdataConfigured ? "text-emerald-400" : "text-muted-foreground"}`}>
+                  {(data as any).newsdataConfigured ? "API key set" : "no key"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Queue</p>
+                <p className="mt-0.5 text-xs font-medium text-foreground">{data.queuedTotal ?? 0} queued</p>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Published 24h</p>
+                <p className="mt-0.5 text-xs font-medium text-foreground">{data.published24h ?? 0}</p>
+              </div>
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Translation fails 24h</p>
+                <p className={`mt-0.5 text-xs font-medium tabular-nums ${Number(data.translationFails24h ?? 0) > 0 ? "text-destructive" : "text-foreground"}`}>
+                  {data.translationFails24h ?? 0}
+                </p>
+              </div>
+            </div>
+          </Card>
         </div>
       )}
+
+      {/* ════════════════════════════════════════════════
+            SECURITY TAB
+          ════════════════════════════════════════════════ */}
+      {activeTab === "security" && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 auto-rows-min gap-4">
+          <Card icon={ShieldCheck} title="Security" hint="How this console is protected" className="lg:col-span-2">
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                <span className="text-xs font-medium text-foreground">PIN-secured session active</span>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Every action in this console is gated by the admin PIN stored in this browser. The dashboard talks only
+                to the PIN-gated <code className="rounded bg-muted px-1 py-0.5">admin</code> edge function — the database
+                itself is locked down with row-level security (migration 0007) and is never reached directly from the
+                browser.
+              </p>
+              <p className="text-[11px] text-muted-foreground">
+                Settings save automatically as you type — nothing resets on login, refresh or redeploy.
+              </p>
+              <Button size="sm" variant="outline" className="h-8 gap-1.5 text-[11px] border-destructive/40 text-destructive hover:bg-destructive/10" onClick={lock}>
+                <Lock className="h-3.5 w-3.5" /> Lock console now
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
+
     </div>
   );
 }

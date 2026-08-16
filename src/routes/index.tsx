@@ -3,21 +3,20 @@ import { useEffect, useState } from "react";
 import { adminApi } from "@/lib/adminApi";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { toast } from "sonner";
 import { AdminError } from "@/lib/adminApi";
+import { toast } from "sonner";
 
 const PIN_STORAGE_KEY = "freebuff_admin_pin";
 
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Sign in · Iran Desk Bot Console" },
+      { title: "Sign in · Iran Desk" },
       {
         name: "description",
         content: "Private admin console for the Iran–U.S. conflict Telegram news bot.",
       },
-      { property: "og:title", content: "Iran Desk Bot Console" },
+      { property: "og:title", content: "Iran Desk" },
       { property: "og:description", content: "Private operations console for an automated Iran–U.S. conflict news bot." },
       { name: "robots", content: "noindex,nofollow" },
     ],
@@ -32,7 +31,7 @@ function SignIn() {
 
   useEffect(() => {
     if (typeof window !== "undefined" && localStorage.getItem(PIN_STORAGE_KEY)) {
-      navigate({ to: "/dashboard", replace: true });
+      navigate({ to: "/overview", replace: true });
     }
   }, [navigate]);
 
@@ -46,8 +45,8 @@ function SignIn() {
       // rejected right here on the form.
       await adminApi.verifyPin({ pin: pin.trim() });
       localStorage.setItem(PIN_STORAGE_KEY, pin.trim());
-      toast.success("PIN accepted. Opening console…");
-      navigate({ to: "/dashboard" });
+      toast.success("PIN accepted. Opening newsroom…");
+      navigate({ to: "/overview" });
     } catch (err) {
       const msg =
         err instanceof AdminError
@@ -66,36 +65,41 @@ function SignIn() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center px-4">
-      <div className="panel w-full max-w-sm p-8">
-        <p className="text-xs font-semibold uppercase tracking-[0.25em] text-primary">
-          Iran Desk
+    <main className="flex min-h-screen flex-col items-center justify-center px-4">
+      <div className="w-full max-w-sm text-center">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-muted-foreground">
+          Newsroom operations
         </p>
-        <h1 className="mt-2 text-2xl font-semibold">Bot operations console</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Private access. Enter your admin PIN.
+        <h1 className="mt-3 text-4xl font-bold tracking-[0.08em] text-foreground">
+          IRAN DESK
+        </h1>
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          Private access — enter your admin PIN.
         </p>
 
-        <form onSubmit={submit} className="mt-6 space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="pin">Admin PIN</Label>
-            <Input
-              id="pin"
-              type="password"
-              inputMode="numeric"
-              autoComplete="off"
-              autoFocus
-              placeholder="••••••"
-              value={pin}
-              onChange={(e) => setPin(e.target.value)}
-              minLength={4}
-              required
-            />
-          </div>
-          <Button type="submit" className="w-full" disabled={busy}>
-            {busy ? "Please wait…" : "Unlock console"}
+        <form onSubmit={submit} className="mx-auto mt-8 max-w-[240px] space-y-3">
+          <Input
+            id="pin"
+            type="password"
+            inputMode="numeric"
+            autoComplete="off"
+            autoFocus
+            placeholder="••••••"
+            value={pin}
+            onChange={(e) => setPin(e.target.value)}
+            minLength={4}
+            required
+            className="h-11 text-center text-lg tracking-[0.35em]"
+          />
+          <Button type="submit" className="h-11 w-full" disabled={busy}>
+            {busy ? "Verifying…" : "ENTER NEWSROOM"}
           </Button>
         </form>
+
+        <p className="mt-8 flex items-center justify-center gap-1.5 text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
+          <span className="h-1.5 w-1.5 rounded-full bg-healthy" />
+          System online
+        </p>
       </div>
     </main>
   );
