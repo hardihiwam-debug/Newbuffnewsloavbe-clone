@@ -2236,11 +2236,10 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   for (let c = 0; c < toExtract.length; c += GROQ_CHUNK_SIZE) {
     toExtractChunks.push(toExtract.slice(c, c + GROQ_CHUNK_SIZE));
   }
-  // Run the rewrite chunks with 3 concurrent workers (each result lands in
-  // its own slot, so order is preserved) so a wide ingest doesn't spend most
-  // of the function timeout on sequential LLM calls.
+  // Run the rewrite chunks sequentially (worker = 1) so concurrent LLM calls
+  // don't trigger 429 rate-limit bursts on Groq/Cloudflare/Gemini free tiers.
   const chunkResults: Array<Array<ExtractedFacts | null>> = new Array(toExtractChunks.length);
-  const GROQ_WORKERS = 3;
+  const GROQ_WORKERS = 1;
   let chunkCursor = 0;
   const chunkWorker = async () => {
     while (budgetLeft() && chunkCursor < toExtractChunks.length) {
