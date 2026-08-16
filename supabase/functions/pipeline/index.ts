@@ -945,19 +945,19 @@ async function groqRewrite(items: Array<{ title: string; description: string | n
   const messages = [
     {
       role: "system",
-      content: `You are a wire editor for an Iraqi, Muslim, pro-Iran regional news channel. Return ONLY a JSON object mapping each item's number to its rewrite, one {"headline": string, "summary": string} per input, e.g. {"1": {"headline": "...", "summary": "..."}}.\nRules:\n- Headline: factual, under 110 characters, no clickbait or feed labels.\n- Summary: write a RICH, COMPLETE, self-contained news summary (3-5 sentences) that stands alone — a reader must understand the full story WITHOUT opening the source link. Lead with who did what, where and when. Then explain why it matters and, when the source provides it, weave in the background and context and any conflicting accounts, attributed inline ("Iran says…", "Israel says…", "the Pentagon says…"). Carry over every concrete fact — names, numbers, quotes, places, casualty counts, prices, percentages.\n- Aim for roughly 60-150 words; a terse one-liner is a failure. Never just repeat the headline.\n- Do NOT invent facts. Do not add opinion or hostile framing about Iran. Professional English only.\n- Never end with an ellipsis or an unfinished clause.`,
+      content: `You are a professional wire editor for a regional news channel. Return ONLY a JSON object mapping each item's number to its rewrite, one {"headline": string, "summary": string} per input, e.g. {"1": {"headline": "...", "summary": "..."}}.\nRules:\n- Headline: factual, concise (under 100 characters), captures the main event. No clickbait or feed labels.\n- Summary: write a COMPREHENSIVE, detailed news summary that provides substantial information beyond the headline. Include specific details: who, what, where, when, why, and how. Add context, background information, relevant statistics, quotes, and implications. The summary should be significantly longer and more detailed than the headline, offering real value to readers.\n- Ensure the summary contains NEW information not found in the headline. Do not repeat headline content in the summary.\n- Include concrete facts: names, numbers, dates, locations, casualty figures, financial data, percentages, official statements.\n- When sources conflict, present multiple perspectives with proper attribution.\n- Write in professional, objective journalistic style. No invented facts or opinions.\n- Length: aim for 150-300 words for substantial coverage. Quality over brevity.\n- Never end with ellipsis or unfinished sentences.`,
     },
     {
       role: "user",
-      content: JSON.stringify(items.map((item, i) => ({ [String(i + 1)]: { title: item.title, description: item.description?.slice(0, 2400) ?? null } }))),
+      content: JSON.stringify(items.map((item, i) => ({ [String(i + 1)]: { title: item.title, description: item.description?.slice(0, 3000) ?? null } }))),
     },
   ];
   try {
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
-      body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages, temperature: 0, max_tokens: 4000, response_format: { type: "json_object" } }),
-      signal: AbortSignal.timeout(45_000),
+      body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages, temperature: 0.1, max_tokens: 6000, response_format: { type: "json_object" } }),
+      signal: AbortSignal.timeout(60_000),
     });
     const raw = await res.text();
     if (!res.ok) throw new Error(`Groq ${res.status}`);
