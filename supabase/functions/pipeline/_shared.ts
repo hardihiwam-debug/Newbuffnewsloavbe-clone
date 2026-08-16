@@ -394,3 +394,132 @@ export function chooseDeliveryMode(
   if (post.imageUrl && mediaKind !== "video_thumb") return "photo";
   return "text";
 }
+
+
+// ── Sorani translation validator ────────────────────────────────────────────
+// Rejects outputs that are clearly not Kurdish Sorani (English or
+// Latin-transliterated text). The allowed charset deliberately includes the
+// U+FE0F variation selector (FE00-FEFF) so valid translations that preserve
+// Telegram emojis like "❗️" / "⭕️" are NOT rejected — that regression used to
+// bounce every emoji-prefixed Telegram post to the English fallback.
+export const SORANI_ALLOWED =
+  /^[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE00-\uFEFF0-9\s\p{P}\p{S}\p{Extended_Pictographic}A-Za-z.-]*$/u;
+export function validateSorani(text: string): boolean {
+  if (!text.trim()) return false;
+  const latin = (text.match(/[A-Za-z]/g) ?? []).length;
+  const arabic = (text.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/g) ?? []).length;
+  if (arabic < 2) return false;
+  // A real Sorani translation of a Lebanon/Israel story keeps many Latin
+  // proper nouns (Israel, Merkava, place names). Reject only when Latin
+  // clearly dominates the Sorani script — English output has ~0 Arabic
+  // chars and is already rejected above.
+  if (latin > Math.max(50, arabic)) return false;
+  return SORANI_ALLOWED.test(text);
+}
+
+
+// ── Robust LLM JSON extraction ──────────────────────────────────────────────
+// Llama-class models (Groq / OpenRouter / Cloudflare all serve Llama 3.3)
+// frequently emit a valid JSON object followed by trailing prose, or two
+// concatenated objects. JSON.parse on the whole string then throws
+// "Unexpected non-whitespace character after JSON". This returns just the
+// FIRST balanced {...} object so the parser only ever sees clean JSON.
+export function extractFirstJsonObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+// ── Relevance / beat gate ───────────────────────────────────────────────────
+// Pure classification: does a story belong to the Iran/Iraq conflict beat?
+// Moved here (from the edge function) so it is unit-testable. `title` and
+// `description` are the raw ENGLISH source text.
+
+export const SOFT_NEWS_PATTERNS: RegExp[] = [
+  /\b(football|soccer|volleyball|basketball|wrestling|weightlifting|futsal|goalkeep\w*|striker|midfielder|league|premier league|world cup|olympic|olympiad|championship|tournament|match|derby|coach|club|esteghlal|persepolis|sepahan|tractor)\b/i,
+  /\b(film|movie|cinema|festival|actor|actress|director'?s cut|box office|series|drama|music|singer|concert|album|art exhibition|exhibition|gallery|artwork(?:s)?|painting|sculpture|photography|pottery|ceramic|theatre|theater|dance|ballet|opera|poetry|poem|museum|carpet weaving|handicraft)\b/i,
+  /\b(recipe|cuisine|restaurant|tourism|tourist|travel guide|hotel|resort|nowruz celebration|fashion|celebrity|royal family|dating|horoscope)\b/i,
+  /\b(aquaculture|mariculture|marine farm(?:ing)?|fish farm(?:ing)?|fisheries)\b/i,
+  /\b(electricity (?:sector|grid|co-?op(?:eration)?|transmission)|power (?:grid|sector|transmission))\b/i,
+  /\b(earthquake drill|weather forecast|air pollution index|traffic accident|road crash|bus crash|train derail)\b/i,
+  /\b(school shooting|mass shooting)\b/i,
+  /\b(caspian sea convention|delimitation of (the )?(seabed|subsoil)|urmia lake)\b/i,
+];
+
+export const BEAT_PATTERNS: RegExp[] = [
+  /\b(iran|iranian|tehran|irgc|khamenei|pezeshkian|qalibaf|ghalibaf|araghchi|larijani|islamic republic|persian gulf|hormuz)\b/i,
+  /\b(iraq|iraqi|baghdad|basra|mosul|erbil|sulaymaniyah|kurdistan region|najaf|karbala|sistani|sudani|pmf|hashd)\b/i,
+  /\b(hezbollah|houthi|ansar allah|kataib|kata.?ib|nujaba|axis of resistance|hamas|militia|proxy|proxies|popular mobilization|badr|asayib|saraya|resistance front)\b/i,
+  /\b(nuclear|uranium|enrich\w*|iaea|sanction\w*|snapback|jcpoa)\b/i,
+  /\b(centcom|pentagon|us (navy|military|forces|troops)|carrier strike group|airstrike|air strike|missile|drone|ballistic|ceasefire|war|attack|strike)\b/i,
+  /\b(oil|crude|brent|opec|barrel|refinery|tanker|shipping lane|red sea|bab el-?mandeb|gold (price|prices?|market|rally|climb|slip|fall|rise|surge|trad\w*|futures)|bullion|natural gas|lng|petrochemical|energy market)\b/i,
+  /\b(middle east|gulf states|saudi|riyadh|qatar|uae|oman|bahrain|kuwait|syria|lebanon|yemen|turkey|ankara|israel|israeli|netanyahu|tel aviv|idf|golan|jordan|amman|egypt|cairo|gaza|west bank|palestin\w*|kurdish|kurd|peshmerga|sdf)\b/i,
+];
+
+export function relevanceGate(
+  title: string,
+  description?: string | null,
+): { ok: boolean; reason?: string } {
+  const text = `${title} ${description ?? ""}`;
+  if (SOFT_NEWS_PATTERNS.some((p) => p.test(text))) return { ok: false, reason: "off-beat soft news" };
+
+  // Self-sufficient signals — conflict/security, proxies, nuclear and the
+  // oil/gold/energy market pass on their own, without needing a country word.
+  const selfSufficient = /\b(hezbollah|houthi|ansar allah|hamas|militia|axis of resistance|irgc|kataib|kata.?ib|nujaba|popular mobilization|badr|asayib|saraya|resistance front|proxy|proxies|missile|ballistic|airstrike|air strike|ceasefire|invasion|offensive|shelling|bombing|death toll|massacre|hostage|captive|carrier strike group|centcom|pentagon|hormuz|nuclear|uranium|enrich\w*|iaea|sanction\w*|snapback|jcpoa|oil|crude|brent|opec|barrel|refiner\w*|tanker|natural gas|lng|petrochemical|gold|bullion)\b/i.test(text);
+  if (selfSufficient) return { ok: true };
+
+  // Actor/location inside the beat (Iran, Iraq, wider Middle East) plus US
+  // military engagement in the region.
+  const inBeat = [BEAT_PATTERNS[0], BEAT_PATTERNS[1], BEAT_PATTERNS[6]].some((p) => p!.test(text));
+  const usRegional = /\b(centcom|pentagon|us (navy|military|forces|troops)|carrier strike group)\b/i.test(text);
+  // A concrete development is required when only a location matched — a bare
+  // "Iran" mention (a feature, a student prize, a routine bilateral meeting)
+  // is not a conflict-beat story.
+  const concrete = /\b(attack\w*|strike\w*|clash\w*|escalat\w*|tension\w*|threat\w*|warn\w*|vow\w*|denounce|condemn|retaliat\w*|respond\w*|response|deni\w*|killed|dead|death|wounded|injured|casualt\w*|military|troops|forces|navy|army|defense|defence|deploy\w*|redeploy\w*|reinforce\w*|mobiliz\w*|intercept\w*|withdraw\w*|ministry|minister|president|prime minister|leader|leadership|commander|official\w*|parliament|government|regime|diploma\w*|negotiat\w*|talks|agreement|deal|policy|policies|pressure|election\w*|protest\w*|uprising|arrest\w*|detain\w*|execut\w*|sentenc\w*|intelligence|spy|espionage|security|border|crossing|smuggl\w*|missile|drone|war|conflict|ceasefire|sanction\w*|export\w*|import\w*|pipeline)\b/i.test(text);
+  if ((inBeat || usRegional) && concrete) return { ok: true };
+
+  // Operator carve-out: only MAJOR Russia–Ukraine war news (invasion,
+  // offensive, casualties, mass strikes) — never routine "drone hit a
+  // warehouse" noise.
+  const ru = /\b(russia|russian|ukrain\w*|kyiv|moscow|zelensky|putin|kremlin|donbass|crimea)\b/i.test(text);
+  const ruMajor = /\b(invasion|offensive|counter[- ]?offensive|front[- ]?line|escalat\w+|war|ceasefire|peace (talks|deal|negotiat\w+)|surrender|casualt\w*|\d+\s+(killed|dead)|deadly|massacre|mass[- ]?grave|mobiliz\w+|annex\w+|territor\w+|massive (airstrike|strike|attack|barrage)|missile barrage|energy (grid|infrastructure)|blackout)\b/i.test(text);
+  if (ru && ruMajor) return { ok: true };
+
+  return { ok: false, reason: "unrelated to the conflict beat" };
+}
+
+// ── Source daily quota accounting (pure — unit-tested) ─────────────────────
+// Same-day calls accumulate; the counter resets the first time we touch it on
+// a new day. `today` is the caller's date key (YYYY-MM-DD, UTC for now).
+export function computeQuotaPatch(
+  today: string,
+  usedToday: number | null | undefined,
+  quotaDate: string | null | undefined,
+  calls: number,
+): { used_today: number; quota_date: string } {
+  const sameDay = quotaDate === today;
+  return {
+    used_today: (sameDay ? Number(usedToday ?? 0) : 0) + calls,
+    quota_date: today,
+  };
+}

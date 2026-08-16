@@ -71,6 +71,7 @@ function Sources() {
                 <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
                   <span>{src.kind}</span>
                   <span>{ok} ok · {rej} rejected</span>
+                  {src.dailyQuota ? <span className="tabular-nums">{Number(src.usedToday ?? 0)} / {Number(src.dailyQuota)} used today</span> : null}
                   {rate !== null ? <span>{rate}% accepted</span> : null}
                   {src.lastSuccessAt ? <span>last fetch {relTime(src.lastSuccessAt)}</span> : <span>no successful fetch yet</span>}
                   {src.enabled === false ? <span className="text-destructive">disabled</span> : null}
@@ -97,6 +98,12 @@ function Sources() {
                 <div>
                   <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Articles today</p>
                   <p className="mt-0.5 font-medium tabular-nums text-foreground">{Number(selected.publishedCount ?? 0)}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Quota today</p>
+                  <p className="mt-0.5 font-medium tabular-nums text-foreground">
+                    {selected.dailyQuota ? `${Number(selected.usedToday ?? 0)} / ${Number(selected.dailyQuota)}` : "—"}
+                  </p>
                 </div>
                 <div>
                   <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Rejected</p>

@@ -16,7 +16,9 @@ import {
   checkNumberConsistency,
   chooseDeliveryMode,
   crossLanguageSimilarity,
+  computeQuotaPatch,
   eventSimilarity,
+  extractFirstJsonObject,
   fitCaption,
   formatMessage,
   isBreaking,
@@ -24,8 +26,10 @@ import {
   keywordCategory,
   matchEventCluster,
   normalizeTitle,
+  relevanceGate,
   sameEvent,
   severityLevel,
+  validateSorani,
   type Post,
   type PostFormat,
 } from "./_shared.ts";
@@ -44,6 +48,17 @@ const MINIMAX_API_KEY = Deno.env.get("MINIMAX_API_KEY") ?? "";
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY") ?? "";
 const CLOUDFLARE_API_TOKEN = Deno.env.get("CLOUDFLARE_API_TOKEN") ?? "";
 const CLOUDFLARE_ACCOUNT_ID = Deno.env.get("CLOUDFLARE_ACCOUNT_ID") ?? "";
+
+// ── Pipeline tuning (operator decisions) ────────────────────────────────────
+// Posts sent per publish cycle. Raising this drains the backlog faster; the
+// day/night window gap still spaces cycles apart.
+const PUBLISH_BATCH_SIZE = 3;
+// Ingest net width per cycle. NewsData groups are one API call each (the
+// provider's own free tier caps at 200 requests/day, not us).
+const NEWSDATA_MAX_GROUPS = 8;
+const RSS_MAX_QUERIES = 12;
+const PUBLISHER_FEED_CAP = 15;
+const TELEGRAM_POSTS_PER_CHANNEL = 40;
 
 function geminiKeys(): Array<{ index: number; key: string }> {
   const out: Array<{ index: number; key: string }> = [];
@@ -370,27 +385,27 @@ const PUBLISHER_FEEDS: Array<{ name: string; url: string; cap?: number; group?: 
   { name: "Tasnim News", url: "https://www.tasnimnews.com/en/rss/feed/0/8/0/", group: "Iran & Gulf" },
   { name: "IRNA English", url: "https://en.irna.ir/rss", group: "Iran & Gulf" },
   { name: "Rudaw", url: "https://www.rudaw.net/rss/english", group: "Iran & Gulf" },
-  { name: "Amwaj.media", url: "https://amwaj.media/rss", cap: 4, group: "Iran & Gulf" },
-  { name: "Financial Tribune", url: "https://financialtribune.com/rss", cap: 4, group: "Iran & Gulf" },
-  { name: "Defense News Mideast", url: "https://www.defensenews.com/arc/outboundfeeds/rss/category/mideast-africa/?outputType=xml", cap: 6, group: "Iran & Gulf" },
+  { name: "Amwaj.media", url: "https://amwaj.media/rss", cap: 15, group: "Iran & Gulf" },
+  { name: "Financial Tribune", url: "https://financialtribune.com/rss", cap: 15, group: "Iran & Gulf" },
+  { name: "Defense News Mideast", url: "https://www.defensenews.com/arc/outboundfeeds/rss/category/mideast-africa/?outputType=xml", cap: 15, group: "Iran & Gulf" },
   // Lebanon & Levant
   { name: "Al Mayadeen", url: "https://english.almayadeen.net/rss", group: "Lebanon & Levant" },
-  { name: "L'Orient Today", url: "https://today.lorientlejour.com/feed/", cap: 6, group: "Lebanon & Levant" },
-  { name: "Middle East Monitor", url: "https://www.middleeastmonitor.com/feed/", cap: 6, group: "Lebanon & Levant" },
-  { name: "The National", url: "https://www.thenationalnews.com/arcio/rss/", cap: 6, group: "Lebanon & Levant" },
+  { name: "L'Orient Today", url: "https://today.lorientlejour.com/feed/", cap: 15, group: "Lebanon & Levant" },
+  { name: "Middle East Monitor", url: "https://www.middleeastmonitor.com/feed/", cap: 15, group: "Lebanon & Levant" },
+  { name: "The National", url: "https://www.thenationalnews.com/arcio/rss/", cap: 15, group: "Lebanon & Levant" },
   { name: "Shafaq News", url: "https://shafaq.com/en/rss", group: "Lebanon & Levant" },
   // Gulf business & energy
-  { name: "OilPrice.com", url: "https://oilprice.com/rss/main", cap: 6, group: "Gulf business & energy" },
-  { name: "CNBC Energy", url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19836768", cap: 6, group: "Gulf business & energy" },
-  { name: "Gulf Business", url: "https://gulfbusiness.com/feed/", cap: 6, group: "Gulf business & energy" },
-  { name: "The National Business", url: "https://www.thenationalnews.com/business/arcio/rss/", cap: 6, group: "Gulf business & energy" },
-  { name: "Arabian Business", url: "https://www.arabianbusiness.com/feed/", cap: 6, group: "Gulf business & energy" },
+  { name: "OilPrice.com", url: "https://oilprice.com/rss/main", cap: 15, group: "Gulf business & energy" },
+  { name: "CNBC Energy", url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19836768", cap: 15, group: "Gulf business & energy" },
+  { name: "Gulf Business", url: "https://gulfbusiness.com/feed/", cap: 15, group: "Gulf business & energy" },
+  { name: "The National Business", url: "https://www.thenationalnews.com/business/arcio/rss/", cap: 15, group: "Gulf business & energy" },
+  { name: "Arabian Business", url: "https://www.arabianbusiness.com/feed/", cap: 15, group: "Gulf business & energy" },
   // Independent analysis
-  { name: "Middle East Eye", url: "https://www.middleeasteye.net/rss", cap: 4, group: "Independent analysis" },
-  { name: "War on the Rocks", url: "https://warontherocks.com/feed/", cap: 4, group: "Independent analysis" },
-  { name: "Responsible Statecraft", url: "https://responsiblestatecraft.org/feed/", cap: 4, group: "Independent analysis" },
-  { name: "Atlantic Council MENASource", url: "https://www.atlanticcouncil.org/blogs/menasource/feed/", cap: 4, group: "Independent analysis" },
-  { name: "Middle East Institute", url: "https://www.mei.edu/rss.xml", cap: 4, group: "Independent analysis" },
+  { name: "Middle East Eye", url: "https://www.middleeasteye.net/rss", cap: 15, group: "Independent analysis" },
+  { name: "War on the Rocks", url: "https://warontherocks.com/feed/", cap: 15, group: "Independent analysis" },
+  { name: "Responsible Statecraft", url: "https://responsiblestatecraft.org/feed/", cap: 15, group: "Independent analysis" },
+  { name: "Atlantic Council MENASource", url: "https://www.atlanticcouncil.org/blogs/menasource/feed/", cap: 15, group: "Independent analysis" },
+  { name: "Middle East Institute", url: "https://www.mei.edu/rss.xml", cap: 15, group: "Independent analysis" },
   // General wire
   { name: "Al Jazeera", url: "https://www.aljazeera.com/xml/rss/all.xml", group: "General wire" },
   { name: "BBC World", url: "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", group: "General wire" },
@@ -404,7 +419,7 @@ async function fetchPublisherFeeds(): Promise<Article[]> {
         const res = await fetch(feed.url, { headers: RSS_HEADERS, signal: AbortSignal.timeout(20_000) });
         if (!res.ok) return [] as Article[];
         const items = parseRssItems(await res.text(), `${feed.name} RSS`, feed.name);
-        return items.slice(0, feed.cap ?? 15);
+        return items.slice(0, feed.cap ?? PUBLISHER_FEED_CAP);
       } catch {
         return [] as Article[];
       }
@@ -638,7 +653,7 @@ async function fetchTelegramPostVideo(postUrl: string): Promise<string | null> {
   }
 }
 
-async function fetchTelegramChannel(channel: string, limit = 20): Promise<ChannelPost[]> {
+async function fetchTelegramChannel(channel: string, limit = TELEGRAM_POSTS_PER_CHANNEL): Promise<ChannelPost[]> {
   const name = channel.replace(/^@/, "").trim();
   const res = await fetch(`https://t.me/s/${enc(name)}`, {
     headers: TELEGRAM_HEADERS,
@@ -711,23 +726,6 @@ const NEGATIVE_IRAN_PATTERNS: RegExp[] = [
   /\b(report claims?|a report claims?|sources? claim|rumou?rs? (say|claim|suggest))\b[^.]{0,60}\b(die|death|dead|dying|assassinat\w+|flee|fled)\b/i,
   /\biran(?:ian|'s)?\b[^.]{0,80}\b(propaganda|brainwash\w*|deception|disinformation machine|war spectacle)\b/i,
 ];
-const SOFT_NEWS_PATTERNS: RegExp[] = [
-  /\b(football|soccer|volleyball|basketball|wrestling|weightlifting|futsal|goalkeep\w*|striker|midfielder|league|premier league|world cup|olympic|championship|tournament|match|derby|coach|club|esteghlal|persepolis|sepahan|tractor)\b/i,
-  /\b(film|movie|cinema|festival|actor|actress|director'?s cut|box office|series|drama|music|singer|concert|album|art exhibition|exhibition|gallery|artwork(?:s)?|painting|sculpture|photography|pottery|ceramic|theatre|theater|dance|ballet|opera|poetry|poem|museum|carpet weaving|handicraft)\b/i,
-  /\b(recipe|cuisine|restaurant|tourism|tourist|travel guide|hotel|resort|nowruz celebration|fashion|celebrity|royal family|dating|horoscope)\b/i,
-  /\b(earthquake drill|weather forecast|air pollution index|traffic accident|road crash|bus crash|train derail)\b/i,
-  /\b(school shooting|mass shooting)\b/i,
-  /\b(caspian sea convention|delimitation of (the )?(seabed|subsoil)|urmia lake)\b/i,
-];
-const BEAT_PATTERNS: RegExp[] = [
-  /\b(iran|iranian|tehran|irgc|khamenei|pezeshkian|qalibaf|ghalibaf|araghchi|larijani|islamic republic|persian gulf|hormuz)\b/i,
-  /\b(iraq|iraqi|baghdad|basra|mosul|erbil|sulaymaniyah|kurdistan region|najaf|karbala|sistani|sudani|pmf|hashd)\b/i,
-  /\b(hezbollah|houthi|ansar allah|kataib|kata.?ib|nujaba|axis of resistance|hamas|militia|proxy|proxies|popular mobilization|badr|asayib|saraya|resistance front)\b/i,
-  /\b(nuclear|uranium|enrich\w*|iaea|sanction\w*|snapback|jcpoa)\b/i,
-  /\b(centcom|pentagon|us (navy|military|forces|troops)|carrier strike group|airstrike|air strike|missile|drone|ballistic|ceasefire|war|attack|strike)\b/i,
-  /\b(oil|crude|brent|opec|barrel|refinery|tanker|shipping lane|red sea|bab el-?mandeb|gold (price|prices?|market|rally|climb|slip|fall|rise|surge|trad\w*|futures)|bullion|natural gas|lng|petrochemical|energy market)\b/i,
-  /\b(middle east|gulf states|saudi|riyadh|qatar|uae|oman|bahrain|kuwait|syria|lebanon|yemen|turkey|ankara|israel|israeli|netanyahu|tel aviv|idf|golan|jordan|amman|egypt|cairo|gaza|west bank|palestin\w*|kurdish|kurd|peshmerga|sdf)\b/i,
-];
 
 function gateOk(ok: boolean, reason: string): { ok: boolean; reason?: string } {
   return ok ? { ok: true } : { ok: false, reason };
@@ -753,30 +751,7 @@ function respectGate(a: Article): { ok: boolean; reason?: string } {
   if (NEGATIVE_IRAN_PATTERNS.some((p) => p.test(text))) return gateOk(false, "demoralising/unsourced negative Iran framing");
   return gateOk(true, "");
 }
-function relevanceGate(a: Article): { ok: boolean; reason?: string } {
-  const text = `${a.title} ${a.description ?? ""}`;
-  if (SOFT_NEWS_PATTERNS.some((p) => p.test(text))) return gateOk(false, "off-beat soft news");
 
-  // Core beat: Iran, Iraq, proxies, nuclear, oil/energy, Middle-East region.
-  const core = [BEAT_PATTERNS[0], BEAT_PATTERNS[1], BEAT_PATTERNS[2], BEAT_PATTERNS[3], BEAT_PATTERNS[5], BEAT_PATTERNS[6]].some((p) => p!.test(text));
-  // US military engagement in the region (Centcom / carrier groups).
-  const usRegional = /\b(centcom|pentagon|us (navy|military|forces|troops)|carrier strike group)\b/i.test(text);
-  if (core || usRegional) {
-    const genericWarMention = /\biran war\b/i.test(text);
-    const concreteEvent = /\b(attack|strike|missile|drone|killed|wounded|ceasefire|agreement|talks|negotiat|sanction|export|oil|hormuz|nuclear|military|government|minister|president|leader|commander|parliament|statement|announc|warn|percent|%)\b/i.test(text);
-    if (genericWarMention && !concreteEvent) return gateOk(false, "Iran war is only a passing mention");
-    return gateOk(true, "");
-  }
-
-  // Operator carve-out: only MAJOR Russia–Ukraine war news (invasion,
-  // offensive, casualties, mass strikes) — never routine "drone hit a
-  // warehouse" noise.
-  const ru = /\b(russia|russian|ukrain\w*|kyiv|moscow|zelensky|putin|kremlin|donbass|crimea)\b/i.test(text);
-  const ruMajor = /\b(invasion|offensive|counter[- ]?offensive|front[- ]?line|escalat\w+|ceasefire|peace (talks|deal|negotiat\w+)|surrender|casualt\w*|\d+\s+(killed|dead)|deadly|massacre|mass[- ]?grave|mobiliz\w+|annex\w+|territor\w+|massive (airstrike|strike|attack|barrage)|missile barrage|energy (grid|infrastructure)|blackout)\b/i.test(text);
-  if (ru && ruMajor) return gateOk(true, "");
-
-  return gateOk(false, "unrelated to the conflict beat");
-}
 
 const NON_LATIN_SCRIPT = /[\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0700-\u074F\u0900-\u097F\u0980-\u09FF\u0A00-\u0D7F\u0E00-\u0E7F\u10A0-\u10FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/u;
 const ACCENTED_LATIN = /[àâäãáçéèêëíìîïñóòôöõúùûüýÿåæøœšžğışİ]/i;
@@ -923,7 +898,7 @@ type ExtractedFacts = {
   facts: Record<string, unknown>;
 };
 
-async function groqExtractFacts(items: Array<{ title: string; description: string | null }>): Promise<Array<ExtractedFacts | null>> {
+async function groqExtractFacts(items: Array<{ title: string; description: string | null }>, deadline = Number.POSITIVE_INFINITY): Promise<Array<ExtractedFacts | null>> {
   if (items.length === 0) return [];
   const messages = [
     {
@@ -947,6 +922,11 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
 
   let lastError = "";
   for (const p of providers) {
+    // Stop the provider chain once the cycle's time budget is spent — an
+    // in-flight chunk here used to be able to run 3 × 40s = 120s past the
+    // deadline and kill the worker at the 150s limit.
+    if (Date.now() >= deadline) break;
+    const remainingMs = Math.max(5000, deadline - Date.now());
     try {
       const res = await fetch(p.url, {
         method: "POST",
@@ -960,7 +940,7 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
           // force JSON mode on Groq/OpenRouter.
           ...(p.name === "cloudflare" ? {} : { response_format: { type: "json_object" } }),
         }),
-        signal: AbortSignal.timeout(60_000),
+        signal: AbortSignal.timeout(Math.min(40_000, remainingMs)),
       });
       const raw = await res.text();
       if (!res.ok) throw new Error(`${p.name} ${res.status}`);
@@ -973,9 +953,9 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
       }
       let content = json.choices?.[0]?.message?.content ?? "";
       content = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-      const firstBrace = content.indexOf("{");
-      if (firstBrace > 0) content = content.slice(firstBrace);
-      const parsed = JSON.parse(content) as Record<string, Record<string, unknown>>;
+      const jsonObj = extractFirstJsonObject(content);
+      if (!jsonObj) throw new Error(`${p.name} returned no JSON object`);
+      const parsed = JSON.parse(jsonObj) as Record<string, Record<string, unknown>>;
       recordAiUsage(p.name, "rewrite", Number(json.usage?.prompt_tokens ?? 0), Number(json.usage?.completion_tokens ?? 0));
       return items.map((item, i) => {
         const row = parsed[String(i + 1)] ?? {};
@@ -1019,20 +999,6 @@ const SORANI_SYSTEM_PROMPT =
 const SORANI_SYSTEM_PROMPT_STRICT =
   "Translate the following message into Kurdish Sorani (Central Kurdish). You MUST output ONLY the translation in the Sorani Arabic script (ئەلفوبێی عەرەبیی سۆرانی). Do NOT answer in English or Latin script — translate every word into Sorani script except widely-recognised abbreviations (CIA, US, UN, NATO, CEO). Do NOT add commentary, explanations, a \"Translation:\" prefix, or quotes. Output ONLY the Sorani translation. Preserve emojis, links, line breaks, and formatting exactly. Preserve all numbers, dates, times and quoted statements exactly as given — never change, round or reword a figure.";
 
-const SORANI_ALLOWED =
-  /^[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF0-9\s\p{P}\p{S}\p{Extended_Pictographic}A-Za-z.-]*$/u;
-function validateSorani(text: string): boolean {
-  if (!text.trim()) return false;
-  const latin = (text.match(/[A-Za-z]/g) ?? []).length;
-  const arabic = (text.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/g) ?? []).length;
-  if (arabic < 2) return false;
-  // A real Sorani translation of a Lebanon/Israel story keeps many Latin
-  // proper nouns (Israel, Merkava, place names). Reject only when Latin
-  // clearly dominates the Sorani script — English output has ~0 Arabic
-  // chars and is already rejected above.
-  if (latin > Math.max(50, arabic)) return false;
-  return SORANI_ALLOWED.test(text);
-}
 
 function cleanGeminiTranslation(raw: string): string {
   let text = raw.trim();
@@ -1292,7 +1258,7 @@ async function aiDecideIsDuplicate(
   const texts = publishedTexts.slice(0, 20);
   if (texts.length === 0) return null;
   const system =
-    'You are a news-desk duplicate checker for an Iran/Iraq war news channel. Given a candidate news item and a list of already-published items, decide whether the candidate reports the SAME EVENT as one already published (including a clear follow-up of the same incident) or is genuinely NEW. Same actor + action + target + location + time = duplicate. A material new development (new casualty count, new official statement, new attack wave) is NEW. Respond with ONLY JSON: {"verdict":"duplicate"|"new","reason":"short reason"}.';
+    'You are a news-desk duplicate checker for an Iran/Iraq war news channel. Given a candidate news item and a list of already-published items, decide whether the candidate reports the SAME STORY as one already published, or is genuinely NEW. Treat as duplicate: same actor + target + location + day where only the framing/headline differs (e.g. "Trump pressures Iran" vs "Trump contains Iran fallout"), even if the action wording differs. A material NEW development (new casualty count, new official statement, new attack wave) is NEW. Respond with ONLY JSON: {"verdict":"duplicate"|"new","reason":"short reason"}.';
   const user = JSON.stringify({ candidate: candidateText.slice(0, 2000), already_published: texts.map((t) => t.slice(0, 1200)) });
   const order: Array<{ name: string; url: string; headers: Record<string, string>; model: string }> = [];
   const pushProvider = (name: string) => {
@@ -1330,9 +1296,9 @@ async function aiDecideIsDuplicate(
       } | null;
       const content = json?.choices?.[0]?.message?.content ?? "";
       let raw = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-      const firstBrace = raw.indexOf("{");
-      if (firstBrace > 0) raw = raw.slice(firstBrace);
-      const parsed = JSON.parse(raw) as { verdict?: string };
+      const jsonObj = extractFirstJsonObject(raw);
+      if (!jsonObj) continue;
+      const parsed = JSON.parse(jsonObj) as { verdict?: string };
       if (parsed.verdict === "duplicate" || parsed.verdict === "new") {
         recordAiUsage(cfg.name, "dedup", Number(json?.usage?.prompt_tokens ?? 0), Number(json?.usage?.completion_tokens ?? 0));
         return { verdict: parsed.verdict };
@@ -1753,6 +1719,26 @@ async function bumpSourceFailure(
   }
 }
 
+// ── Source daily quota tracking ────────────────────────────────────────────
+// NewsData charges per API request, so `used_today` counts successful calls
+// (failed requests don't consume a credit). The counter rolls over at
+// midnight so the dashboard's "X / 200 used today" stays honest instead of
+// the old always-zero placeholder.
+async function bumpSourceQuota(id: string, calls: number): Promise<void> {
+  if (!id || calls <= 0) return;
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const rows = await rest<Array<{ used_today: number; quota_date: string }>>("sources", {
+      query: `id=eq.${enc(id)}&select=used_today,quota_date&limit=1`,
+    });
+    const row = rows?.[0];
+    const patch = computeQuotaPatch(today, row?.used_today, row?.quota_date, calls);
+    await rest("sources", { method: "PATCH", query: `id=eq.${enc(id)}`, body: patch, prefer: "return=minimal" });
+  } catch {
+    /* quota tracking must never break ingest */
+  }
+}
+
 // ── Queue pruning + table retention (free-plan row hygiene) ─────────────
 // Runs at the top of every cycle; keeps the DB from growing unbounded:
 //   queue:                queued older than 24h -> expired; non-queued > 1h -> deleted
@@ -1856,7 +1842,7 @@ async function pruneQueueAndRetain(): Promise<void> {
 // telegram fast lane and the full ingest).
 async function fetchTelegramArticles(
   channelRows: Array<Record<string, unknown>>,
-  options: { botApiVideoFetch?: "off" | "bot_api"; stagingChatId?: number | null; autoPause?: { enabled: boolean; threshold: number } | null } = {},
+  options: { botApiVideoFetch?: "off" | "bot_api"; stagingChatId?: number | null; autoPause?: { enabled: boolean; threshold: number } | null; deadline?: number } = {},
 ): Promise<{ articles: Article[]; errors: string[]; botApiResolved: number }> {
   const articles: Article[] = [];
   const errors: string[] = [];
@@ -1874,25 +1860,35 @@ async function fetchTelegramArticles(
   const autoPause = options.autoPause ?? null;
   try {
     const posts: ChannelPost[] = [];
-    for (const src of channels) {
-      try {
-        posts.push(...(await fetchTelegramChannel(src.handle)));
-        await patchSourceHealth(src.rowId, null, 0);
-        if (src.wasFailing) {
-          await logActivity("source", "success", `@${src.handle} recovered — Telegram fetch OK again`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        errors.push(`@${src.handle}: ${msg}`);
-        const health = await bumpSourceFailure(src.rowId, msg, autoPause);
-        if (health?.first) {
-          await logActivity("source", "warning", `@${src.handle} Telegram fetch failed: ${msg}`);
-        }
-        if (health?.autoPaused) {
-          await logActivity("source", "error", `@${src.handle} auto-paused after ${health.failures} consecutive fetch failures: ${msg}`);
+    // Channels are independent I/O — run them through a small worker pool so
+    // N channels cost ~1 fetch time instead of N × 15s sequential (which used
+    // to push a wide ingest past the function timeout and leave the publish
+    // lock stuck). Each channel still keeps its own error/health handling.
+    const TG_WORKERS = 4;
+    let tgCursor = 0;
+    const tgWorker = async () => {
+      while (tgCursor < channels.length) {
+        const src = channels[tgCursor++]!;
+        try {
+          posts.push(...(await fetchTelegramChannel(src.handle)));
+          await patchSourceHealth(src.rowId, null, 0);
+          if (src.wasFailing) {
+            await logActivity("source", "success", `@${src.handle} recovered — Telegram fetch OK again`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errors.push(`@${src.handle}: ${msg}`);
+          const health = await bumpSourceFailure(src.rowId, msg, autoPause);
+          if (health?.first) {
+            await logActivity("source", "warning", `@${src.handle} Telegram fetch failed: ${msg}`);
+          }
+          if (health?.autoPaused) {
+            await logActivity("source", "error", `@${src.handle} auto-paused after ${health.failures} consecutive fetch failures: ${msg}`);
+          }
         }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(TG_WORKERS, channels.length) }, () => tgWorker()));
     // Build candidate articles first (no side effects) so the Bot-API video
     // resolution can be gated on "have we already ingested this post?". A
     // fresh video post stays inside the 6h freshness window for ~72 cycles,
@@ -1955,9 +1951,17 @@ async function fetchTelegramArticles(
     }
 
     const knownKeys = await getKnownRawKeys(candidates.map((c) => c.key));
+    // Video recovery is the only sequential Telegram work left in ingest
+    // (forwardMessage + getFile per post). Cap it per cycle and stop once
+    // the time budget is spent so it can never kill the worker again.
+    const deadline = options.deadline ?? Number.POSITIVE_INFINITY;
+    const MAX_VIDEO_RESOLUTIONS = 3;
+    let videoResolutions = 0;
     for (const c of candidates) {
       if (
         c.resolveVideo &&
+        videoResolutions < MAX_VIDEO_RESOLUTIONS &&
+        Date.now() < deadline &&
         !knownKeys.has(c.key) &&
         // Skip posts we already failed to resolve in the last 24h so a dead
         // embed/video isn't hammered with forwardMessage every 5 minutes.
@@ -1966,6 +1970,7 @@ async function fetchTelegramArticles(
         const resolved = await fetchTelegramVideoViaBotApi(c.handle, c.pid, options.stagingChatId ?? null);
         if (resolved) {
           c.article.videoUrl = resolved.fileUrl;
+          videoResolutions += 1;
           botApiResolved += 1;
         }
       }
@@ -1977,7 +1982,12 @@ async function fetchTelegramArticles(
   return { articles, errors, botApiResolved };
 }
 
-async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"): Promise<Record<string, unknown>> {
+async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all", opts: { deadline?: number } = {}): Promise<Record<string, unknown>> {
+  // Hard time budget (set by runCycle): stop starting new phases once the
+  // budget is spent so the cycle returns and releases the publish lock
+  // instead of being killed by the worker limit mid-write.
+  const deadline = opts.deadline ?? Number.POSITIVE_INFINITY;
+  const budgetLeft = () => Date.now() < deadline;
   const stats: Record<string, unknown> = { fetched: 0, junk: 0, offTopic: 0, stale: 0, duplicate: 0, reReports: 0, extractionFails: 0, updates: 0, queued: 0, breakingQueued: 0, errors: [] as string[] };
   const errors = stats.errors as string[];
 
@@ -2002,6 +2012,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
       enabled: settings.source_auto_pause_enabled !== false,
       threshold: Math.max(1, Number(settings.source_auto_pause_threshold ?? 8)),
     },
+    deadline,
   });
   collected.push(...tg.articles);
   errors.push(...tg.errors);
@@ -2015,7 +2026,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
 
   // Web sources
   const newsdataRow = sources.find((s) => s.kind === "newsdata");
-  if (mode === "all" && newsdataRow && NEWSDATA_API_KEY && queries.length) {
+  if (mode === "all" && budgetLeft() && newsdataRow && NEWSDATA_API_KEY && queries.length) {
     const groups: string[] = [];
     let current = "";
     for (const q of queries) {
@@ -2026,36 +2037,55 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
       } else current = candidate;
     }
     if (current) groups.push(current);
-    for (const group of groups.slice(0, 2)) {
-      try {
-        collected.push(...(await fetchNewsData(NEWSDATA_API_KEY, group)));
-      } catch (err) {
-        errors.push(`newsdata: ${err instanceof Error ? err.message : String(err)}`);
-        break;
-      }
-    }
+    // Respect the provider's own daily cap (free tier = 200 requests/day):
+    // fetch only as many groups as the remaining quota allows, and skip
+    // entirely once spent (used_today rolls over at midnight via
+    // bumpSourceQuota). This avoids burning calls on a quota that is gone.
+    const dailyQuota = Math.max(1, Number(newsdataRow.daily_quota ?? 200));
+    const usedToday = Number(newsdataRow.used_today ?? 0);
+    const quotaSameDay = String(newsdataRow.quota_date ?? "") === new Date().toISOString().slice(0, 10);
+    const remaining = dailyQuota - (quotaSameDay ? usedToday : 0);
+    const groupBudget = Math.min(NEWSDATA_MAX_GROUPS, Math.max(0, remaining));
+    // All groups fire concurrently — sequential NewsData calls (each with a
+    // 20s timeout) could alone blow past the function's compute budget.
+    let newsdataCalls = 0;
+    const newsdataResults = await Promise.all(
+      groups.slice(0, groupBudget).map(async (group) => {
+        try {
+          const articles = await fetchNewsData(NEWSDATA_API_KEY, group);
+          newsdataCalls += 1;
+          return articles;
+        } catch (err) {
+          errors.push(`newsdata: ${err instanceof Error ? err.message : String(err)}`);
+          return [] as Article[];
+        }
+      }),
+    );
+    for (const r of newsdataResults) collected.push(...r);
+    await bumpSourceQuota(String(newsdataRow.id ?? ""), newsdataCalls);
   }
-  if (mode === "all" && sources.some((s) => s.kind === "rss")) {
-    for (const query of queries.slice(0, 4)) {
-      try {
-        collected.push(...(await fetchGoogleNewsRss(query)));
-      } catch (err) {
-        errors.push(`rss / ${query.slice(0, 40)}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+  if (mode === "all" && budgetLeft() && sources.some((s) => s.kind === "rss")) {
+    // RSS queries are I/O-bound and fetch concurrently; sequential would add
+    // up to 12 × 20s worst case to every ingest cycle.
+    const rssResults = await Promise.all(
+      queries.slice(0, RSS_MAX_QUERIES).map(async (query) => {
+        try {
+          return await fetchGoogleNewsRss(query);
+        } catch (err) {
+          errors.push(`rss / ${query.slice(0, 40)}: ${err instanceof Error ? err.message : String(err)}`);
+          return [] as Article[];
+        }
+      }),
+    );
+    for (const r of rssResults) collected.push(...r);
     try {
       const topical = /iran|tehran|irgc|khamenei|israel|hezbollah|houthi|yemen|iraq|syria|lebanon|militia|hormuz|persian gulf|tanker|oil|gold|bullion|natural gas|lng|petrochemical|nuclear|uranium|enrich|iaea|sanction|trump|pentagon|centcom|us navy|missile|drone|airstrike|strike|ceasefire|nato|mossad|gaza|west bank|palestin|kurd|jordan|egypt|amman|cairo/i;
-      collected.push(...(await fetchPublisherFeeds()).filter((a) => topical.test(`${a.title} ${a.description ?? ""}`) || isLeaderStatement(`${a.title} ${a.description ?? ""}`)));
+      if (budgetLeft()) collected.push(...(await fetchPublisherFeeds()).filter((a) => topical.test(`${a.title} ${a.description ?? ""}`) || isLeaderStatement(`${a.title} ${a.description ?? ""}`)));
     } catch {
       /* optional */
     }
   }
 
-  // Free-plan hygiene: cap how many articles enter the funnel each cycle so
-  // raw_articles + queue growth stay bounded (~100 items is plenty of variety).
-  if (collected.length > 40) {
-    collected.length = 40;
-  }
   stats.fetched = collected.length;
 
   // Gates
@@ -2070,7 +2100,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (!sourceBanGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!junkGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!respectGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
-    if (!relevanceGate(article).ok) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
+    if (!relevanceGate(article.title, article.description).ok) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
     if (!isEnglishText(`${article.title} ${article.description ?? ""}`).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     const textForFreshness = `${article.title} ${article.description ?? ""}`;
     const maxAge = /\b(attack|strike|missile|drone|war|explosion|airstrike|houthi|hezbollah|irgc|centcom|hormuz|nuclear)\b/i.test(textForFreshness) ? 14
@@ -2085,7 +2115,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   stats.duplicate = survivors.length - fresh.length;
 
   // Enrich thin web snippets
-  if (settings.enrich_summaries !== false) {
+  if (budgetLeft() && settings.enrich_summaries !== false) {
     const targets = fresh.filter((s) => !s.article.provider.startsWith("Telegram/") && (s.article.description ?? "").trim().length < 240).slice(0, 4);
     let cursor = 0;
     const worker = async () => {
@@ -2133,6 +2163,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
       followUp.set(i, { eventId: matched.eventId, label: matched.label });
     }
     if (item.article.provider.startsWith("Telegram/")) continue;
+    if (toExtract.length >= 60) continue;
     extractionIdx.push(i);
     toExtract.push({ title: item.article.title, description: item.article.description });
   }
@@ -2140,11 +2171,26 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   // A truncated JSON body used to throw in groqExtractFacts, which silently
   // dropped the WHOLE batch back to raw source text — the duplicated
   // "title — outlet" posts visible in the channel.
-  const extractedArr: Array<ExtractedFacts | null> = [];
   const GROQ_CHUNK_SIZE = 5;
+  const toExtractChunks: Array<Array<{ title: string; description: string | null }>> = [];
   for (let c = 0; c < toExtract.length; c += GROQ_CHUNK_SIZE) {
-    extractedArr.push(...(await groqExtractFacts(toExtract.slice(c, c + GROQ_CHUNK_SIZE))));
+    toExtractChunks.push(toExtract.slice(c, c + GROQ_CHUNK_SIZE));
   }
+  // Run the rewrite chunks with 3 concurrent workers (each result lands in
+  // its own slot, so order is preserved) so a wide ingest doesn't spend most
+  // of the function timeout on sequential LLM calls.
+  const chunkResults: Array<Array<ExtractedFacts | null>> = new Array(toExtractChunks.length);
+  const GROQ_WORKERS = 3;
+  let chunkCursor = 0;
+  const chunkWorker = async () => {
+    while (budgetLeft() && chunkCursor < toExtractChunks.length) {
+      const i = chunkCursor++;
+      chunkResults[i] = await groqExtractFacts(toExtractChunks[i]!, deadline);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(GROQ_WORKERS, toExtractChunks.length) }, () => chunkWorker()));
+  const extractedArr: Array<ExtractedFacts | null> = [];
+  for (const r of chunkResults) extractedArr.push(...(r ?? []));
   const extracted = new Map<number, ExtractedFacts>();
   extractionIdx.forEach((idx, j) => {
     const ex = extractedArr[j];
@@ -2152,6 +2198,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   });
 
   for (let i = 0; i < fresh.length; i++) {
+    if (!budgetLeft()) break;
     if (droppedIdx.has(i)) continue;
     const { article, key } = fresh[i]!;
     const articleText = `${article.title} ${article.description ?? ""}`;
@@ -2420,6 +2467,19 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
     const summary = String(item.summary ?? "");
     const url = String(item.url ?? "");
     const sourceName = String(item.source_name ?? "");
+    // Publish-time beat gate — drops any web/RSS/NewsData item whose raw
+    // source text is off-beat, even if it was queued before the latest
+    // relevance filter. Telegram fast-lane channels are exempt: they are the
+    // operator's hand-picked sources and are translated/published as-is.
+    if (!sourceName.startsWith("@")) {
+      const sourceText = String(item.source_text ?? `${headline} ${summary}`);
+      const gate = relevanceGate(sourceText, "");
+      if (!gate.ok) {
+        await setQueueStatus(id, "rejected");
+        await logActivity("publish", "info", `Off-beat story rejected at publish (${gate.reason}): ${headline.slice(0, 110)}`);
+        continue;
+      }
+    }
     if (isRepeated({ dedup_key: dedupKey, headline, summary }, dedup, simThreshold)) {
       await deleteQueueRow(id);
       continue;
@@ -2766,12 +2826,16 @@ async function computePublishPreview(settings: SettingsRow, limit = 5): Promise<
 
 async function acquireLock(settings: SettingsRow): Promise<boolean> {
   // Atomic compare-and-set: ONE conditional UPDATE claims the lock only when
-  // it is free (NULL) or older than the 10-minute stale window, and
+  // it is free (NULL) or older than the stale window, and
   // return=representation makes the winning row the proof of ownership. This
   // replaces the old check-then-set (two separate database round-trips) that
   // let two concurrent invocations both read "unlocked" and both proceed to
   // publish.
-  const staleBefore = new Date(Date.now() - 10 * 60_000).toISOString();
+  //
+  // The stale window (4 min) is shorter than the previous 10 min so a cycle
+  // that gets killed by the function timeout (finally never runs) frees the
+  // pipeline quickly instead of silently halting publishing for 10 minutes.
+  const staleBefore = new Date(Date.now() - 4 * 60_000).toISOString();
   const claimed = await rest<Array<{ id: string }>>("settings", {
     method: "PATCH",
     query: `id=eq.${enc(String(settings.id))}&or=(publish_run_lock_at.is.null,publish_run_lock_at.lt.${enc(staleBefore)})`,
@@ -2811,6 +2875,14 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
 
   if (!(await acquireLock(settings))) return { skipped: "publish run in progress" };
   try {
+    // Hard time budget: Supabase kills the worker at ~150s
+    // (WORKER_RESOURCE_LIMIT) and a killed cycle never reaches the finally
+    // that releases the publish lock — which is what silently halted the bot
+    // before. Stop starting new work before the ceiling so every cycle
+    // finishes, releases the lock, and keeps ingesting/publishing.
+    const cycleStart = Date.now();
+    const budgetMs = 100_000; // ~50s headroom under the worker limit
+    const budgetLeft = () => Date.now() - cycleStart < budgetMs;
     // Telegram fast lane: check channels every N minutes and publish any
     // breaking story immediately (no queue wait, no window-gap gate).
     const lastTg = settings.last_telegram_signals_at as string | undefined;
@@ -2819,7 +2891,7 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
     let tgStats: Record<string, unknown> | null = null;
     if (tgDue) {
       try {
-        tgStats = await runIngest(settings, "telegram");
+        tgStats = await runIngest(settings, "telegram", { deadline: cycleStart + budgetMs });
       } catch (err) {
         await logActivity("ingest", "error", `Telegram signals failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -2832,7 +2904,7 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
     let ingestStats: Record<string, unknown> | null = null;
     if (ingestDue) {
       try {
-        ingestStats = await runIngest(settings);
+        ingestStats = await runIngest(settings, "all", { deadline: cycleStart + budgetMs });
       } catch (err) {
         await logActivity("ingest", "error", `Ingest failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -2844,15 +2916,20 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
     // so the channel always feels live. Cap at 3 per cycle so a burst doesn't
     // flood subscribers. Web/news/RSS content still follows the day/night gap
     // cadence in the fall-through path below.
-    if (tgStats && Number(tgStats.queued) > 0) {
-      const publishStats = await runPublish(settings, Math.min(3, Math.max(1, Number(tgStats.queued))));
+    if (tgStats && Number(tgStats.queued) > 0 && budgetLeft()) {
+      const remainingSec = Math.max(0, (cycleStart + budgetMs - Date.now()) / 1000);
+      const tgBatch = Math.max(1, Math.min(PUBLISH_BATCH_SIZE, Number(tgStats.queued), Math.floor(remainingSec / 35)));
+      const publishStats = await runPublish(settings, tgBatch);
       return { telegram: tgStats, ingest: ingestStats, publish: publishStats };
     }
 
     const gap = windowGapOk(settings);
     if (!force && !gap.ok) return { skipped: `window gap (${gap.gapMinutes} min ${gap.night ? "night" : "day"})`, telegram: tgStats, ingest: ingestStats };
+    if (!budgetLeft()) return { skipped: "time budget (publish deferred)", telegram: tgStats, ingest: ingestStats };
 
-    const publishStats = await runPublish(settings, force ? 3 : 1);
+    const remainingSec = Math.max(0, (cycleStart + budgetMs - Date.now()) / 1000);
+    const batch = Math.max(1, Math.min(PUBLISH_BATCH_SIZE, Math.floor(remainingSec / 35)));
+    const publishStats = await runPublish(settings, batch);
     return { telegram: tgStats, ingest: ingestStats, publish: publishStats };
   } finally {
     await releaseLock(settings).catch(() => {});
@@ -2890,7 +2967,7 @@ Deno.serve(async (req) => {
       const settings = await getSettings();
       if (!settings) throw new Error("Settings row missing");
       const onlyId = url.searchParams.get("id");
-      const stats = await runPublish(settings, force || onlyId ? 3 : 1, onlyId);
+      const stats = await runPublish(settings, PUBLISH_BATCH_SIZE, onlyId);
       return new Response(JSON.stringify(stats), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     const result = await runCycle(force);
