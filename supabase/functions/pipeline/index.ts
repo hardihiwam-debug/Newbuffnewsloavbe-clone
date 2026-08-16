@@ -59,6 +59,11 @@ const NEWSDATA_MAX_GROUPS = 8;
 const RSS_MAX_QUERIES = 12;
 const PUBLISHER_FEED_CAP = 15;
 const TELEGRAM_POSTS_PER_CHANNEL = 40;
+// Telegram fast-lane (mode === "telegram") runs every ~5 minutes; it only
+// needs the newest posts to catch breaking stories, so cap each channel's
+// fetch well below the full-ingest width to avoid re-reading 40 old posts
+// that are already in the raw_articles dedup window every cycle.
+const TELEGRAM_FAST_LANE_POSTS = 10;
 
 function geminiKeys(): Array<{ index: number; key: string }> {
   const out: Array<{ index: number; key: string }> = [];
@@ -1595,6 +1600,18 @@ async function listTopicQueries(): Promise<Array<{ query: string; category: stri
 async function listActiveChats(): Promise<Array<{ id: string; chat_id: number }>> {
   return (await rest<Array<{ id: string; chat_id: number }>>("chats", { query: "select=id,chat_id&active=eq.true" })) ?? [];
 }
+// The same chat can end up registered more than once (e.g. re-adding a group
+// the bot already belongs to). Publishing to each duplicate row double-sends
+// every story, so collapse to unique chat_ids before any send loop.
+function dedupeChats(chats: Array<{ id: string; chat_id: number }>): Array<{ id: string; chat_id: number }> {
+  const seen = new Set<string>();
+  return chats.filter((c) => {
+    const key = String(c.chat_id ?? "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 async function logActivity(type: string, level: string, message: string, detail?: string): Promise<void> {
   try {
     await rest("activity_log", { method: "POST", body: { type, level, message, detail }, prefer: "return=minimal" });
@@ -1842,7 +1859,7 @@ async function pruneQueueAndRetain(): Promise<void> {
 // telegram fast lane and the full ingest).
 async function fetchTelegramArticles(
   channelRows: Array<Record<string, unknown>>,
-  options: { botApiVideoFetch?: "off" | "bot_api"; stagingChatId?: number | null; autoPause?: { enabled: boolean; threshold: number } | null; deadline?: number } = {},
+  options: { botApiVideoFetch?: "off" | "bot_api"; stagingChatId?: number | null; autoPause?: { enabled: boolean; threshold: number } | null; deadline?: number; limit?: number } = {},
 ): Promise<{ articles: Article[]; errors: string[]; botApiResolved: number }> {
   const articles: Article[] = [];
   const errors: string[] = [];
@@ -1858,6 +1875,7 @@ async function fetchTelegramArticles(
     channels.push({ handle, rowId: String(r.id ?? ""), wasFailing: Number(r.consecutive_failures ?? 0) > 0 });
   }
   const autoPause = options.autoPause ?? null;
+  const perChannelLimit = options.limit ?? TELEGRAM_POSTS_PER_CHANNEL;
   try {
     const posts: ChannelPost[] = [];
     // Channels are independent I/O — run them through a small worker pool so
@@ -1870,7 +1888,7 @@ async function fetchTelegramArticles(
       while (tgCursor < channels.length) {
         const src = channels[tgCursor++]!;
         try {
-          posts.push(...(await fetchTelegramChannel(src.handle)));
+          posts.push(...(await fetchTelegramChannel(src.handle, perChannelLimit)));
           await patchSourceHealth(src.rowId, null, 0);
           if (src.wasFailing) {
             await logActivity("source", "success", `@${src.handle} recovered — Telegram fetch OK again`);
@@ -2013,6 +2031,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
       threshold: Math.max(1, Number(settings.source_auto_pause_threshold ?? 8)),
     },
     deadline,
+    limit: mode === "telegram" ? TELEGRAM_FAST_LANE_POSTS : TELEGRAM_POSTS_PER_CHANNEL,
   });
   collected.push(...tg.articles);
   errors.push(...tg.errors);
@@ -2087,6 +2106,14 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   }
 
   stats.fetched = collected.length;
+
+  // Per-cycle source breakdown so operators can see at a glance whether
+  // NewsData is exhausted, RSS is failing, or publisher feeds came back
+  // empty — instead of just "0 queued" with no visibility into why.
+  const byProvider = new Map<string, number>();
+  for (const a of collected) byProvider.set(a.provider, (byProvider.get(a.provider) ?? 0) + 1);
+  const sourceBreakdown = [...byProvider.entries()].map(([p, n]) => `${p}:${n}`).join(", ");
+  if (sourceBreakdown) await logActivity("ingest", "info", `Source breakdown: ${sourceBreakdown}`);
 
   // Gates
   const survivors: Array<{ article: Article; key: string }> = [];
@@ -2419,7 +2446,7 @@ function parsePostLinks(raw: unknown): Array<{ url: string; text: string }> {
 
 async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | null): Promise<Record<string, unknown>> {
   const result: Record<string, unknown> = { sent: 0, items: [] as string[] };
-  const chats = await listActiveChats();
+  const chats = dedupeChats(await listActiveChats());
   if (chats.length === 0) {
     await logActivity("publish", "warning", "Publish skipped — no active destination chats configured");
     return { ...result, skipped: "no chats" };
@@ -2771,7 +2798,7 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
 // so each candidate shows an honest ready / duplicate / blocked status with
 // a reason instead of the old "dump raw queue rows and call them blocked".
 async function computePublishPreview(settings: SettingsRow, limit = 5): Promise<Record<string, unknown>> {
-  const chats = await listActiveChats();
+  const chats = dedupeChats(await listActiveChats());
   const pool = await listQueued();
   const recentPublished = await listRecentPublished(200);
   const cooldownHours = Number(settings.event_cooldown_hours ?? 8);
