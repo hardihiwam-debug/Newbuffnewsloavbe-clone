@@ -244,7 +244,7 @@ async function translateBulletinToSorani(
     if (!useGemini) return null;
     const keys = geminiKeys();
     if (keys.length === 0) return null;
-    const models = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"];
+    const models = ["gemini-1.5-flash-latest", "gemini-1.5-flash-002", "gemini-2.0-flash-exp"];
     for (const model of models) {
       for (const { key } of keys) {
         try {

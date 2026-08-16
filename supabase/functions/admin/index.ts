@@ -36,9 +36,9 @@ const PIPELINE_URL = `${SUPABASE_URL}/functions/v1/pipeline`;
 // Supported direct-REST Gemini model chain (kept in sync with the pipeline).
 // Mirrors SUPPORTED_GEMINI_MODELS in src/convex/secrets.ts.
 const SUPPORTED_GEMINI_MODELS = [
-  "google/gemini-2.5-flash",
-  "google/gemini-1.5-flash",
-  "google/gemini-1.5-flash-8b",
+  "google/gemini-1.5-flash-latest",
+  "google/gemini-1.5-flash-002",
+  "google/gemini-2.0-flash-exp",
   "minimax/MiniMax-M2",
 ];
 
@@ -165,7 +165,7 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   bulletinTime: "08:00",
   bulletinHours: 24,
   translationMode: "gemini_first",
-  translationModel: "google/gemini-2.5-flash",
+  translationModel: "google/gemini-1.5-flash-latest",
   pollsEnabled: true,
   pollsMaxPerHour: 1,
   pollsAutoCloseMinutes: 60,
@@ -1054,9 +1054,9 @@ async function testTranslationKey(p: { id: string }): Promise<unknown> {
 // usable. The dashboard already shows a confirm-style button.
 async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
   const GEMINI_DIRECT_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-002",
+    "gemini-2.0-flash-exp",
   ];
   const keys: { index: number; key: string }[] = [];
   for (let i = 1; i <= 6; i++) {
