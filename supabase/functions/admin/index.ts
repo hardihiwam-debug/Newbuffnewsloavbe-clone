@@ -1048,16 +1048,16 @@ async function testTranslationKey(p: { id: string }): Promise<unknown> {
 }
 
 // ── Action: testGeminiKeys ──────────────────────────────────────────────────
-// Live health-check every GEMINI_API_KEY_1..6 across each direct-REST model.
-// Costs real Gemini quota: 18 calls per click (6 keys × 3 models). The promise
-// of the admin UI is to show exactly which (key, model) pairs are still
-// usable. The dashboard already shows a confirm-style button.
+// Live health-check every GEMINI_API_KEY_1..6 against the configured direct
+// translation model. This used to fire every key against three models (18 real
+// quota-burning calls per click); one model is enough to prove whether each key
+// is usable without making the dashboard itself look like rate-limit traffic.
 async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
-  const GEMINI_DIRECT_MODELS = [
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-002",
-    "gemini-2.0-flash-exp",
-  ];
+  const settingsRows = await rest<unknown[]>("settings", { query: "select=translation_model&limit=1" });
+  const configured = String((settingsRows?.[0] as Record<string, unknown> | undefined)?.translation_model ?? "gemini-1.5-flash-latest")
+    .replace(/^google\//, "")
+    .trim();
+  const GEMINI_DIRECT_MODELS = [configured || "gemini-1.5-flash-latest"];
   const keys: { index: number; key: string }[] = [];
   for (let i = 1; i <= 6; i++) {
     const k = Deno.env.get(`GEMINI_API_KEY_${i}`)?.trim();

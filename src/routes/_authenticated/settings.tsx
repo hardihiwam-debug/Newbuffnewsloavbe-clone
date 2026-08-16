@@ -1253,20 +1253,20 @@ function SettingsPage() {
                 className="h-8 text-[11px] gap-1"
                 disabled={geminiTesting}
                 onClick={() => {
-                  // Real quota spend: every configured key × model is fired
+                  // Real quota spend: every configured key is fired once
                   // directly at Google. Require a second click to confirm so
-                  // an accidental tap doesn't burn the day's quota.
+                  // an accidental tap doesn't burn quota.
                   if (!geminiConfirm) {
                     setGeminiConfirm(true);
                     toast.warning(
-                      "Live quota check — fires one request per Gemini key × model. Click again to confirm.",
+                      "Live quota check — fires one request per Gemini key. Click again to confirm.",
                     );
                     setTimeout(() => setGeminiConfirm(false), 8000);
                     return;
                   }
                   setGeminiConfirm(false);
                   setGeminiTesting(true);
-                  const id = toast.loading("Testing every Gemini key × model…");
+                  const id = toast.loading("Testing every Gemini key…");
                   testGeminiKeys({ pin })
                     .then((r) => {
                       setGeminiTest(r);
