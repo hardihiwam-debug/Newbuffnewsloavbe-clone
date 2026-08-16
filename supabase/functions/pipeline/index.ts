@@ -916,16 +916,29 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
     },
   ];
 
-  // Provider chain: Groq → OpenRouter → Cloudflare, all OpenAI-compatible
+  // Provider chain: Groq → OpenRouter → Cloudflare → Gemini, all OpenAI/Gemini
   // chat/completions endpoints. First usable response wins; the rewrite never
   // blocks the pipeline — if none are configured we fall back to source text.
   const providers: Array<{ name: string; url: string; key: string; model: string }> = [];
   if (GROQ_API_KEY) providers.push({ name: "groq", url: "https://api.groq.com/openai/v1/chat/completions", key: GROQ_API_KEY, model: "llama-3.3-70b-versatile" });
   if (OPENROUTER_API_KEY) providers.push({ name: "openrouter", url: "https://openrouter.ai/api/v1/chat/completions", key: OPENROUTER_API_KEY, model: "meta-llama/llama-3.3-70b-instruct" });
   if (CLOUDFLARE_API_TOKEN && CLOUDFLARE_ACCOUNT_ID) providers.push({ name: "cloudflare", url: `https://api.cloudflare.com/client/v4/accounts/${enc(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`, key: CLOUDFLARE_API_TOKEN, model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" });
+  
+  // Also push Gemini key as OpenAI-compatible fallback endpoint if available
+  const gKeys = geminiKeys();
+  if (gKeys.length > 0) {
+    const gk = gKeys[0]!;
+    providers.push({
+      name: "gemini",
+      url: `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`,
+      key: gk.key,
+      model: "gemini-2.5-flash",
+    });
+  }
+
   if (providers.length === 0) return items.map(() => null);
 
-  let lastError = "";
+  const providerErrors: string[] = [];
   for (const p of providers) {
     // Stop the provider chain once the cycle's time budget is spent — an
     // in-flight chunk here used to be able to run 3 × 40s = 120s past the
@@ -942,13 +955,13 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
           temperature: 0.1,
           max_tokens: 6000,
           // Cloudflare's OpenAI-compat layer rejects response_format, so only
-          // force JSON mode on Groq/OpenRouter.
+          // force JSON mode on Groq/OpenRouter/Gemini.
           ...(p.name === "cloudflare" ? {} : { response_format: { type: "json_object" } }),
         }),
         signal: AbortSignal.timeout(Math.min(40_000, remainingMs)),
       });
       const raw = await res.text();
-      if (!res.ok) throw new Error(`${p.name} ${res.status}`);
+      if (!res.ok) throw new Error(`${p.name} ${res.status}: ${raw.slice(0, 150)}`);
       const json = JSON.parse(raw) as {
         choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
         usage?: { prompt_tokens?: number; completion_tokens?: number };
@@ -984,15 +997,16 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
         return { headline, summary, facts };
       });
     } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
+      providerErrors.push(e instanceof Error ? e.message : String(e));
     }
   }
   await logActivity(
     "ingest",
     "error",
     `AI rewrite failed on all providers — falling back to source text for ${items.length} item(s)`,
-    lastError,
+    providerErrors.join(" | ").slice(0, 500),
   );
+  return items.map(() => null);
   return items.map(() => null);
 }
 
