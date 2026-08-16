@@ -165,7 +165,7 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   bulletinEnabled: false,
   bulletinTime: "08:00",
   bulletinHours: 24,
-  translationMode: "minimax_first",
+  translationMode: "gemini_first",
   translationModel: "google/gemini-3.6-flash",
   pollsEnabled: true,
   pollsMaxPerHour: 1,

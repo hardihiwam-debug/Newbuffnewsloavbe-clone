@@ -500,11 +500,13 @@ function isTelegramVideoUrl(url: string | null | undefined): boolean {
 }
 
 function extractPostVideo(block: string): string | null {
-  const wrap = block.match(
-    /<a\b[^>]*class="[^"]*tgme_widget_message_video_player[^"]*"[^>]*>[\s\S]*?<\/a>/i,
-  )?.[0];
-  if (!wrap) return null;
-  const candidates = wrap.match(/<video\b[^>]*>/gi) ?? [];
+  // The public preview HTML places the real <video src="...mp4"> as a SIBLING
+  // of the tgme_widget_message_video_player anchor — the anchor only carries
+  // the poster thumb. Scanning the anchor alone found nothing, which forced
+  // every video post down the Bot-API path (fails when the bot isn't a member
+  // of the source channel) and ultimately published text + a source link.
+  // Scan the whole block so real mp4s on the listing page are captured.
+  const candidates = block.match(/<video\b[^>]*>/gi) ?? [];
   for (const tag of candidates) {
     if (/blured/i.test(tag)) continue;
     const src = tag.match(/src="([^"]+)"/i)?.[1];
@@ -1103,9 +1105,9 @@ async function geminiTranslateOnce(text: string, glossary: string | undefined): 
   return null;
 }
 
-// MiniMax primary via the Vercel AI Gateway. MiniMax does not carry the
-// per-key daily/RPM quota cliffs that burn through Gemini keys, so it runs
-// first and Gemini becomes the fallback chain.
+// MiniMax via the Vercel AI Gateway, used as the fallback behind the
+// Gemini key pool (gemini_first default). MiniMax does not carry the
+// per-key daily/RPM quota cliffs that burn through Gemini keys.
 async function minimaxTranslate(text: string, glossary: string | undefined, strict: boolean): Promise<string | null> {
   if (!MINIMAX_API_KEY) return null;
   try {
@@ -1136,13 +1138,14 @@ async function minimaxTranslate(text: string, glossary: string | undefined, stri
 async function translateToSorani(
   text: string,
   glossary: string | undefined,
-  mode = "minimax_first",
+  mode = "gemini_first",
 ): Promise<{ text: string | null; model: string }> {
   // Operator-controllable chain order (settings.translation_mode).
-  // "minimax_first" (default) keeps the MiniMax AI-Gateway call in front so
-  // the exhausted Gemini keys are only touched as a fallback; "gemini_first"
-  // restores the legacy order; the "*_only" modes skip the other provider.
-  const m = mode || "minimax_first";
+  // "gemini_first" (default) runs the Gemini key pool first — the operator
+  // pays for those keys and wants them used; MiniMax is the fallback.
+  // "minimax_first" keeps the AI-Gateway call in front; the "*_only" modes
+  // skip the other provider.
+  const m = mode || "gemini_first";
   const useMinimax = m !== "gemini_only";
   const useGemini = m !== "minimax_only";
   const minimaxFirst = m === "minimax_first" || m === "minimax_only";
@@ -2438,10 +2441,14 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
     let usedModel = "none";
 
     if (language === "ckb") {
-      const toTranslate = `${headline}\n\n${summary}`;
+      // Telegram posts go out as-is after translation (no title line). The
+      // headline for a Telegram item is just the first 180 chars of the SAME
+      // summary text, so prepending it made the model repeat the opening in
+      // the translated output — the "texts repetition" in the channel.
+      const toTranslate = isTelegramItem ? summary : `${headline}\n\n${summary}`;
       const cached = await getTranslationCache(toTranslate);
       const glossary = settings.translation_glossary as string | undefined;
-      const mode = String(settings.translation_mode ?? "minimax_first");
+      const mode = String(settings.translation_mode ?? "gemini_first");
       let translated = cached ? { text: cached.kurdish, model: cached.model } : await translateToSorani(toTranslate, glossary, mode);
       if (translated.text && translated.model !== "none" && !cached) {
         // Phase-2 digit-preservation guard: a translation must keep the exact

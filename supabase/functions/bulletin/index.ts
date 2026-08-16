@@ -202,9 +202,9 @@ function cleanGeminiTranslation(raw: string): string {
 async function translateBulletinToSorani(
   text: string,
   glossary: string | undefined,
-  mode = "minimax_first",
+  mode = "gemini_first",
 ): Promise<{ text: string | null; model: string }> {
-  const m = mode || "minimax_first";
+  const m = mode || "gemini_first";
   const useMinimax = m !== "gemini_only";
   const useGemini = m !== "minimax_only";
   const minimaxFirst = m === "minimax_first" || m === "minimax_only";
@@ -344,7 +344,7 @@ async function runBulletin(): Promise<Record<string, unknown>> {
     const translated = await translateBulletinToSorani(
       english,
       settings.translation_glossary as string | undefined,
-      String(settings.translation_mode ?? "minimax_first"),
+      String(settings.translation_mode ?? "gemini_first"),
     );
     if (translated.text && translated.model !== "none") {
       body = translated.text;
