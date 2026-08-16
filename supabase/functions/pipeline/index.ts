@@ -2138,8 +2138,27 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
 
   // Dedup vs raw_articles
   const known = await getKnownRawKeys(survivors.map((s) => s.key));
-  const fresh = survivors.filter((s) => !known.has(s.key));
+  let fresh = survivors.filter((s) => !known.has(s.key));
   stats.duplicate = survivors.length - fresh.length;
+
+  // Pre-queue in-cycle dedup: check fresh items against each other so multiple
+  // outlets publishing the exact same story in the same 15m window don't all get queued.
+  const uniqueFresh: typeof fresh = [];
+  const inCycleThreshold = Number(settings.event_similarity_threshold ?? 0.52);
+  for (const item of fresh) {
+    const rawText = `${item.article.title} ${item.article.description ?? ""}`;
+    const isDupe = uniqueFresh.some((u) => {
+      const uText = `${u.article.title} ${u.article.description ?? ""}`;
+      // Use the same event detection logic the cluster/publish paths use
+      return sameEvent(rawText, uText, inCycleThreshold) || eventSimilarity(rawText, uText) >= inCycleThreshold;
+    });
+    if (!isDupe) {
+      uniqueFresh.push(item);
+    } else {
+      stats.duplicate = Number(stats.duplicate) + 1;
+    }
+  }
+  fresh = uniqueFresh;
 
   // Enrich thin web snippets
   if (budgetLeft() && settings.enrich_summaries !== false) {

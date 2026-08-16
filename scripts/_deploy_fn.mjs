@@ -26,7 +26,7 @@ for (const slug of slugs) {
   const entry = `supabase/functions/${slug}/index.ts`;
   const out = join(tmpdir(), `${slug}_bundle.js`);
   execSync(
-    `./node_modules/.bin/esbuild ${entry} --bundle --format=esm --platform=neutral --target=esnext --outfile=${out}`,
+    `npx esbuild ${entry} --bundle --format=esm --platform=neutral --target=esnext --outfile=${out}`,
     { stdio: "inherit" },
   );
   const file = readFileSync(out);
