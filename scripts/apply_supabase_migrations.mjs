@@ -102,7 +102,18 @@ function splitStatements(sql) {
   return out;
 }
 
-const files = ["supabase/migrations/0001_init.sql", "supabase/migrations/0002_cron.sql"];
+const files = [
+  "supabase/migrations/0001_init.sql",
+  "supabase/migrations/0002_cron.sql",
+  "supabase/migrations/0003_cache_and_retention.sql",
+  "supabase/migrations/0004_slim.sql",
+  "supabase/migrations/0005_telegram_video_bot.sql",
+  "supabase/migrations/0006_slim_after_post.sql",
+  "supabase/migrations/0007_enable_rls.sql",
+  "supabase/migrations/0008_ai_and_idempotency.sql",
+  "supabase/migrations/0009_news_quality.sql",
+  "supabase/migrations/0010_bulletin_cron.sql",
+];
 let failed = 0;
 for (const file of files) {
   const sql = readFileSync(file, "utf8");

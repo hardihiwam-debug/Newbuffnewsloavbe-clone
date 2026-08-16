@@ -74,6 +74,16 @@ export const adminApi = {
   }) => callAdmin<{ ok: true }>("setPauseState", args),
   clearQueue: (args: { pin?: string }) =>
     callAdmin<{ ok: boolean; cleared: boolean; ingest: unknown }>("clearQueue", args),
+  editQueueItem: (args: {
+    pin: string;
+    id: string;
+    headline?: string;
+    summary?: string;
+    category?: string;
+    breaking?: boolean;
+  }) => callAdmin<{ ok: true; id: string }>("editQueueItem", args),
+  publishQueueItem: (args: { pin: string; id: string }) =>
+    callAdmin<{ ok: boolean; status: number; result: unknown }>("publishQueueItem", args),
   setTranslationModel: (args: { pin: string; model: string }) =>
     callAdmin<{ ok: true; model: string }>("setTranslationModel", args),
   updateChat: (args: {
@@ -164,8 +174,6 @@ export const adminActionsApi = {
       }>;
       models: string[];
     }>("testGeminiKeys", args),
-  revealGeminiKey: (args: { pin: string; index: number }) =>
-    callAdmin<{ index: number; key: string }>("revealGeminiKey", args),
   // The admin edge function expects `mode` for the inner pipeline stage,
   // NOT `action` (which collides with the outer action enum when the call
   // is serialized). Accept both `mode` (preferred) and the legacy

@@ -36,6 +36,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import { ConsoleNav } from "@/components/ConsoleNav";
 import {
   BarChart3,
   Globe,
@@ -48,11 +50,13 @@ import {
   List,
   Play,
   Pause,
-  Lock,
   HeartPulse,
-  Settings2,
   Eye,
   X,
+  Pencil,
+  Radio,
+  SendHorizonal,
+  AlertTriangle,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -254,6 +258,8 @@ function Dashboard() {
   const paused = Boolean(s["botPaused"]);
 
   return (
+    <>
+      <ConsoleNav />
     <div className="mx-auto max-w-6xl px-4 py-8">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -280,17 +286,6 @@ function Dashboard() {
               )}
             </span>
           </h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1.5"
-            onClick={() => navigate({ to: "/settings" })}
-          >
-            <Settings2 className="h-3.5 w-3.5" />
-            Settings
-          </Button>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2">
@@ -397,11 +392,42 @@ function Dashboard() {
               Stop all
             </ConfirmAction>
           )}
-          <Button size="sm" variant="ghost" onClick={lock}>
-            Lock
-          </Button>
         </div>
       </header>
+
+      {(() => {
+        const sm = (data as any).schemaMigrations;
+        if (!sm || sm.ok) return null;
+        const missing = Object.entries(sm.missing ?? {});
+        return (
+          <div className="mt-6 rounded-2xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm">
+            <p className="flex items-center gap-2 font-medium text-destructive">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              Database schema is behind the pipeline — the bot cannot queue or publish
+            </p>
+            <p className="mt-1.5 text-muted-foreground">
+              The deployed <code className="rounded bg-muted px-1 py-0.5">pipeline</code> function writes columns that
+              only exist in migrations that were never applied to this project. Every queue insert fails
+              silently, which is exactly why the activity feed shows “N fetched, 0 queued”.
+            </p>
+            <p className="mt-1.5 text-muted-foreground">
+              Missing:{" "}
+              {missing.map(([migration, cols]) => (
+                <span key={migration} className="mr-2 inline-flex flex-wrap items-baseline gap-1">
+                  <code className="rounded bg-muted px-1 py-0.5 text-destructive">{migration}</code>
+                  <span className="text-xs text-muted-foreground">({(cols as string[]).join(", ")})</span>
+                </span>
+              ))}
+            </p>
+            <p className="mt-1.5 text-muted-foreground">
+              Fix: apply the missing migrations in order (<code className="rounded bg-muted px-1 py-0.5">0005 → 0009</code>)
+              via <code className="rounded bg-muted px-1 py-0.5">node scripts/apply_supabase_migrations.mjs</code> with your
+              <code className="rounded bg-muted px-1 py-0.5">SUPABASE_ACCESS_TOKEN</code>, or Supabase → SQL Editor, then
+              redeploy the <code className="rounded bg-muted px-1 py-0.5">pipeline</code> function.
+            </p>
+          </div>
+        );
+      })()}
 
       {paused ? (
         <div className="mt-6 rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
@@ -577,16 +603,25 @@ function Dashboard() {
         </div>
       ) : null}
 
+      <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <ActivityFeed items={(data as any).recentActivity ?? []} />
+        <SourceHealthPanel sources={(data as any).sources ?? []} />
+      </div>
+
+      <CategoryBreakdown history={(data as any).history ?? []} />
+
         {/* QUEUE */}
           <PipelineFunnel stats={(s as any).pipelineStats} />
           <QueueStatusTabs
             items={(data as any).queueAll ?? []}
             publishedItems={(data as any).history ?? []}
             queuedTotal={(data as any).queuedTotal}
+            pin={pin}
           />
 
 
     </div>
+    </>
   );
 }
 
@@ -842,13 +877,37 @@ function QueueStatusTabs({
   items,
   publishedItems,
   queuedTotal,
+  pin,
 }: {
   items: any[];
   publishedItems: any[];
   queuedTotal?: number | null;
+  pin?: string;
 }) {
   const [status, setStatus] = useState("queued");
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [editing, setEditing] = useState<any | null>(null);
+  const [publishingId, setPublishingId] = useState<string | null>(null);
+
+  const handlePublishNow = async (item: any, rowId: string) => {
+    if (!pin) return;
+    setPublishingId(rowId);
+    const id = toast.loading("Publishing…");
+    try {
+      const r = await adminApi.publishQueueItem({ pin, id: item._id ?? item.id });
+      toast.dismiss(id);
+      if ((r as any)?.ok === false) {
+        const res = (r as any)?.result;
+        throw new Error(String(res?.error ?? res?.skipped ?? "Publish failed"));
+      }
+      toast.success("Published to all active chats");
+    } catch (e) {
+      toast.dismiss(id);
+      toast.error(e instanceof Error ? e.message : "Publish failed");
+    } finally {
+      setPublishingId(null);
+    }
+  };
 
   // Human labels for the stored scoreParts breakdown.
   const PART_LABELS: Record<string, string> = {
@@ -979,20 +1038,39 @@ function QueueStatusTabs({
                   <span className="hidden sm:inline shrink-0 text-[10px] text-muted-foreground">{src}</span>
                   <span className="shrink-0 text-[10px] text-muted-foreground">{age}</span>
                 </button>
-                {isExpanded && breakdown.length > 0 ? (
+                {isExpanded ? (
                   <div className="ml-5 mt-0.5 mb-1 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
-                    {breakdown.map((p) => (
-                      <div key={p.label} className="flex items-center justify-between gap-4 text-[10px]">
-                        <span className="text-muted-foreground">{p.label}</span>
-                        <span className={`font-mono tabular-nums ${p.value > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-500"}`}>
-                          {p.value > 0 ? `+${p.value}` : p.value}
-                        </span>
+                    {breakdown.length > 0 ? (
+                      <>
+                        {breakdown.map((p) => (
+                          <div key={p.label} className="flex items-center justify-between gap-4 text-[10px]">
+                            <span className="text-muted-foreground">{p.label}</span>
+                            <span className={`font-mono tabular-nums ${p.value > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-red-500"}`}>
+                              {p.value > 0 ? `+${p.value}` : p.value}
+                            </span>
+                          </div>
+                        ))}
+                        <div className="mt-1 flex items-center justify-between gap-4 border-t border-border/60 pt-1 text-[10px]">
+                          <span className="font-medium">Total</span>
+                          <span className="font-mono tabular-nums text-primary">{score ?? "—"}</span>
+                        </div>
+                      </>
+                    ) : null}
+                    {status === "queued" && pin ? (
+                      <div className="mt-1.5 flex items-center gap-2">
+                        <Button size="sm" variant="outline" className="h-7 gap-1 text-[11px]" onClick={() => setEditing(item)}>
+                          <Pencil className="h-3 w-3" /> Edit
+                        </Button>
+                        <Button
+                          size="sm"
+                          className="h-7 gap-1 text-[11px]"
+                          disabled={publishingId === rowId}
+                          onClick={() => handlePublishNow(item, rowId)}
+                        >
+                          <SendHorizonal className="h-3 w-3" /> {publishingId === rowId ? "Publishing…" : "Publish now"}
+                        </Button>
                       </div>
-                    ))}
-                    <div className="mt-1 flex items-center justify-between gap-4 border-t border-border/60 pt-1 text-[10px]">
-                      <span className="font-medium">Total</span>
-                      <span className="font-mono tabular-nums text-primary">{score ?? "—"}</span>
-                    </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -1000,6 +1078,367 @@ function QueueStatusTabs({
           })
         )}
       </div>
+      <EditQueueItemDialog item={editing} pin={pin} onClose={() => setEditing(null)} />
     </Panel>
+  );
+}
+
+// ── Live operations feed ────────────────────────────────────────────────────
+// Stream of the latest pipeline/admin events (activity_log), newest first.
+function ActivityFeed({ items }: { items: any[] }) {
+  const rel = (iso: string): string => {
+    if (!iso) return "";
+    const ms = Date.now() - Date.parse(iso);
+    if (Number.isNaN(ms)) return "";
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return "now";
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  };
+  const dot = (level: string) => {
+    if (level === "error") return "bg-destructive";
+    if (level === "warning") return "bg-amber-500";
+    if (level === "success") return "bg-emerald-500";
+    return "bg-sky-500";
+  };
+  const icon = (type: string) => {
+    if (type === "ingest") return <Radio className="h-3.5 w-3.5 text-sky-400" />;
+    if (type === "publish") return <SendHorizonal className="h-3.5 w-3.5 text-emerald-400" />;
+    if (type === "telegram") return <MessageCircle className="h-3.5 w-3.5 text-violet-400" />;
+    if (type === "admin") return <List className="h-3.5 w-3.5 text-primary" />;
+    return <Activity className="h-3.5 w-3.5 text-muted-foreground" />;
+  };
+  return (
+    <Panel
+      title="Live operations"
+      hint="Latest pipeline and admin events, newest first."
+    >
+      <div className="max-h-[24rem] overflow-y-auto space-y-1">
+        {items.length === 0 ? (
+          <p className="text-xs text-muted-foreground py-4 text-center">
+            No activity recorded yet.
+          </p>
+        ) : (
+          items.map((a, i) => (
+            <div
+              key={a.id ?? i}
+              className="flex items-start gap-2 rounded-md border border-border/60 bg-card/40 px-2.5 py-2"
+            >
+              <span className="mt-1 shrink-0">{icon(a.type)}</span>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot(a.level)}`} />
+                  <p className="truncate text-xs text-foreground">{a.message}</p>
+                  <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                    {rel(a.createdAt)}
+                  </span>
+                </div>
+                {a.detail ? (
+                  <p className="mt-0.5 truncate text-[11px] text-muted-foreground" title={a.detail}>
+                    {a.detail}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+// ── Source health & quota ───────────────────────────────────────────────────
+// One row per source: live/auto-paused/off, per-source reject streak, daily
+// quota burn (NewsData etc.), Telegram channel speed, and last error.
+function SourceHealthPanel({ sources }: { sources: any[] }) {
+  const statusBadge = (s: any) => {
+    if (s.autoPaused)
+      return (
+        <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+          auto-paused
+        </span>
+      );
+    if (!s.enabled)
+      return (
+        <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+          off
+        </span>
+      );
+    return (
+      <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+        live
+      </span>
+    );
+  };
+  const boostLabel = (cfg: any) => {
+    const b = Number(cfg?.boost ?? 0);
+    if (b >= 2) return "instant";
+    if (b === 1) return "fast";
+    return null;
+  };
+  return (
+    <Panel
+      title="Source health & quota"
+      hint="Enabled, auto-pause streak, daily quota, and last error per source."
+    >
+      <div className="max-h-[24rem] overflow-y-auto space-y-1">
+        {sources.length === 0 ? (
+          <p className="text-xs text-muted-foreground py-4 text-center">No sources configured.</p>
+        ) : (
+          sources.map((s) => {
+            const quota = s.dailyQuota != null ? `${s.usedToday ?? 0}/${s.dailyQuota}` : null;
+            const streak = Number(s.consecutiveRejects ?? 0);
+            const boost = boostLabel(s.config);
+            return (
+              <div
+                key={s.id ?? `${s.kind}:${s.name}`}
+                className="rounded-md border border-border/60 bg-card/40 px-2.5 py-2"
+              >
+                <div className="flex items-center gap-2">
+                  <Globe className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium">{s.name}</span>
+                  {boost ? (
+                    <span className="rounded bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-400">
+                      {boost}
+                    </span>
+                  ) : null}
+                  <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    {s.kind}
+                  </span>
+                  {statusBadge(s)}
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+                  {quota ? <span title="Daily quota used / limit">📊 {quota} today</span> : null}
+                  <span title="Stories this source produced vs. got rejected">
+                    ✅ {Number(s.publishedCount ?? 0)} · ❌ {Number(s.rejectedCount ?? 0)}
+                  </span>
+                  {streak > 0 ? (
+                    <span
+                      className={streak >= 8 ? "text-destructive" : "text-amber-500"}
+                      title="Consecutive rejections (auto-pauses at the threshold)"
+                    >
+                      ⚠ {streak} reject(s)
+                    </span>
+                  ) : null}
+                  {s.autoPauseReason ? (
+                    <span className="text-destructive" title={s.autoPauseReason}>
+                      ⏸ {s.autoPauseReason}
+                    </span>
+                  ) : null}
+                </div>
+                {s.lastError ? (
+                  <p className="mt-1 truncate text-[10px] text-destructive/80" title={s.lastError}>
+                    {s.lastError}
+                  </p>
+                ) : null}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+// ── Category breakdown ──────────────────────────────────────────────────────
+// Share of published stories per category (last 100 published, deduped).
+function CategoryBreakdown({ history }: { history: any[] }) {
+  const CATEGORY_COLORS: Record<string, string> = {
+    war: "bg-destructive",
+    iran: "bg-emerald-500",
+    proxies: "bg-violet-500",
+    usa: "bg-sky-500",
+    oil: "bg-amber-500",
+    gold: "bg-yellow-500",
+    "economic-impact": "bg-teal-500",
+    "middle-east": "bg-rose-500",
+    analysis: "bg-indigo-500",
+    iraq: "bg-lime-500",
+  };
+  const counts = new Map<string, number>();
+  for (const h of history) {
+    const c = String(h.category ?? "unknown");
+    counts.set(c, (counts.get(c) ?? 0) + 1);
+  }
+  const entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const total = entries.reduce((sum, [, n]) => sum + n, 0);
+  return (
+    <div className="mt-6">
+      <Panel
+        title="Category breakdown"
+        hint={`Share of the last ${history.length} published stories by category.`}
+      >
+        {entries.length === 0 ? (
+          <p className="text-xs text-muted-foreground py-2">
+            No published stories yet — run Fetch now or publish a batch.
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {entries.map(([cat, n]) => {
+              const pct = total > 0 ? Math.round((n / total) * 100) : 0;
+              return (
+                <div key={cat} className="flex items-center gap-2">
+                  <span className="w-28 shrink-0 truncate text-xs text-muted-foreground">
+                    {cat}
+                  </span>
+                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className={`h-full rounded-full ${CATEGORY_COLORS[cat] ?? "bg-primary"}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                    {n} · {pct}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+// ── Edit & publish-now dialog ───────────────────────────────────────────────
+// Inline editor for a queued item: headline, summary, category, breaking flag.
+// Saves via adminApi.editQueueItem, then leaves the item queued for "Publish
+// now" (or the next cycle) with the corrected copy.
+const EDIT_CATEGORIES = [
+  "war", "iran", "proxies", "usa", "oil", "gold", "economic-impact",
+  "middle-east", "analysis", "iraq",
+];
+
+function EditQueueItemDialog({
+  item,
+  pin,
+  onClose,
+}: {
+  item: any | null;
+  pin?: string;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog open={Boolean(item)} onOpenChange={(v) => { if (!v) onClose(); }}>
+      <DialogContent className="max-w-lg">
+        {item ? (
+          <EditQueueForm
+            key={String(item.id ?? item._id ?? "item")}
+            item={item}
+            pin={pin}
+            onDone={onClose}
+          />
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function EditQueueForm({
+  item,
+  pin,
+  onDone,
+}: {
+  item: any;
+  pin?: string;
+  onDone: () => void;
+}) {
+  const [headline, setHeadline] = useState(String(item.headline ?? ""));
+  const [summary, setSummary] = useState(String(item.summary ?? ""));
+  const [category, setCategory] = useState(String(item.category ?? "iran"));
+  const [breaking, setBreaking] = useState(Boolean(item.breaking));
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    if (!pin || !headline.trim()) return;
+    setSaving(true);
+    const id = String(item.id ?? item._id);
+    try {
+      await adminApi.editQueueItem({
+        pin,
+        id,
+        headline,
+        summary,
+        category,
+        breaking,
+      });
+      toast.success("Queue item updated");
+      onDone();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>Edit queue item</DialogTitle>
+        <DialogDescription>
+          Correct the copy, then use &ldquo;Publish now&rdquo; (or the next cycle) to send it.
+        </DialogDescription>
+      </DialogHeader>
+      <div className="mt-2 space-y-3">
+        <div className="space-y-1.5">
+          <Label className="text-xs">Headline</Label>
+          <Textarea
+            value={headline}
+            onChange={(e) => setHeadline(e.target.value)}
+            rows={2}
+            className="text-sm"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label className="text-xs">Summary</Label>
+          <Textarea
+            value={summary}
+            onChange={(e) => setSummary(e.target.value)}
+            rows={4}
+            className="text-sm"
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Category</Label>
+            <select
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+            >
+              {EDIT_CATEGORIES.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-end justify-between gap-2 pb-1">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Breaking</Label>
+              <p className="text-[10px] text-muted-foreground">
+                🚨 bypasses the posting window
+              </p>
+            </div>
+            <Switch checked={breaking} onCheckedChange={setBreaking} />
+          </div>
+        </div>
+      </div>
+      <div className="mt-4 flex items-center justify-end gap-2">
+        <Button size="sm" variant="outline" className="h-8 text-[11px]" onClick={onDone}>
+          Cancel
+        </Button>
+        <Button
+          size="sm"
+          className="h-8 gap-1 text-[11px]"
+          disabled={saving || !headline.trim()}
+          onClick={save}
+        >
+          <Pencil className="h-3 w-3" /> {saving ? "Saving…" : "Save changes"}
+        </Button>
+      </div>
+    </>
   );
 }
