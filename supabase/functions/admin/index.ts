@@ -159,13 +159,13 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   oilMoveThreshold: 3,
   goldMoveThreshold: 2,
   timezone: "Asia/Baghdad",
-  eventCooldownHours: 72,
+  eventCooldownHours: 8,
   eventSimilarityThreshold: 0.52,
   sendDelayMs: 3000,
   bulletinEnabled: false,
   bulletinTime: "08:00",
   bulletinHours: 24,
-  translationMode: "gemini_first",
+  translationMode: "minimax_first",
   translationModel: "google/gemini-3.6-flash",
   pollsEnabled: true,
   pollsMaxPerHour: 1,
@@ -187,6 +187,13 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   sourceAutoPauseEnabled: true,
   sourceAutoPauseThreshold: 8,
   postFooter: "⚡ Delivered by Freebuff",
+  // Telegram video recovery: when "bot_api", the pipeline does
+  // forwardMessage -> getFile -> sendVideo on the bot's Saved Messages staging
+  // chat (or the staging chat below) to publish real Telegram videos instead
+  // of their thumbnails. "off" (default) drops video_thumb posts to text-only
+  // with the permalink, never sending the thumb as a photo.
+  telegramVideoFetchMode: "bot_api",
+  telegramVideoStagingChatId: null,
 };
 
 async function getSettings(): Promise<Record<string, unknown>> {
@@ -335,6 +342,40 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     return { calls, promptTokens, completionTokens, byProvider };
   })();
 
+  // Schema-drift probe (migrations 0005–0009). The pipeline writes columns
+  // that only exist in these migrations. If the deployed function outruns the
+  // schema (functions and migrations deploy independently), every queue
+  // INSERT fails with "column does not exist" — and the pipeline's
+  // insertQueueItem swallows that error, so the dashboard shows "N fetched,
+  // 0 queued" with no explanation. Probe one representative column per
+  // migration; a 400 means the migration was never applied. Surfaced as a
+  // banner in the dashboard so the operator sees the cause instead of a
+  // mystery.
+  const SCHEMA_PROBES: Array<{ table: string; column: string; migration: string }> = [
+    { table: "queue", column: "media_kind", migration: "0005_telegram_video_bot.sql" },
+    { table: "settings", column: "telegram_video_fetch_mode", migration: "0005_telegram_video_bot.sql" },
+    { table: "published_history", column: "status", migration: "0008_ai_and_idempotency.sql" },
+    { table: "sources", column: "consecutive_failures", migration: "0008_ai_and_idempotency.sql" },
+    { table: "queue", column: "facts", migration: "0009_news_quality.sql" },
+    { table: "queue", column: "is_update", migration: "0009_news_quality.sql" },
+    { table: "settings", column: "breaking_max_age_hours", migration: "0009_news_quality.sql" },
+  ];
+  const schemaMissing: Record<string, string[]> = {};
+  const probeResults = await Promise.all(
+    SCHEMA_PROBES.map(async (probe) => {
+      try {
+        await rest<unknown[]>(probe.table, { query: `select=${probe.column}&limit=1` });
+        return null;
+      } catch {
+        return probe;
+      }
+    }),
+  );
+  for (const probe of probeResults) {
+    if (probe) (schemaMissing[probe.migration] ??= []).push(`${probe.table}.${probe.column}`);
+  }
+  const schemaMigrations = { ok: Object.keys(schemaMissing).length === 0, missing: schemaMissing };
+
   return {
     settings,
     isOwner: true,
@@ -354,24 +395,37 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     polls24h,
     translationFails24h,
     aiUsage24h,
+    schemaMigrations,
     botConfigured: Boolean(TELEGRAM_BOT_TOKEN),
     newsdataConfigured: Boolean(NEWSDATA_API_KEY),
   };
 }
 
 // ── Action: saveSettings ────────────────────────────────────────────────────
+// camelCase (SPA contract) -> snake_case (PostgREST column names).
+function camelToSnake(key: string): string {
+  return key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+}
+
 async function saveSettings(p: { patch: Record<string, unknown> }): Promise<unknown> {
+  // The SPA sends camelCase keys (Convex-style). Convert to snake_case column
+  // names, otherwise every dashboard save fails with "Could not find the
+  // 'postFooter' column".
+  const patch: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(p.patch ?? {})) {
+    patch[camelToSnake(k)] = v;
+  }
   const id = await settingsId();
   if (!id) {
     await rest("settings", {
       method: "POST",
-      body: { ...p.patch, updated_at: new Date().toISOString() },
+      body: { ...patch, updated_at: new Date().toISOString() },
       prefer: "return=minimal",
     });
   } else {
     await rest(`settings?id=eq.${id}`, {
       method: "PATCH",
-      body: { ...p.patch, updated_at: new Date().toISOString() },
+      body: { ...patch, updated_at: new Date().toISOString() },
       prefer: "return=minimal",
     });
   }
@@ -1062,13 +1116,6 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
   return { keys: results, models: GEMINI_DIRECT_MODELS };
 }
 
-async function revealGeminiKey(p: { index: number }): Promise<unknown> {
-  if (p.index < 1 || p.index > 6) throw new HttpError(400, "Key index must be 1..6");
-  const key = Deno.env.get(`GEMINI_API_KEY_${p.index}`)?.trim();
-  if (!key) throw new HttpError(404, `GEMINI_API_KEY_${p.index} is not configured`);
-  return { index: p.index, key };
-}
-
 // ── Action: runPipeline / previewNextBatch ──────────────────────────────────
 // Accepts the inner pipeline mode under either `action` (legacy) or `mode`.
 // The browser SPA used to send `action: "ingest"`, which collided with the
@@ -1080,7 +1127,7 @@ async function runPipeline(p: { action?: string; mode?: string }): Promise<unkno
   const mode = raw === "ingest" ? "ingest" : raw === "publish" ? "publish" : "cycle";
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (PIPELINE_INTERNAL_SECRET) headers["x-internal-secret"] = PIPELINE_INTERNAL_SECRET;
-  const res = await fetch(`${PIPELINE_URL}?mode=${mode}`, {
+  const res = await fetch(`${PIPELINE_URL}?mode=${mode}${mode === "publish" ? "&force=1" : ""}`, {
     method: "POST",
     headers,
     body: JSON.stringify({ trigger: "admin" }),
@@ -1139,14 +1186,87 @@ async function clearQueue(_p: Record<string, unknown>): Promise<unknown> {
   return { ok: true, cleared: true, ingest };
 }
 
-// `previewNextBatch` just inspects the queue without sending anything.
-// Returns the next N items that runPublish would consider posting.
+// `previewNextBatch` forwards to the pipeline's dry-run preview mode so the
+// dashboard dialog shows the same ready/duplicate/blocked verdict the real
+// publish run would produce (same scoring + dedup gates, nothing sent).
 async function previewNextBatch(p: { limit?: number }): Promise<unknown> {
   const limit = Math.min(20, Math.max(1, p.limit ?? 5));
-  const rows = await rest<unknown[]>("queue", {
-    query: `status=eq.queued&order=created_at.desc&limit=${limit}`,
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (PIPELINE_INTERNAL_SECRET) headers["x-internal-secret"] = PIPELINE_INTERNAL_SECRET;
+  const res = await fetch(`${PIPELINE_URL}?mode=preview&limit=${limit}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ trigger: "admin" }),
+    signal: AbortSignal.timeout(60_000),
   });
-  return { items: snakeArray(rows) };
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Preview failed (${res.status}): ${text.slice(0, 200)}`);
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+// ── Action: editQueueItem ───────────────────────────────────────────────────
+// Edit a queued item's headline/summary/category/breaking flag in place, then
+// leave it queued so the operator can hit "Publish now" (or the next cycle)
+// with the corrected copy. Only queued rows are editable — published rows are
+// deleted after send and history is immutable.
+async function editQueueItem(p: {
+  id: string;
+  headline?: string;
+  summary?: string;
+  category?: string;
+  breaking?: boolean;
+}): Promise<unknown> {
+  if (!p.id) throw new HttpError(400, "id is required");
+  const row = await rest<Array<Record<string, unknown>>>("queue", {
+    query: `id=eq.${encodeURIComponent(p.id)}&limit=1`,
+  });
+  if (!Array.isArray(row) || row.length === 0) throw new HttpError(404, "Queue item not found");
+  if (String(row[0].status) !== "queued") throw new HttpError(409, "Only queued items can be edited");
+  const patch: Record<string, unknown> = {};
+  if (typeof p.headline === "string" && p.headline.trim()) patch.headline = p.headline.trim();
+  if (typeof p.summary === "string") patch.summary = p.summary.trim();
+  if (typeof p.category === "string" && p.category.trim()) patch.category = p.category.trim();
+  if (typeof p.breaking === "boolean") patch.breaking = p.breaking;
+  if (Object.keys(patch).length === 0) throw new HttpError(400, "No editable fields provided");
+  await rest("queue", {
+    method: "PATCH",
+    query: `id=eq.${encodeURIComponent(p.id)}`,
+    body: patch,
+    prefer: "return=minimal",
+  });
+  await logActivity({
+    type: "admin",
+    level: "info",
+    message: "Queue item edited",
+    detail: (p.headline ?? p.id).slice(0, 80),
+  });
+  return { ok: true, id: p.id };
+}
+
+// ── Action: publishQueueItem ────────────────────────────────────────────────
+// Publish a single queued item immediately, bypassing the normal sort order.
+// Forwards to the pipeline's publish mode with an explicit id so the operator
+// can force a specific story out now (for example right after editing it).
+async function publishQueueItem(p: { id: string }): Promise<unknown> {
+  if (!p.id) throw new HttpError(400, "id is required");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (PIPELINE_INTERNAL_SECRET) headers["x-internal-secret"] = PIPELINE_INTERNAL_SECRET;
+  const res = await fetch(`${PIPELINE_URL}?mode=publish&force=1&id=${encodeURIComponent(p.id)}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ trigger: "admin" }),
+    signal: AbortSignal.timeout(170_000),
+  });
+  const text = await res.text();
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { parsed = text; }
+  await logActivity({
+    type: "admin",
+    level: "info",
+    message: "Manual publish of a single queue item",
+    detail: p.id.slice(0, 8),
+  });
+  return { ok: res.ok, status: res.status, result: parsed };
 }
 
 // ── Handler table ───────────────────────────────────────────────────────────
@@ -1171,10 +1291,11 @@ const handlers: Record<string, (p: any) => Promise<unknown>> = {
   sendTestMessage,
   testPoll,
   testGeminiKeys,
-  revealGeminiKey,
   runPipeline,
   clearQueue,
   previewNextBatch,
+  editQueueItem,
+  publishQueueItem,
 };
 
 // ── CORS helpers (so the SPA can call directly without a proxy) ─────────────

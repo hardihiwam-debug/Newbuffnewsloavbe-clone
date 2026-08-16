@@ -7,9 +7,9 @@ import { Switch } from "@/components/ui/switch";
 // or delete (two-step inline confirm). Saves go through upsertSource so the
 // pipeline picks them up on the next fetch.
 const BOOST_OPTIONS = [
-  { value: 0, label: "Normal", hint: "publishes on the normal cadence" },
-  { value: 1, label: "Fast", hint: "+60 score, jumps the queue — no breaking prefix" },
-  { value: 2, label: "Instant", hint: "+150 and breaking — bypasses posting windows" },
+  { value: 0, label: "Normal", hint: "standard score — regular queue order" },
+  { value: 1, label: "Fast", hint: "+60 score — jumps the queue, no 🚨 prefix" },
+  { value: 2, label: "Instant", hint: "+150 & breaking — always first, 24/7" },
 ];
 
 export function TelegramChannelRow({

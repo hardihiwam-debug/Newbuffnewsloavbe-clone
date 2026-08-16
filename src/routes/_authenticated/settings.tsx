@@ -57,9 +57,6 @@ import {
   Package,
   Vote,
   ChevronDown,
-  Eye,
-  EyeOff,
-  Copy,
 } from "lucide-react";
 import { clearStoredPin, readStoredPin } from "@/routes/index";
 
@@ -117,7 +114,9 @@ function CompactInput({
   placeholder,
   min,
   max,
+  step,
   className = "",
+  hint,
 }: {
   label: string;
   value: string | number;
@@ -126,7 +125,9 @@ function CompactInput({
   placeholder?: string;
   min?: number;
   max?: number;
+  step?: number;
   className?: string;
+  hint?: string;
 }) {
   return (
     <div className={`flex flex-col gap-1 ${className}`}>
@@ -138,9 +139,11 @@ function CompactInput({
         placeholder={placeholder}
         min={min}
         max={max}
+        step={step}
         dir={type === "text" ? "auto" : undefined}
         className="h-9 rounded-lg text-sm focus:ring-primary/20 focus:border-primary"
       />
+      {hint ? <p className="text-[10px] text-muted-foreground">{hint}</p> : null}
     </div>
   );
 }
@@ -280,7 +283,6 @@ function SettingsPage() {
   const upsertTranslationKey = useAdminMutation(api.admin.upsertTranslationKey);
   const testTranslationKey = useAdminAction(api.admin_actions.testTranslationKey);
   const testGeminiKeys = useAdminAction(api.admin_actions.testGeminiKeys);
-  const revealGeminiKey = useAdminAction(api.admin_actions.revealGeminiKey);
   const testSource = useAdminAction(api.admin_actions.testSource);
   const refreshBotInfo = useAdminAction(api.admin_actions.refreshBotInfo);
   const setWebhook = useAdminAction(api.admin_actions.setWebhook);
@@ -309,7 +311,6 @@ function SettingsPage() {
   const [geminiTest, setGeminiTest] = useState<any | null>(null);
   const [geminiTesting, setGeminiTesting] = useState(false);
   const [geminiConfirm, setGeminiConfirm] = useState(false);
-  const [revealedKeys, setRevealedKeys] = useState<Record<number, string>>({});
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(new Set());
 
   // Translation models
@@ -608,12 +609,6 @@ function SettingsPage() {
           <Card icon={Cpu} title="AI Dedup" hint="Final duplicate check (Groq/OpenRouter/Cloudflare)">
             <div className="space-y-3">
               <CompactToggle
-                label="Enable AI News Desk"
-                checked={s["aiNewsDeskEnabled"] !== false}
-                onChange={(v) => save({ aiNewsDeskEnabled: v })}
-                hint="Consolidated AI verdict: relevance, importance, clustering, offense check, merge + final decision"
-              />
-              <CompactToggle
                 label="Enable AI final dedup"
                 checked={s["aiDedupEnabled"] !== false}
                 onChange={(v) => save({ aiDedupEnabled: v })}
@@ -654,6 +649,56 @@ function SettingsPage() {
                   { value: "openrouter", label: "OpenRouter" },
                   { value: "cloudflare", label: "Cloudflare" },
                 ]}
+              />
+            </div>
+          </Card>
+
+          {/* News quality */}
+          <Card icon={Gauge} title="News quality" hint="Breaking recency, fact consistency and update cadence">
+            <div className="space-y-3">
+              <CompactInput
+                label="Breaking max age (hours)"
+                value={s["breakingMaxAgeHours"] ?? 8}
+                onChange={(v) => save({ breakingMaxAgeHours: Math.max(1, Number(v) || 8) })}
+                type="number"
+                min={1}
+                max={72}
+                hint="Stories older than this never publish as breaking"
+              />
+              <CompactInput
+                label="Update prefix"
+                value={s["updatePrefix"] ?? "UPDATE — "}
+                onChange={(v) => save({ updatePrefix: v })}
+                hint="Prefix for material follow-ups of a published event"
+              />
+              <CompactInput
+                label="Update cooldown (hours)"
+                value={s["updateCooldownHours"] ?? 1}
+                onChange={(v) => save({ updateCooldownHours: Math.max(0.5, Number(v) || 1) })}
+                type="number"
+                min={0.5}
+                max={24}
+                step={0.5}
+              />
+              <CompactInput
+                label="Update material threshold"
+                value={s["updateMaterialThreshold"] ?? 0.7}
+                onChange={(v) =>
+                  save({ updateMaterialThreshold: Math.max(0.4, Math.min(0.95, Number(v) || 0.7)) })
+                }
+                type="number"
+                min={0.4}
+                max={0.95}
+                step={0.05}
+                hint="Similarity above this = re-report (dropped), below = update"
+              />
+              <CompactInput
+                label="Max updates per cycle"
+                value={s["maxUpdatesPerCycle"] ?? 2}
+                onChange={(v) => save({ maxUpdatesPerCycle: Math.max(1, Number(v) || 2) })}
+                type="number"
+                min={1}
+                max={10}
               />
             </div>
           </Card>
@@ -879,6 +924,30 @@ function SettingsPage() {
                   }).catch(onError)
                 }
               />
+            </div>
+            <div className="mt-4 rounded-lg border border-border bg-muted/40 px-3 py-3">
+              <p className="mb-2 text-[11px] font-semibold text-muted-foreground">
+                🎬 Telegram video handling
+              </p>
+              <div className="space-y-3">
+                <CompactToggle
+                  label="Try Bot API for Telegram videos"
+                  hint="On (default): forwards each candidate video into the bot's Saved Messages, calls getFile, and posts the real .mp4. Off: Telegram video posts degrade to text + source link instead of the misleading thumbnail-as-photo."
+                  checked={(s["telegramVideoFetchMode"] ?? "bot_api") === "bot_api"}
+                  onChange={(v) => save({ telegramVideoFetchMode: v ? "bot_api" : "off" })}
+                />
+                <CompactInput
+                  label="Bot API staging chat id (optional)"
+                  hint="If set, the pipeline uses this chat (e.g. a private staging channel you admin the bot in) for forwardMessage/getFile. If blank, the bot's own Saved Messages are used as the staging destination."
+                  value={s["telegramVideoStagingChatId"] ?? ""}
+                  onChange={(v) => {
+                    const n = Number(String(v).trim());
+                    save({ telegramVideoStagingChatId: Number.isFinite(n) && n > 0 ? Math.floor(n) : null });
+                  }}
+                  type="number"
+                  min={0}
+                />
+              </div>
             </div>
           </Card>
 
@@ -1150,56 +1219,8 @@ function SettingsPage() {
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-xs font-semibold text-foreground">Key {g.keyIndex}</span>
                         <span className="text-[10px] text-muted-foreground font-mono break-all">
-                          {g.configured
-                            ? revealedKeys[g.keyIndex] ?? `${g.first8}…${g.last4}`
-                            : "not configured"}
+                          {g.configured ? `${g.first8}…${g.last4}` : "not configured"}
                         </span>
-                        {g.configured ? (
-                          <>
-                            <button
-                              type="button"
-                              className="text-muted-foreground hover:text-primary transition-colors"
-                              title={revealedKeys[g.keyIndex] ? "Hide key" : "Reveal full key"}
-                              onClick={() => {
-                                if (revealedKeys[g.keyIndex]) {
-                                  setRevealedKeys((prev) => {
-                                    const next = { ...prev };
-                                    delete next[g.keyIndex];
-                                    return next;
-                                  });
-                                } else {
-                                  revealGeminiKey({ pin, index: g.keyIndex })
-                                    .then((r) =>
-                                      setRevealedKeys((prev) => ({
-                                        ...prev,
-                                        [g.keyIndex]: r.key,
-                                      })),
-                                    )
-                                    .catch(onError);
-                                }
-                              }}
-                            >
-                              {revealedKeys[g.keyIndex] ? (
-                                <EyeOff className="h-3.5 w-3.5" />
-                              ) : (
-                                <Eye className="h-3.5 w-3.5" />
-                              )}
-                            </button>
-                            {revealedKeys[g.keyIndex] ? (
-                              <button
-                                type="button"
-                                className="text-muted-foreground hover:text-primary transition-colors"
-                                title="Copy full key"
-                                onClick={() => {
-                                  navigator.clipboard?.writeText(revealedKeys[g.keyIndex] ?? "");
-                                  toast.success("Copied");
-                                }}
-                              >
-                                <Copy className="h-3.5 w-3.5" />
-                              </button>
-                            ) : null}
-                          </>
-                        ) : null}
                         {!g.configured ? (
                           <Badge variant="secondary" className="text-[10px]">not configured</Badge>
                         ) : g.unused ? (
