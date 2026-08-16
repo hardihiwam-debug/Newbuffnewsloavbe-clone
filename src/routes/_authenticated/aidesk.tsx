@@ -29,7 +29,7 @@ function AiDesk() {
   const envGeminiCount = Number(keys?.envDefaults?.gemini ?? 0);
   const storedKeys = (keys?.keys ?? []) as any[];
   const geminiUsage = (keys?.geminiUsage ?? []) as any[];
-  const schemaOk = Boolean((data as any).schemaMigrations?.ok);
+  const schemaOk = Boolean((data as any)?.schemaMigrations?.ok);
 
   const stages = [
     { name: "Ingestion", ok: sources.length > 0, detail: sources.length > 0 ? `${sources.length} source(s) configured` : "No sources configured yet" },
