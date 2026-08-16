@@ -1007,12 +1007,11 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
     providerErrors.join(" | ").slice(0, 500),
   );
   return items.map(() => null);
-  return items.map(() => null);
 }
 
 // ── AI: Gemini direct translation (Sorani) ─────────────────────────────────
 const GEMINI_DIRECT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_DIRECT_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]; // chain: 3.6 -> 3.5 -> 3.5-lite (never hit limits on lite)
+const GEMINI_DIRECT_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]; // valid Google Gemini API models
 const SORANI_SYSTEM_PROMPT =
   "Translate the following message into Kurdish Sorani (Central Kurdish, in the Sorani script). Output ONLY the translation — no commentary, no \"Translation:\" prefix, no quotes around the text. Preserve emojis, links, line breaks, and any formatting exactly. Preserve all numbers, dates, times, percentages and quoted statements exactly as given — never change, round or reword a figure.";
 const SORANI_SYSTEM_PROMPT_STRICT =
