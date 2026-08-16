@@ -57,6 +57,12 @@ const PUBLISH_BATCH_SIZE = 3;
 // provider's own free tier caps at 200 requests/day, not us).
 const NEWSDATA_MAX_GROUPS = 8;
 const RSS_MAX_QUERIES = 12;
+// Google News can return ~100 items for every topical query. A wide ingest was
+// pulling 700+ Google proxy URLs per cycle, then spending the whole cycle
+// rediscovering old/same wire stories instead of queuing genuinely new news.
+// Keep each query to the newest results and let the publisher feeds provide
+// breadth.
+const GOOGLE_NEWS_RSS_PER_QUERY_CAP = 25;
 const PUBLISHER_FEED_CAP = 15;
 const TELEGRAM_POSTS_PER_CHANNEL = 40;
 // Telegram fast-lane (mode === "telegram") runs every ~5 minutes; it only
@@ -794,6 +800,18 @@ function freshnessGate(a: Article, maxAgeHours = 24): { ok: boolean; reason?: st
 function topTokens(title: string, n = 6): string[] {
   return normalizeTitle(title).split(" ").filter((w) => w.length > 3 && !STOPWORDS.has(w)).slice(0, n).sort();
 }
+function stripGoogleNewsSourceSuffix(title: string): string {
+  // Google News RSS titles are commonly "Headline - Outlet" while the <source>
+  // tag already carries the outlet. Keeping the suffix made the same story from
+  // repeated queries look different enough to survive in-cycle dedup.
+  return title.replace(/\s+-\s+[^-]{2,80}$/u, "").trim() || title.trim();
+}
+
+function articleIdentityText(a: Article): string {
+  const title = a.provider === "Google News RSS" ? stripGoogleNewsSourceSuffix(a.title) : a.title;
+  return `${title} ${a.description ?? ""}`.trim();
+}
+
 function normalizeUrl(raw: string): string | null {
   try {
     const u = new URL(raw);
@@ -809,7 +827,17 @@ function normalizeUrl(raw: string): string | null {
 }
 async function canonicalKey(a: Article): Promise<string> {
   const normalized = normalizeUrl(a.url);
-  if (normalized) return "u:" + (await sha256hex(normalized)).slice(0, 32);
+  if (normalized) {
+    const host = hostOf(normalized);
+    // Google News RSS emits a different news.google.com proxy URL for the same
+    // article across query feeds. Key those rows by normalized headline/day so
+    // one story cannot refill raw_articles and queue over and over.
+    if (a.provider === "Google News RSS" || host === "news.google.com") {
+      const day = a.publishedAt ? new Date(a.publishedAt).toISOString().slice(0, 10) : "nodate";
+      return "g:" + (await sha256hex([day, normalizeTitle(stripGoogleNewsSourceSuffix(a.title))].join("|"))).slice(0, 32);
+    }
+    return "u:" + (await sha256hex(normalized)).slice(0, 32);
+  }
   const day = a.publishedAt ? new Date(a.publishedAt).toISOString().slice(0, 10) : "nodate";
   const fp = [hostOf(a.url) || a.sourceName || "unknown", day, topTokens(a.title).join("-"), normalizeTitle(a.title)].join("|");
   return "f:" + (await sha256hex(fp)).slice(0, 32);
@@ -1011,6 +1039,9 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
 
 // ── AI: Gemini direct translation (Sorani) ─────────────────────────────────
 const GEMINI_DIRECT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta";
+// Use one stable direct Gemini model for translation. Trying multiple models per
+// post multiplies quota use; if these API keys belong to one Google project,
+// six API keys still share that project's RPM/daily quota.
 const GEMINI_DIRECT_MODELS = ["gemini-1.5-flash-latest"];
 const SORANI_SYSTEM_PROMPT =
   "Translate the following message into Kurdish Sorani (Central Kurdish, in the Sorani script). Output ONLY the translation — no commentary, no \"Translation:\" prefix, no quotes around the text. Preserve emojis, links, line breaks, and any formatting exactly. Preserve all numbers, dates, times, percentages and quoted statements exactly as given — never change, round or reword a figure.";
@@ -1082,7 +1113,45 @@ async function logGeminiCall(c) {
 }
 
 const GEMINI_MIN_INTERVAL_MS = 6500;
+const GEMINI_RATE_LIMIT_BACKOFF_MS = 15 * 60_000;
+const GEMINI_PROJECT_RATE_LIMIT_BACKOFF_MS = 70_000;
 const keyNextAt = new Map<number, number>();
+
+function isProjectWideGeminiLimit(message: string): boolean {
+  return /per\s+project|GenerateRequestsPerMinutePerProject|RequestsPerMinutePerProject|quota metric/i.test(message);
+}
+
+async function getGeminiThrottleUntil(keyIndex: number): Promise<number> {
+  const rows = await rest<Array<{ next_available_at: number }>>("gemini_throttle", {
+    query: `key_index=eq.${keyIndex}&order=next_available_at.desc&limit=1`,
+  }).catch(() => []);
+  return Number(rows?.[0]?.next_available_at ?? 0);
+}
+
+async function setGeminiThrottle(keyIndex: number, nextAvailableAt: number): Promise<void> {
+  const rows = await rest<Array<{ id: string; next_available_at: number }>>("gemini_throttle", {
+    query: `key_index=eq.${keyIndex}&order=next_available_at.desc&limit=1`,
+  }).catch(() => []);
+  const existing = rows?.[0];
+  if (existing?.id) {
+    if (Number(existing.next_available_at ?? 0) >= nextAvailableAt) return;
+    await rest(`gemini_throttle?id=eq.${enc(String(existing.id))}`, {
+      method: "PATCH",
+      body: { next_available_at: nextAvailableAt },
+      prefer: "return=minimal",
+    }).catch(() => {});
+    return;
+  }
+  await rest("gemini_throttle", {
+    method: "POST",
+    body: { key_index: keyIndex, next_available_at: nextAvailableAt },
+    prefer: "return=minimal",
+  }).catch(() => {});
+}
+
+async function throttleGeminiKeys(keys: Array<{ index: number }>, nextAvailableAt: number): Promise<void> {
+  await Promise.all(keys.map(({ index }) => setGeminiThrottle(index, nextAvailableAt)));
+}
 
 async function geminiTranslateOnce(text: string, glossary: string | undefined): Promise<{ text: string; model: string; keyIndex: number } | null> {
   const keys = geminiKeys();
@@ -1091,6 +1160,11 @@ async function geminiTranslateOnce(text: string, glossary: string | undefined): 
   for (const model of GEMINI_DIRECT_MODELS) {
     for (const { index, key } of keys) {
       if (deadKeys.has(index)) continue;
+      const persistentThrottleUntil = await getGeminiThrottleUntil(index);
+      if (persistentThrottleUntil > Date.now()) {
+        await logGeminiCall({ keyIndex: index, model, ok: false, code: 429, message: "skipped: local Gemini throttle active" });
+        continue;
+      }
       const now = Date.now();
       const wait = (keyNextAt.get(index) ?? 0) - now;
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
@@ -1119,7 +1193,17 @@ async function geminiTranslateOnce(text: string, glossary: string | undefined): 
       };
       if (!res.ok || data?.error) {
         const code = data?.error?.code ?? res.status;
-        await logGeminiCall({ keyIndex: index, model, ok: false, code, message: data?.error?.message ?? `HTTP ${res.status}` });
+        const message = data?.error?.message ?? `HTTP ${res.status}`;
+        await logGeminiCall({ keyIndex: index, model, ok: false, code, message });
+        if (code === 429) {
+          const backoff = isProjectWideGeminiLimit(message) ? GEMINI_PROJECT_RATE_LIMIT_BACKOFF_MS : GEMINI_RATE_LIMIT_BACKOFF_MS;
+          const until = Date.now() + backoff;
+          if (isProjectWideGeminiLimit(message)) {
+            await throttleGeminiKeys(keys, until);
+            break;
+          }
+          await setGeminiThrottle(index, until);
+        }
         if (code === 400 || code === 401 || code === 403) deadKeys.add(index);
         continue;
       }
@@ -1663,6 +1747,13 @@ async function listQueued(): Promise<Array<Record<string, unknown>>> {
 async function setQueueStatus(id: string, status: string): Promise<void> {
   await rest("queue", { method: "PATCH", query: `id=eq.${enc(id)}`, body: { status }, prefer: "return=minimal" });
 }
+async function deactivateChat(id: string): Promise<void> {
+  await rest("chats", { method: "PATCH", query: `id=eq.${enc(id)}`, body: { active: false }, prefer: "return=minimal" });
+}
+function isPermanentTelegramChatError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /Telegram .*\[(400|403)\].*(chat not found|bot was blocked|bot is not a member|forbidden|kicked|user is deactivated)/i.test(msg);
+}
 // delete-after-post: once a queue row lands in every active chat we drop it
 // from Postgres immediately, so the queue table does not grow with each
 // published story. Dedup memory moves to published_history and is sized by
@@ -1938,7 +2029,9 @@ async function fetchTelegramArticles(
     for (const post of posts) {
       if (post.publishedAt && Date.now() - Date.parse(post.publishedAt) > 6 * 3_600_000) continue;
       const text = cleanEditorialText(post.text);
-      if (!isEnglishText(text).ok) continue;
+      // Telegram sources are operator-selected. Do not silently discard posts
+      // just because they are already Sorani/Arabic/Persian; the old English
+      // gate made trusted Telegram channels look "stuck" with nothing queued.
       const article: Article = {
         provider: `Telegram/${post.channel}`,
         sourceName: `@${post.channel}`,
@@ -2102,7 +2195,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     const rssResults = await Promise.all(
       queries.slice(0, RSS_MAX_QUERIES).map(async (query) => {
         try {
-          return await fetchGoogleNewsRss(query);
+          return (await fetchGoogleNewsRss(query)).slice(0, GOOGLE_NEWS_RSS_PER_QUERY_CAP);
         } catch (err) {
           errors.push(`rss / ${query.slice(0, 40)}: ${err instanceof Error ? err.message : String(err)}`);
           return [] as Article[];
@@ -2140,8 +2233,12 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (!sourceBanGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!junkGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!respectGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
-    if (!relevanceGate(article.title, article.description).ok) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
-    if (!isEnglishText(`${article.title} ${article.description ?? ""}`).ok) { stats.junk = Number(stats.junk) + 1; continue; }
+    const isTelegramArticle = article.provider.startsWith("Telegram/");
+    // Telegram feeds are curated by the operator. Keep the hard junk/respect
+    // checks, but do not apply English/topic gates that were written for web
+    // RSS snippets; otherwise non-English Telegram posts never reach queue.
+    if (!isTelegramArticle && !relevanceGate(article.title, article.description).ok) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
+    if (!isTelegramArticle && !isEnglishText(`${article.title} ${article.description ?? ""}`).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     const textForFreshness = `${article.title} ${article.description ?? ""}`;
     const maxAge = /\b(attack|strike|missile|drone|war|explosion|airstrike|houthi|hezbollah|irgc|centcom|hormuz|nuclear)\b/i.test(textForFreshness) ? 14
       : /\b(analysis|explainer|commentary|opinion)\b/i.test(textForFreshness) ? 48 : 22;
@@ -2159,9 +2256,9 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   const uniqueFresh: typeof fresh = [];
   const inCycleThreshold = Number(settings.event_similarity_threshold ?? 0.52);
   for (const item of fresh) {
-    const rawText = `${item.article.title} ${item.article.description ?? ""}`;
+    const rawText = articleIdentityText(item.article);
     const isDupe = uniqueFresh.some((u) => {
-      const uText = `${u.article.title} ${u.article.description ?? ""}`;
+      const uText = articleIdentityText(u.article);
       // Use the same event detection logic the cluster/publish paths use
       return sameEvent(rawText, uText, inCycleThreshold) || eventSimilarity(rawText, uText) >= inCycleThreshold;
     });
@@ -2260,7 +2357,8 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (droppedIdx.has(i)) continue;
     const { article, key } = fresh[i]!;
     const articleText = `${article.title} ${article.description ?? ""}`;
-    const category = keywordCategory(articleText);
+    const isTelegramArticle = article.provider.startsWith("Telegram/");
+    const category = keywordCategory(articleText) ?? (isTelegramArticle ? "telegram" : null);
     if (!category) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
     let headline = article.title;
     let summary = article.description ?? "";
@@ -2461,6 +2559,10 @@ function queueEffectiveScore(q: Record<string, unknown>): number {
 
 // Operator-configured footer hyperlinks (settings.post_links). Stored as a
 // jsonb array of { url, text } — appended to the bottom of every post.
+function containsArabicScript(text: string): boolean {
+  return /[؀-ۿݐ-ݿࢠ-ࣿ]/u.test(text);
+}
+
 function parsePostLinks(raw: unknown): Array<{ url: string; text: string }> {
   if (!Array.isArray(raw)) return [];
   const out: Array<{ url: string; text: string }> = [];
@@ -2640,51 +2742,60 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
       // headline for a Telegram item is just the first 180 chars of the SAME
       // summary text, so prepending it made the model repeat the opening in
       // the translated output — the "texts repetition" in the channel.
-      const toTranslate = isTelegramItem ? summary : `${headline}\n\n${summary}`;
-      const cached = await getTranslationCache(toTranslate);
-      const glossary = settings.translation_glossary as string | undefined;
-      const mode = String(settings.translation_mode ?? "gemini_first");
-      let translated = cached ? { text: cached.kurdish, model: cached.model } : await translateToSorani(toTranslate, glossary, mode);
-      if (translated.text && translated.model !== "none" && !cached) {
-        // Phase-2 digit-preservation guard: a translation must keep the exact
-        // figures of the source ("12 killed" may not become "15 killed").
-        // One retry, then accept and log — we never block publication on a
-        // digit, but we never silently ship a changed figure either.
-        const digits = checkDigitPreservation(toTranslate, translated.text);
-        if (!digits.ok) {
-          const retry = await translateToSorani(toTranslate, glossary, mode);
-          const retryOk = Boolean(retry.text) && checkDigitPreservation(toTranslate, retry.text).ok;
-          if (retryOk) translated = retry;
-          await logActivity("translation", "warning", `Digit guard — ${digits.missing.slice(0, 3).join(", ")} not in source${retryOk ? " (fixed on retry)" : ""}: ${headline.slice(0, 90)}`);
-        }
-        await saveTranslationCache(toTranslate, translated.text, translated.model).catch(() => {});
-      }
-      if (translated.text) {
-        usedModel = translated.model;
-        const parts = translated.text.split("\n\n");
-        if (isTelegramItem) {
-          finalHeadline = "";
-          finalSummary = translated.text;
-        } else {
-          finalHeadline = parts[0] ?? headline;
-          finalSummary = parts.slice(1).join("\n\n") || translated.text;
-        }
+      // If a trusted Telegram source is already in Sorani/Arabic script, ship
+      // the source text directly instead of wasting Gemini/MiniMax quota and
+      // risking a failed "translation" of already-local text.
+      if (isTelegramItem && containsArabicScript(summary)) {
+        finalHeadline = "";
+        finalSummary = summary;
+        usedModel = "source-text";
       } else {
-        await logActivity("translation", "warning", `Sorani unavailable — published English fallback (all providers exhausted): ${headline.slice(0, 110)}`);
-        // Record the failure so the dashboard "Translation fails" stat is
-        // honest instead of always reading 0.
-        await rest("translation_failures", {
-          method: "POST",
-          body: {
-            dedup_key: dedupKey,
-            headline: headline.slice(0, 300),
-            target_language: "ckb",
-            models_tried: ["minimax", "gemini"],
-            detail: "All translation models failed or returned non-Sorani output",
-          },
-          prefer: "return=minimal",
-        }).catch(() => {});
-        usedModel = "english-fallback";
+        const toTranslate = isTelegramItem ? summary : `${headline}\n\n${summary}`;
+        const cached = await getTranslationCache(toTranslate);
+        const glossary = settings.translation_glossary as string | undefined;
+        const mode = String(settings.translation_mode ?? "gemini_first");
+        let translated = cached ? { text: cached.kurdish, model: cached.model } : await translateToSorani(toTranslate, glossary, mode);
+        if (translated.text && translated.model !== "none" && !cached) {
+          // Phase-2 digit-preservation guard: a translation must keep the exact
+          // figures of the source ("12 killed" may not become "15 killed").
+          // One retry, then accept and log — we never block publication on a
+          // digit, but we never silently ship a changed figure either.
+          const digits = checkDigitPreservation(toTranslate, translated.text);
+          if (!digits.ok) {
+            const retry = await translateToSorani(toTranslate, glossary, mode);
+            const retryOk = Boolean(retry.text) && checkDigitPreservation(toTranslate, retry.text).ok;
+            if (retryOk) translated = retry;
+            await logActivity("translation", "warning", `Digit guard — ${digits.missing.slice(0, 3).join(", ")} not in source${retryOk ? " (fixed on retry)" : ""}: ${headline.slice(0, 90)}`);
+          }
+          await saveTranslationCache(toTranslate, translated.text, translated.model).catch(() => {});
+        }
+        if (translated.text) {
+          usedModel = translated.model;
+          const parts = translated.text.split("\n\n");
+          if (isTelegramItem) {
+            finalHeadline = "";
+            finalSummary = translated.text;
+          } else {
+            finalHeadline = parts[0] ?? headline;
+            finalSummary = parts.slice(1).join("\n\n") || translated.text;
+          }
+        } else {
+          await logActivity("translation", "warning", `Sorani unavailable — published English fallback (all providers exhausted): ${headline.slice(0, 110)}`);
+          // Record the failure so the dashboard "Translation fails" stat is
+          // honest instead of always reading 0.
+          await rest("translation_failures", {
+            method: "POST",
+            body: {
+              dedup_key: dedupKey,
+              headline: headline.slice(0, 300),
+              target_language: "ckb",
+              models_tried: ["minimax", "gemini"],
+              detail: "All translation models failed or returned non-Sorani output",
+            },
+            prefer: "return=minimal",
+          }).catch(() => {});
+          usedModel = "english-fallback";
+        }
       }
     }
 
@@ -2791,7 +2902,13 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
         if (historyId) {
           await rest(`published_history?id=eq.${enc(String(historyId))}`, { method: "DELETE", prefer: "return=minimal" }).catch(() => {});
         }
-        await logActivity("publish", "warning", `Send failed to chat ${chat.chat_id}: ${err instanceof Error ? err.message : String(err)}`);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (isPermanentTelegramChatError(err)) {
+          await deactivateChat(String(chat.id)).catch(() => {});
+          await logActivity("publish", "warning", `Disabled unreachable chat ${chat.chat_id}: ${errMsg}`);
+        } else {
+          await logActivity("publish", "warning", `Send failed to chat ${chat.chat_id}: ${errMsg}`);
+        }
       }
     }
     if (sentThisItem > 0) {
