@@ -2384,7 +2384,9 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   if (mode === "all") tsPatch.last_ingest_at = new Date().toISOString();
   await patchSettings(String(settings.id), tsPatch);
   const updateNote = Number(stats.updates) > 0 ? `, ${stats.updates} update${Number(stats.updates) === 1 ? "" : "s"}` : "";
-  await logActivity("ingest", Number(stats.queued) > 0 ? "success" : "info", `Ingest cycle: ${stats.fetched} fetched, ${stats.queued} queued${updateNote}`, errors.length ? `Errors: ${errors.slice(0, 3).join(" | ")}` : undefined);
+  const filterBreakdown = `Junk: ${stats.junk} | OffTopic: ${stats.offTopic} | Stale: ${stats.stale} | Dup: ${stats.duplicate} | ReReports: ${stats.reReports}`;
+  const detailStr = errors.length ? `Errors: ${errors.slice(0, 2).join(" | ")} | ${filterBreakdown}` : filterBreakdown;
+  await logActivity("ingest", Number(stats.queued) > 0 ? "success" : "info", `Ingest cycle: ${stats.fetched} fetched, ${stats.queued} queued${updateNote}`, detailStr);
   await flushAiUsage();
   return stats;
 }
