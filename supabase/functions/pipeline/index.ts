@@ -50,13 +50,36 @@ const CLOUDFLARE_API_TOKEN = Deno.env.get("CLOUDFLARE_API_TOKEN") ?? "";
 const CLOUDFLARE_ACCOUNT_ID = Deno.env.get("CLOUDFLARE_ACCOUNT_ID") ?? "";
 
 // ── Pipeline tuning (operator decisions) ────────────────────────────────────
-// Posts sent per publish cycle. Raising this drains the backlog faster; the
-// day/night window gap still spaces cycles apart.
+// Posts sent per MANUAL publish cycle (the dashboard "publish now" path).
+// Raising this drains the backlog faster.
 const PUBLISH_BATCH_SIZE = 3;
+// Automatic (cron-tick) publish cycles send exactly one post per cycle so a
+// burst can never push 2-3 posts out in a single cycle.
+const AUTO_PUBLISH_BATCH_SIZE = 1;
+// How many queue candidates a publish cycle may scan before giving up.
+// Duplicates / rejects encountered while scanning are deleted or rejected
+// (backlog cleanup), but only the first `force` READY items are actually sent.
+// This is what keeps a duplicate sitting at the top of the queue from
+// blocking the whole cycle: the old code looked at exactly one candidate and
+// published nothing whenever that candidate was a duplicate.
+const PUBLISH_SCAN_CAP = 40;
+// Instant Telegram channels (per-source speed = "Instant"): every new on-beat
+// post is published immediately during the 5-minute fast lane — no scoring
+// order, no window gap, no 1-per-cycle limit. Safety cap so a channel dumping
+// many posts in a burst cannot flood subscribers; the rest trickle out on
+// later cycles.
+const INSTANT_PUBLISH_CAP = 5;
 // Ingest net width per cycle. NewsData groups are one API call each (the
 // provider's own free tier caps at 200 requests/day, not us).
 const NEWSDATA_MAX_GROUPS = 8;
 const RSS_MAX_QUERIES = 12;
+// Per-query cap for Google News RSS. A 1-day feed returns ~100 items per
+// query; 12 queries un-capped floods every cycle with ~800 raw items, and the
+// ingest's O(n²) in-cycle dedup + gate pipeline then blows past the function
+// execution limit (cycle killed mid-ingest, publish lock stuck). 20/query keeps
+// the fetch "wide like before" (~180-240 raw items) while staying inside the
+// worker budget.
+const RSS_PER_QUERY_CAP = 20;
 const PUBLISHER_FEED_CAP = 15;
 const TELEGRAM_POSTS_PER_CHANNEL = 40;
 // Telegram fast-lane (mode === "telegram") runs every ~5 minutes; it only
@@ -373,7 +396,7 @@ async function fetchGoogleNewsRss(query: string): Promise<Article[]> {
     const url = `${base}?q=${encodeURIComponent(query)}+when:1d&hl=en-US&gl=US&ceid=US:en`;
     try {
       const res = await fetch(url, { headers: RSS_HEADERS, signal: AbortSignal.timeout(20_000) });
-      if (res.ok) return parseRssItems(await res.text(), "Google News RSS", null);
+      if (res.ok) return parseRssItems(await res.text(), "Google News RSS", null).slice(0, RSS_PER_QUERY_CAP);
     } catch {
       /* try next */
     }
@@ -958,7 +981,7 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
           // force JSON mode on Groq/OpenRouter/Gemini.
           ...(p.name === "cloudflare" ? {} : { response_format: { type: "json_object" } }),
         }),
-        signal: AbortSignal.timeout(Math.min(40_000, remainingMs)),
+        signal: AbortSignal.timeout(Math.min(15_000, remainingMs)),
       });
       const raw = await res.text();
       if (!res.ok) throw new Error(`${p.name} ${res.status}: ${raw.slice(0, 150)}`);
@@ -1658,7 +1681,11 @@ async function insertQueueItem(row: Record<string, unknown>): Promise<void> {
   }
 }
 async function listQueued(): Promise<Array<Record<string, unknown>>> {
-  return (await rest<Array<Record<string, unknown>>>("queue", { query: "select=*&status=eq.queued&order=created_at.desc&limit=60" })) ?? [];
+  // No tight newest-60 window: the queue routinely holds 100+ items and a
+  // high-score / breaking item queued early would fall outside a small window
+  // and be starved forever (it never even reaches the publish sort). Fetch up
+  // to PostgREST's max rows so the sort + gates see the whole backlog.
+  return (await rest<Array<Record<string, unknown>>>("queue", { query: "select=*&status=eq.queued&order=created_at.desc&limit=1000" })) ?? [];
 }
 async function setQueueStatus(id: string, status: string): Promise<void> {
   await rest("queue", { method: "PATCH", query: `id=eq.${enc(id)}`, body: { status }, prefer: "return=minimal" });
@@ -2235,6 +2262,12 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   for (let c = 0; c < toExtract.length; c += GROQ_CHUNK_SIZE) {
     toExtractChunks.push(toExtract.slice(c, c + GROQ_CHUNK_SIZE));
   }
+  // Hard wall-time cap on the whole rewrite phase: the LLM provider chain
+  // (up to 4 providers per chunk) could previously eat the entire ingest
+  // budget and the cycle was killed mid-rewrite, leaving the publish lock
+  // stuck for minutes. Cap the rewrite at ~20s total so ingest always
+  // finishes and reaches the queue/publish path.
+  const rewriteDeadline = Math.min(deadline, Date.now() + 20_000);
   // Run the rewrite chunks sequentially (worker = 1) so concurrent LLM calls
   // don't trigger 429 rate-limit bursts on Groq/Cloudflare/Gemini free tiers.
   const chunkResults: Array<Array<ExtractedFacts | null>> = new Array(toExtractChunks.length);
@@ -2243,7 +2276,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   const chunkWorker = async () => {
     while (budgetLeft() && chunkCursor < toExtractChunks.length) {
       const i = chunkCursor++;
-      chunkResults[i] = await groqExtractFacts(toExtractChunks[i]!, deadline);
+      chunkResults[i] = await groqExtractFacts(toExtractChunks[i]!, rewriteDeadline);
     }
   };
   await Promise.all(Array.from({ length: Math.min(GROQ_WORKERS, toExtractChunks.length) }, () => chunkWorker()));
@@ -2292,6 +2325,17 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     // Telegram source): 0 = normal, 1 = fast (+60 score, no flag), 2 = instant
     // (+150 score AND treated as breaking so it always sorts first).
     const instant = boost >= 2;
+    // Instant Telegram channels publish immediately via the 5-minute fast
+    // lane (no scoring order, no window gap) and skip the queue's
+    // publish-time beat gate — so run the beat gate here: only on-beat posts
+    // may go out, off-beat ones are dropped and never queued.
+    if (instant) {
+      const beat = relevanceGate(articleText, "");
+      if (!beat.ok) {
+        stats.instantOffBeat = Number(stats.instantOffBeat ?? 0) + 1;
+        continue;
+      }
+    }
     const ageHours = article.publishedAt ? Math.max(0, (Date.now() - Date.parse(article.publishedAt)) / 3_600_000) : 24;
     // Phase-2 breaking gate: breaking requires recency (breaking_max_age_hours)
     // — a 10-hour-old "missile" story entering the pipeline late must not
@@ -2345,13 +2389,14 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
       is_update: isUpdate,
       importance: breaking ? "breaking" : isUpdate ? "update" : "minor",
       score,
-      score_parts: { priority, freshness, severity: SEVERITY_POINTS[severity], leader: leaderStatement ? 120 : 0, breaking: breaking ? 42 : 0, boost: boostBonus },
+      score_parts: { priority, freshness, severity: SEVERITY_POINTS[severity], leader: leaderStatement ? 120 : 0, breaking: breaking ? 42 : 0, boost: boostBonus, instant },
       breaking,
       status: "queued",
       created_at: new Date().toISOString(),
     });
     if (breaking) stats.breakingQueued = Number(stats.breakingQueued) + 1;
     if (isUpdate) stats.updates = Number(stats.updates) + 1;
+    if (instant) stats.instantQueued = Number(stats.instantQueued ?? 0) + 1;
     stats.queued = Number(stats.queued) + 1;
   }
 
@@ -2477,7 +2522,12 @@ function parsePostLinks(raw: unknown): Array<{ url: string; text: string }> {
   return out;
 }
 
-async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | null): Promise<Record<string, unknown>> {
+async function runPublish(
+  settings: SettingsRow,
+  force = 1,
+  onlyId?: string | null,
+  opts: { instantOnly?: boolean } = {},
+): Promise<Record<string, unknown>> {
   const result: Record<string, unknown> = { sent: 0, items: [] as string[] };
   const chats = dedupeChats(await listActiveChats());
   if (chats.length === 0) {
@@ -2485,9 +2535,18 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
     return { ...result, skipped: "no chats" };
   }
 
-  const pool = onlyId
+  let pool = onlyId
     ? (await rest<Array<Record<string, unknown>>>("queue", { query: `select=*&id=eq.${enc(onlyId)}&limit=1` })) ?? []
     : await listQueued();
+  // Instant-only mode (5-minute fast lane): restrict the pool to posts from
+  // Instant Telegram channels (score_parts.instant set at ingest; the
+  // boost>=150 fallback also catches rows queued before the flag existed).
+  if (opts.instantOnly) {
+    pool = pool.filter((item) => {
+      const parts = (item.score_parts as Record<string, unknown> | null) ?? {};
+      return parts.instant === true || Number(parts.boost ?? 0) >= 150;
+    });
+  }
   if (pool.length === 0) return { ...result, skipped: onlyId ? "item not found or no longer queued" : "queue empty" };
 
   const recentPublished = await listRecentPublished(200);
@@ -2519,7 +2578,12 @@ async function runPublish(settings: SettingsRow, force = 1, onlyId?: string | nu
 
   let sentThisCycle = 0;
   let updatesPublishedThisCycle = 0;
-  for (const item of sorted.slice(0, Math.max(force, 1))) {
+  // Scan past duplicates/rejects instead of stopping at the first candidate:
+  // each `continue` below deletes (or rejects) the dead item and the loop
+  // advances to the next candidate, so an eligible cycle always publishes a
+  // READY item as long as one exists in the pool. Sends are still capped at
+  // `force` (1 per automatic cycle) by the guard at the top of the loop.
+  for (const item of sorted.slice(0, Math.max(force, PUBLISH_SCAN_CAP))) {
     if (sentThisCycle >= Math.max(force, 1)) break;
     const id = String(item.id);
     const dedupKey = String(item.dedup_key);
@@ -2892,10 +2956,10 @@ async function acquireLock(settings: SettingsRow): Promise<boolean> {
   // let two concurrent invocations both read "unlocked" and both proceed to
   // publish.
   //
-  // The stale window (4 min) is shorter than the previous 10 min so a cycle
-  // that gets killed by the function timeout (finally never runs) frees the
-  // pipeline quickly instead of silently halting publishing for 10 minutes.
-  const staleBefore = new Date(Date.now() - 4 * 60_000).toISOString();
+  // The stale window (60s) lets a cycle that gets killed by the function
+  // timeout (finally never runs) free the pipeline within a minute instead of
+  // silently halting publishing for 4+ minutes.
+  const staleBefore = new Date(Date.now() - 60_000).toISOString();
   const claimed = await rest<Array<{ id: string }>>("settings", {
     method: "PATCH",
     query: `id=eq.${enc(String(settings.id))}&or=(publish_run_lock_at.is.null,publish_run_lock_at.lt.${enc(staleBefore)})`,
@@ -2971,14 +3035,27 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
       settings = (await getSettings()) ?? settings;
     }
 
+    // Instant Telegram channels (per-source speed = "Instant"): publish EVERY
+    // new on-beat post they made this fetch, right now — no scoring order, no
+    // window gap, no 1-per-cycle limit. Only the per-cycle flood cap applies;
+    // anything beyond it stays queued (flagged instant) and drains on later
+    // cycles. The /25 term also keeps the batch inside the worker time budget.
+    const instantQueued = Number(tgStats?.instantQueued ?? 0) + Number(ingestStats?.instantQueued ?? 0);
+    if (instantQueued > 0 && budgetLeft()) {
+      const remainingSec = Math.max(0, (cycleStart + budgetMs - Date.now()) / 1000);
+      const instantBatch = Math.max(1, Math.min(INSTANT_PUBLISH_CAP, instantQueued, Math.floor(remainingSec / 25)));
+      const instantStats = await runPublish(settings, instantBatch, null, { instantOnly: true });
+      return { telegram: tgStats, ingest: ingestStats, instant: instantStats };
+    }
+
     // Telegram fast lane: publish any NEW related post within the 5-minute
     // fetch cadence, 24/7 (not just "breaking" ones, not just the day window)
-    // so the channel always feels live. Cap at 3 per cycle so a burst doesn't
+    // so the channel always feels live. Cap at 1 per cycle so a burst doesn't
     // flood subscribers. Web/news/RSS content still follows the day/night gap
     // cadence in the fall-through path below.
     if (tgStats && Number(tgStats.queued) > 0 && budgetLeft()) {
       const remainingSec = Math.max(0, (cycleStart + budgetMs - Date.now()) / 1000);
-      const tgBatch = Math.max(1, Math.min(PUBLISH_BATCH_SIZE, Number(tgStats.queued), Math.floor(remainingSec / 35)));
+      const tgBatch = Math.max(1, Math.min(AUTO_PUBLISH_BATCH_SIZE, Number(tgStats.queued), Math.floor(remainingSec / 35)));
       const publishStats = await runPublish(settings, tgBatch);
       return { telegram: tgStats, ingest: ingestStats, publish: publishStats };
     }
@@ -2988,7 +3065,7 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
     if (!budgetLeft()) return { skipped: "time budget (publish deferred)", telegram: tgStats, ingest: ingestStats };
 
     const remainingSec = Math.max(0, (cycleStart + budgetMs - Date.now()) / 1000);
-    const batch = Math.max(1, Math.min(PUBLISH_BATCH_SIZE, Math.floor(remainingSec / 35)));
+    const batch = Math.max(1, Math.min(AUTO_PUBLISH_BATCH_SIZE, Math.floor(remainingSec / 35)));
     const publishStats = await runPublish(settings, batch);
     return { telegram: tgStats, ingest: ingestStats, publish: publishStats };
   } finally {

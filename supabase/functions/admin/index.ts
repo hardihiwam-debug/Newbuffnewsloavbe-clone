@@ -380,6 +380,13 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
   }
   const schemaMigrations = { ok: Object.keys(schemaMissing).length === 0, missing: schemaMissing };
 
+  // Cron scheduler health (migration 0014 exposes cron.job / cron.job_run_details
+  // as public.cron_job_health because pg_cron lives in a schema PostgREST does
+  // not expose). Degrades to [] if the view is missing or the query fails, so a
+  // not-yet-applied migration can never break the dashboard.
+  const cronHealthRaw = await rest<unknown[]>("cron_job_health", { query: "limit=50" }).catch(() => []);
+  const cronHealth = snakeArray(cronHealthRaw);
+
   return {
     settings,
     isOwner: true,
@@ -401,6 +408,7 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     translationFails24h,
     aiUsage24h,
     schemaMigrations,
+    cronHealth,
     botConfigured: Boolean(TELEGRAM_BOT_TOKEN),
     newsdataConfigured: Boolean(NEWSDATA_API_KEY),
   };

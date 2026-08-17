@@ -115,6 +115,8 @@ const files = [
   "supabase/migrations/0010_bulletin_cron.sql",
   "supabase/migrations/0011_gemini_first_translation.sql",
   "supabase/migrations/0012_post_links.sql",
+  "supabase/migrations/0013_cron_config.sql",
+  "supabase/migrations/0014_cron_health.sql",
 ];
 let failed = 0;
 for (const file of files) {

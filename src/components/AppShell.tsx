@@ -62,6 +62,7 @@ export function useNewsroomData() {
     translationHistory?: any[];
     polls?: any[];
     schemaMigrations?: { ok: boolean; missing?: Record<string, string[]> };
+    cronHealth?: any[];
     botConfigured?: boolean;
     newsdataConfigured?: boolean;
     clusters?: any[];

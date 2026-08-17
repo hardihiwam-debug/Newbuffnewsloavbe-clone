@@ -1764,6 +1764,40 @@ function SettingsPage() {
               </div>
             </div>
           </Card>
+          <Card icon={Clock} title="Scheduler (pg_cron)" hint="Automatic pipeline + bulletin ticker" className="lg:col-span-3">
+            {(() => {
+              const jobs = ((data as any).cronHealth ?? []) as any[];
+              if (!jobs.length) {
+                return (
+                  <p className="text-xs text-muted-foreground">
+                    No cron jobs visible — apply migration 0014 (cron health view) or confirm pg_cron is enabled.
+                  </p>
+                );
+              }
+              return (
+                <div className="space-y-2">
+                  {jobs.map((j: any) => {
+                    const status = j.lastRunStatus;
+                    const failed = status === "failed";
+                    const ok = ["succeeded", "running", "starting", "sending", "connecting"].includes(status);
+                    const stateLabel = !j.active ? "inactive" : status || "no runs yet";
+                    const stateClass = !j.active || failed ? "text-destructive" : ok ? "text-emerald-400" : "text-muted-foreground";
+                    return (
+                      <div key={j.jobname} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-muted/40 px-3 py-2.5">
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-medium text-foreground">{j.jobname}</p>
+                          <p className="truncate text-[10px] text-muted-foreground">
+                            {j.schedule} · last run {j.lastRunFinishedAt ? new Date(j.lastRunFinishedAt).toLocaleString() : "—"}
+                          </p>
+                        </div>
+                        <span className={`shrink-0 text-[10px] font-medium ${stateClass}`}>{stateLabel}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          </Card>
         </div>
       )}
 
