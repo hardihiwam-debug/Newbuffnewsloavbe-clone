@@ -683,10 +683,10 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
       (a.priority ?? 0) - (b.priority ?? 0),
     );
 
-  const hardcodedGemini: { index: number; first8: string; last4: string }[] = [];
+  const hardcodedGemini: { index: number; first8: string; last4: string; email: string }[] = [];
   for (let i = 1; i <= 6; i++) {
     const key = Deno.env.get(`GEMINI_API_KEY_${i}`)?.trim() ?? "";
-    if (key) hardcodedGemini.push({ index: i, first8: key.slice(0, 8), last4: key.slice(-4) });
+    if (key) hardcodedGemini.push({ index: i, first8: key.slice(0, 8), last4: key.slice(-4), email: Deno.env.get(`GEMINI_API_EMAIL_${i}`)?.trim() ?? "" });
   }
 
   // Per-key × per-model usage (from gemini_key_usage + recent gemini_call_log).
@@ -698,6 +698,7 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
     keyIndex: number;
     first8: string;
     last4: string;
+    email: string;
     configured: boolean;
     today: ReturnType<typeof empty>;
     total: ReturnType<typeof empty>;
@@ -750,6 +751,7 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
       keyIndex: i,
       first8: envKey.slice(0, 8),
       last4: envKey.slice(-4),
+      email: Deno.env.get(`GEMINI_API_EMAIL_${i}`)?.trim() ?? "",
       configured,
       today,
       total,
@@ -1062,30 +1064,44 @@ async function testTranslationKey(p: { id: string }): Promise<unknown> {
 // usable. The dashboard already shows a confirm-style button.
 async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
   const GEMINI_DIRECT_MODELS = [
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-002",
-    "gemini-2.0-flash-exp",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
   ];
-  const keys: { index: number; key: string }[] = [];
+  // Pace the live check under 5 RPM total (same global rule as the pipeline
+  // translator): 13 seconds between request starts across all keys/models.
+  const GEMINI_TEST_INTERVAL_MS = 13_000;
+  let nextGeminiTestAt = 0;
+  const waitForGeminiTestSlot = async (): Promise<void> => {
+    const now = Date.now();
+    const wait = nextGeminiTestAt - now;
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    nextGeminiTestAt = Date.now() + GEMINI_TEST_INTERVAL_MS;
+  };
+
+  const keys: { index: number; key: string; email: string }[] = [];
   for (let i = 1; i <= 6; i++) {
     const k = Deno.env.get(`GEMINI_API_KEY_${i}`)?.trim();
-    if (k) keys.push({ index: i, key: k });
+    if (k) keys.push({ index: i, key: k, email: Deno.env.get(`GEMINI_API_EMAIL_${i}`)?.trim() ?? "" });
   }
   if (keys.length === 0) throw new HttpError(400, "No GEMINI_API_KEY_1..6 configured in function secrets");
 
   const results: Array<{
     keyIndex: number;
     masked: string;
+    email: string;
     models: Array<{ model: string; status: "ok" | "rate_limited" | "auth_error" | "error"; code: number; detail: string }>;
   }> = [];
 
-  for (const { index, key } of keys) {
+  for (const { index, key, email } of keys) {
     const models: Array<{ model: string; status: "ok" | "rate_limited" | "auth_error" | "error"; code: number; detail: string }> = [];
     for (const model of GEMINI_DIRECT_MODELS) {
       let status: "ok" | "rate_limited" | "auth_error" | "error" = "error";
       let code = 0;
       let detail = "";
       try {
+        await waitForGeminiTestSlot();
         const res = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
           {
@@ -1118,11 +1134,11 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
         detail = err instanceof Error ? err.message : String(err);
       }
       models.push({ model, status, code, detail: detail.slice(0, 200) });
-      await new Promise((r) => setTimeout(r, 350));
     }
     results.push({
       keyIndex: index,
       masked: `${key.slice(0, 6)}…${key.slice(-4)}`,
+      email,
       models,
     });
   }
