@@ -1309,7 +1309,7 @@ function SettingsPage() {
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-xs font-semibold text-foreground">Key {g.keyIndex}</span>
                         <span className="text-[10px] text-muted-foreground font-mono break-all">
-                          {g.configured ? `${g.first8}…${g.last4}` : "not configured"}
+                          {g.configured ? `${g.email ? `${g.email} · ` : ""}${g.first8}…${g.last4}` : "not configured"}
                         </span>
                         {!g.configured ? (
                           <Badge variant="secondary" className="text-[10px]">not configured</Badge>
@@ -1352,6 +1352,7 @@ function SettingsPage() {
                   {(geminiTest.keys ?? []).map((k: any) => (
                     <div key={k.keyIndex} className="flex items-center gap-2 text-[11px] flex-wrap">
                       <span className="font-medium text-foreground w-12 shrink-0">Key {k.keyIndex}</span>
+                      {k.email ? <span className="text-[10px] text-muted-foreground">{k.email}</span> : null}
                       {(k.models ?? []).map((mm: any) => (
                         <Badge
                           key={mm.model}
