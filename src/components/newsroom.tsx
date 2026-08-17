@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode, type TouchEvent } from "react";
 import { Pencil, SendHorizonal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -127,8 +127,44 @@ export function StoryCard({
 }) {
   const facts = (item?.facts ?? null) as Record<string, unknown> | null;
   const numbers = Array.isArray(facts?.numbers) ? (facts.numbers as string[]) : [];
+  // Swipe-left-to-delete: a horizontal left swipe rejects the item
+  // immediately (no confirmation) — only when an onReject handler is wired.
+  const swipeXRef = useRef(0);
+  const [swipeX, setSwipeX] = useState(0);
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
+  const onSwipeStart = (e: TouchEvent<HTMLDivElement>) => {
+    if (!onReject) return;
+    const t = e.touches[0];
+    if (t) touchStart.current = { x: t.clientX, y: t.clientY };
+  };
+  const onSwipeMove = (e: TouchEvent<HTMLDivElement>) => {
+    if (!onReject || !touchStart.current) return;
+    const t = e.touches[0];
+    if (!t) return;
+    const dx = t.clientX - touchStart.current.x;
+    const dy = t.clientY - touchStart.current.y;
+    if (Math.abs(dx) > Math.abs(dy)) {
+      const clamped = Math.max(-96, Math.min(0, dx));
+      swipeXRef.current = clamped;
+      setSwipeX(clamped);
+    }
+  };
+  const onSwipeEnd = () => {
+    if (!onReject) return;
+    const shouldDelete = swipeXRef.current <= -60;
+    touchStart.current = null;
+    swipeXRef.current = 0;
+    setSwipeX(0);
+    if (shouldDelete) onReject(item);
+  };
   return (
-    <div className="panel-hover hover:border-border/100 px-4 py-3">
+    <div
+      className="panel-hover hover:border-border/100 px-4 py-3"
+      style={{ transform: `translateX(${swipeX}px)`, transition: swipeX === 0 ? "transform 150ms ease" : "none", touchAction: "pan-y" }}
+      onTouchStart={onSwipeStart}
+      onTouchMove={onSwipeMove}
+      onTouchEnd={onSwipeEnd}
+    >
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">

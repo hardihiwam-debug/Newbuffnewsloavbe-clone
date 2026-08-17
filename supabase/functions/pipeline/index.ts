@@ -69,6 +69,12 @@ const PUBLISH_SCAN_CAP = 40;
 // many posts in a burst cannot flood subscribers; the rest trickle out on
 // later cycles.
 const INSTANT_PUBLISH_CAP = 5;
+// Instant bursts: when a frozen t.me snapshot advances it can deliver several
+// new posts at once. Space those sends ~50s apart (within the operator's
+// 45-60s target) so subscribers never see 3 posts dumped in 10 seconds. The
+// batch is sized to the remaining worker time budget, so this never overruns
+// the ~150s worker limit.
+const INSTANT_POST_GAP_MS = 50_000;
 // Ingest net width per cycle. NewsData groups are one API call each (the
 // provider's own free tier caps at 200 requests/day, not us).
 const NEWSDATA_MAX_GROUPS = 8;
@@ -813,6 +819,37 @@ function respectGate(a: Article): { ok: boolean; reason?: string } {
   const text = `${a.title} ${a.description ?? ""}`;
   if (DISRESPECT_PATTERNS.some((p) => p.test(text))) return gateOk(false, "disrespectful to Kurds/Muslims");
   if (NEGATIVE_IRAN_PATTERNS.some((p) => p.test(text))) return gateOk(false, "demoralising/unsourced negative Iran framing");
+  return gateOk(true, "");
+}
+
+// ── Sectarian content gate ───────────────────────────────────────────────────
+// Operator decision: this channel is not a Shia religious outlet. Many source
+// channels are Shia and post religious observances (Ashura, Arbaeen, majlis,
+// marja statements, mourning processions). Those are dropped; secular news
+// about the same region/cities passes through normally.
+const SECTARIAN_PATTERNS: RegExp[] = [
+  /عاشوراء|أربعين|الأربعين|زيارة الأربعين|الإمام الحسين|الحسين عليه السلام|الإمام علي|أمير المؤمنين|المجالس الحسينية|الحسينية|اللطمية|اللطم|الموكب الحسيني|ذكرى استشهاد|أهل البيت|المرجعية الدينية|المرجع الديني|الحوزة العلمية|الإمام المهدي|عيد الغدير|محرم الحرام|شهر محرم|زيارة الأئمة|مراسم العزاء|مواكب العزاء|السيستاني/i,
+  /\bashura\b|\barbaeen\b|\bmuharram\b|\bimam (hussein|ali|mahdi|khomeini)\b|\bahl[- ]?ul[- ]?bayt\b|\bmarja\b|\bmaraji'?\b|\bhawza\b|\blatmiya\b|\blatm\b|\bmajlis\b|\bhusseiniya\b|\bmourning procession\b|\beid al[- ]ghadir\b|\bshia pilgrimage\b|\bsistani\b/i,
+];
+function sectarianGate(title: string, description?: string | null): { ok: boolean; reason?: string } {
+  const text = `${title} ${description ?? ""}`;
+  if (SECTARIAN_PATTERNS.some((p) => p.test(text))) return gateOk(false, "Shia religious content");
+  return gateOk(true, "");
+}
+
+// ── Neutrality gate ──────────────────────────────────────────────────────────
+// The channel reports from the middle, it is not a combatant. Partisan war
+// framing that labels a regional state actor (GCC, Saudi, UAE, Syria, Iran)
+// "the enemy" is dropped so the feed stays neutral news, not militia rhetoric.
+const NEUTRALITY_PATTERNS: RegExp[] = [
+  /(العدو|أعداء)\s*(السعودي|السعودية|الإماراتي|الإمارات|الامارات|الخليجي|الخليج|القطري|البحريني|الكويتي|العماني|السوري|النظام السوري|الإيراني|إيران|ايران)/i,
+  /(السعودية|الإمارات|الامارات|الخليج|قطر|البحرين|الكويت|عمان|سوريا|النظام السوري|إيران|ايران)\s*(هو|هي|هم)?\s*(العدو|أعداء)/i,
+  /\b(enemy|enemies)\b[^.\n]{0,40}\b(saudi|uae|emirati|emirates|gulf|gcc|qatar|bahrain|kuwait|oman|syria|syrian|iran|iranian)\b/i,
+  /\b(saudi|uae|emirati|emirates|gulf|gcc|qatar|bahrain|kuwait|oman|syria|syrian|iran|iranian)\b[^.\n]{0,40}\b(enemy|enemies)\b/i,
+];
+function neutralityGate(title: string, description?: string | null): { ok: boolean; reason?: string } {
+  const text = `${title} ${description ?? ""}`;
+  if (NEUTRALITY_PATTERNS.some((p) => p.test(text))) return gateOk(false, "partisan enemy framing (not neutral news)");
   return gateOk(true, "");
 }
 
@@ -2296,6 +2333,8 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (!sourceBanGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!junkGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!respectGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
+    if (!sectarianGate(article.title, article.description).ok) { stats.junk = Number(stats.junk) + 1; stats.sectarian = Number(stats.sectarian ?? 0) + 1; continue; }
+    if (!neutralityGate(article.title, article.description).ok) { stats.junk = Number(stats.junk) + 1; stats.neutrality = Number(stats.neutrality ?? 0) + 1; continue; }
     // Instant channels (boost >= 2) may post in Arabic etc. The relevance
     // (beat) gate and the English gate are English-pattern gates, so they
     // only apply to normal/fast sources; instant posts flow straight through
@@ -2741,6 +2780,25 @@ async function runPublish(
     const summary = String(item.summary ?? "");
     const url = String(item.url ?? "");
     const sourceName = String(item.source_name ?? "");
+    // Editorial safety net — applies to Telegram AND web items alike, and also
+    // catches rows queued before these gates existed. Anti-hate (Kurds/Muslims),
+    // sectarian (Shia religious), and neutrality (enemy-framing) are re-checked
+    // here on the raw source text before anything is sent.
+    const editorialText = `${headline} ${summary} ${String(item.source_text ?? "")}`;
+    const editorialArticle: Article = {
+      provider: "", sourceName, url,
+      title: headline, description: editorialText,
+      imageUrl: null, publishedAt: null, mediaKind: null,
+    };
+    const respectCheck = respectGate(editorialArticle);
+    const sectCheck = sectarianGate(headline, editorialText);
+    const neutCheck = neutralityGate(headline, editorialText);
+    const editorialReason = !respectCheck.ok ? respectCheck.reason : !sectCheck.ok ? sectCheck.reason : !neutCheck.ok ? neutCheck.reason : null;
+    if (editorialReason) {
+      await setQueueStatus(id, "rejected");
+      await logActivity("publish", "info", `Editorial gate (${editorialReason}) — dropped: ${headline.slice(0, 110)}`);
+      continue;
+    }
     // Publish-time beat gate — drops any web/RSS/NewsData item whose raw
     // source text is off-beat, even if it was queued before the latest
     // relevance filter. Telegram fast-lane channels are exempt: they are the
@@ -3043,6 +3101,9 @@ async function runPublish(
       // window expires, so dup-detection still works.
       await deleteQueueRow(id);
       sentThisCycle += 1;
+      if (opts.instantOnly && sentThisCycle < Math.max(force, 1)) {
+        await new Promise((r) => setTimeout(r, INSTANT_POST_GAP_MS));
+      }
       (result.items as string[]).push(headline);
       dedup.publishedTitles.unshift(headline);
       // Same-cycle event suppression: refresh the cluster set + source texts
@@ -3219,7 +3280,7 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
     const instantQueued = Number(tgStats?.instantQueued ?? 0) + Number(ingestStats?.instantQueued ?? 0);
     if (instantQueued > 0 && budgetLeft()) {
       const remainingSec = Math.max(0, (cycleStart + budgetMs - Date.now()) / 1000);
-      const instantBatch = Math.max(1, Math.min(INSTANT_PUBLISH_CAP, instantQueued, Math.floor(remainingSec / 25)));
+      const instantBatch = Math.max(1, Math.min(INSTANT_PUBLISH_CAP, instantQueued, Math.floor(remainingSec / 55)));
       const instantStats = await runPublish(settings, instantBatch, null, { instantOnly: true });
       return { telegram: tgStats, ingest: ingestStats, instant: instantStats };
     }
