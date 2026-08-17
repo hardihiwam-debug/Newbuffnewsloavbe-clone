@@ -89,6 +89,8 @@ export const adminApi = {
     id: string;
     status: "held" | "rejected" | "queued";
   }) => callAdmin<{ ok: true; id: string; status: string }>("setQueueStatus", args),
+  deleteQueueItem: (args: { pin: string; id: string }) =>
+    callAdmin<{ ok: true; id: string; deleted: boolean }>("deleteQueueItem", args),
   setTranslationModel: (args: { pin: string; model: string }) =>
     callAdmin<{ ok: true; model: string }>("setTranslationModel", args),
   updateChat: (args: {

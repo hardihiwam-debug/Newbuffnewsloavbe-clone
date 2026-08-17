@@ -1306,6 +1306,31 @@ async function setQueueStatus(p: { id: string; status: "held" | "rejected" | "qu
 // Publish a single queued item immediately, bypassing the normal sort order.
 // Forwards to the pipeline's publish mode with an explicit id so the operator
 // can force a specific story out now (for example right after editing it).
+// ── Action: deleteQueueItem ─────────────────────────────────────────────────
+// Hard-delete a queue row (Inbox swipe-left). Unlike setQueueStatus — where
+// "rejected" only flags the row so it is excluded from auto-publish but still
+// visible in the FAILED tab — this actually removes the row so it can never be
+// re-selected or re-published.
+async function deleteQueueItem(p: { id: string }): Promise<unknown> {
+  if (!p.id) throw new HttpError(400, "id is required");
+  const row = await rest<Array<Record<string, unknown>>>("queue", {
+    query: `id=eq.${encodeURIComponent(p.id)}&limit=1`,
+  });
+  if (!Array.isArray(row) || row.length === 0) throw new HttpError(404, "Queue item not found");
+  await rest("queue", {
+    method: "DELETE",
+    query: `id=eq.${encodeURIComponent(p.id)}`,
+    prefer: "return=minimal",
+  });
+  await logActivity({
+    type: "admin",
+    level: "info",
+    message: "Queue item deleted",
+    detail: String(row[0].headline ?? p.id).slice(0, 80),
+  });
+  return { ok: true, id: p.id, deleted: true };
+}
+
 async function publishQueueItem(p: { id: string }): Promise<unknown> {
   if (!p.id) throw new HttpError(400, "id is required");
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -1356,6 +1381,7 @@ const handlers: Record<string, (p: any) => Promise<unknown>> = {
   editQueueItem,
   publishQueueItem,
   setQueueStatus,
+  deleteQueueItem,
 };
 
 // ── CORS helpers (so the SPA can call directly without a proxy) ─────────────

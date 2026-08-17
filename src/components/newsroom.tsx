@@ -114,6 +114,7 @@ export function StoryCard({
   onPublish,
   onEdit,
   onReject,
+  onDelete,
   busy,
   showFacts = true,
 }: {
@@ -122,23 +123,25 @@ export function StoryCard({
   onPublish?: (item: any) => void;
   onEdit?: (item: any) => void;
   onReject?: (item: any) => void;
+  onDelete?: (item: any) => void;
   busy?: boolean;
   showFacts?: boolean;
 }) {
   const facts = (item?.facts ?? null) as Record<string, unknown> | null;
   const numbers = Array.isArray(facts?.numbers) ? (facts.numbers as string[]) : [];
-  // Swipe-left-to-delete: a horizontal left swipe rejects the item
-  // immediately (no confirmation) — only when an onReject handler is wired.
+  // Swipe-left-to-delete: a horizontal left swipe hard-deletes the item
+  // (no confirmation) — preferring onDelete, falling back to onReject.
+  const swipeDelete = onDelete ?? onReject;
   const swipeXRef = useRef(0);
   const [swipeX, setSwipeX] = useState(0);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
   const onSwipeStart = (e: TouchEvent<HTMLDivElement>) => {
-    if (!onReject) return;
+    if (!swipeDelete) return;
     const t = e.touches[0];
     if (t) touchStart.current = { x: t.clientX, y: t.clientY };
   };
   const onSwipeMove = (e: TouchEvent<HTMLDivElement>) => {
-    if (!onReject || !touchStart.current) return;
+    if (!swipeDelete || !touchStart.current) return;
     const t = e.touches[0];
     if (!t) return;
     const dx = t.clientX - touchStart.current.x;
@@ -150,12 +153,12 @@ export function StoryCard({
     }
   };
   const onSwipeEnd = () => {
-    if (!onReject) return;
+    if (!swipeDelete) return;
     const shouldDelete = swipeXRef.current <= -60;
     touchStart.current = null;
     swipeXRef.current = 0;
     setSwipeX(0);
-    if (shouldDelete) onReject(item);
+    if (shouldDelete) swipeDelete(item);
   };
   return (
     <div

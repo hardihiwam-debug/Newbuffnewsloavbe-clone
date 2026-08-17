@@ -35,9 +35,12 @@ function Inbox() {
   const [tab, setTab] = useState<Tab>("ALL");
   const [editing, setEditing] = useState<any | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [removedIds, setRemovedIds] = useState<Set<string>>(new Set());
 
   const queue = ((data?.queueAll ?? []) as any[]).filter(
-    (i) => !["published"].includes(String(i.status ?? "")),
+    (i) =>
+      !["published"].includes(String(i.status ?? "")) &&
+      !removedIds.has(String(i.id ?? i._id)),
   );
   const activity = (data?.recentActivity ?? []) as any[];
   const translationFailures = (data?.translationFailures ?? []) as any[];
@@ -87,6 +90,29 @@ function Inbox() {
       onError(e);
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const deleteItem = async (item: any) => {
+    if (!pin) return;
+    const id = String(item.id ?? item._id);
+    // Remove immediately so the swipe doesn't leave a dead row on screen;
+    // re-add it only if the server delete fails.
+    setRemovedIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    try {
+      await adminApi.deleteQueueItem({ pin, id });
+      toast.success("Deleted");
+    } catch (e) {
+      setRemovedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      onError(e);
     }
   };
 
@@ -211,6 +237,7 @@ function Inbox() {
                 onEdit={setEditing}
                 onPublish={() => publishNow(item)}
                 onReject={() => setStatus(item, "rejected")}
+                onDelete={() => deleteItem(item)}
               />
             );
           })

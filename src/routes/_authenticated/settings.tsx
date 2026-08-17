@@ -132,13 +132,39 @@ function CompactInput({
   className?: string;
   hint?: string;
 }) {
+  const isNumber = type === "number";
+  // Local draft for numeric fields so the operator can clear the value and
+  // type a new number. The parent coerces `Number("")` to a fallback, which
+  // otherwise snaps the field back to its old/default number the moment it is
+  // emptied — the "deleted number comes back" bug.
+  const [draft, setDraft] = useState<string>(() => String(value ?? ""));
+  const [focused, setFocused] = useState(false);
+  useEffect(() => {
+    if (!focused) setDraft(String(value ?? ""));
+  }, [value, focused]);
+
   return (
     <div className={`flex flex-col gap-1 ${className}`}>
       <Label className="text-[11px] text-muted-foreground font-medium">{label}</Label>
       <Input
         type={type}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
+        value={isNumber ? draft : value}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (isNumber) {
+            setDraft(v);
+            if (v !== "") onChange(v);
+          } else {
+            onChange(v);
+          }
+        }}
+        onFocus={() => setFocused(true)}
+        onBlur={() => {
+          setFocused(false);
+          if (isNumber && (draft.trim() === "" || Number.isNaN(Number(draft)))) {
+            setDraft(String(value ?? ""));
+          }
+        }}
         placeholder={placeholder}
         min={min}
         max={max}
