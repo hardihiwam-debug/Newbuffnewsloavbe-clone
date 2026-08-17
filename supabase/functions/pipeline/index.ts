@@ -87,6 +87,13 @@ const TELEGRAM_POSTS_PER_CHANNEL = 40;
 // fetch well below the full-ingest width to avoid re-reading 40 old posts
 // that are already in the raw_articles dedup window every cycle.
 const TELEGRAM_FAST_LANE_POSTS = 10;
+// Telegram snapshot egress guard: t.me/s serves anonymous fetchers a frozen
+// SSR snapshot (verified: byte-identical for 25+ min; no ETag/Last-Modified,
+// cache-control: no-store). Re-downloading a channel whose post list hasn't
+// changed is pure egress waste. After an unchanged snapshot, back the channel
+// off this many minutes before fetching it again; the moment the snapshot
+// advances (fingerprint changes) the next poll resumes on the 5-minute base.
+const TELEGRAM_SNAPSHOT_BACKOFF_MINUTES = 30;
 
 function geminiKeys(): Array<{ index: number; key: string }> {
   const out: Array<{ index: number; key: string }> = [];
@@ -174,11 +181,12 @@ function isValidStoryImage(url: string | null | undefined): boolean {
   if (!url) return false;
   const u = url.trim();
   if (!/^https?:\/\//i.test(u)) return false;
-  // Google proxy/placeholder hosts (lh3.googleusercontent.com, gstatic, ggpht)
-  // serve 300px thumbnails or logos — never the actual story image.
+  // Google News RSS ships story images via googleusercontent / gstatic CDN
+  // hosts. They are real article thumbnails (not logos) — accept them; the
+  // bad-token list below still rejects actual logo/avatar/placeholder URLs.
   try {
     const host = new URL(u).hostname.toLowerCase();
-    if (/googleusercontent\.com$|gstatic\.com$|ggpht\.com$|google\.com$/.test(host)) return false;
+    if (host === "google.com" || host.endsWith(".google.com")) return false;
   } catch {
     return false;
   }
@@ -239,14 +247,14 @@ const SCRAPE_HEADERS = {
   "accept-language": "en-US,en;q=0.9",
 };
 
-async function fetchArticleOgImage(url: string): Promise<string | null> {
+async function fetchArticleMeta(url: string): Promise<{ imageUrl: string | null; publishedTime: string | null }> {
   // Google News redirect URLs only resolve (via JS) to a reader page whose
   // og:image is Google's own 300px placeholder — never the story image. Skip.
   try {
     const host = new URL(url).hostname.toLowerCase();
-    if (host === "news.google.com") return null;
+    if (host === "news.google.com") return { imageUrl: null, publishedTime: null };
   } catch {
-    return null;
+    return { imageUrl: null, publishedTime: null };
   }
   try {
     const res = await fetch(url, {
@@ -254,16 +262,44 @@ async function fetchArticleOgImage(url: string): Promise<string | null> {
       redirect: "follow",
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { imageUrl: null, publishedTime: null };
     const ct = res.headers.get("content-type") ?? "";
-    if (!/text\/html|application\/xhtml/i.test(ct)) return null;
+    if (!/text\/html|application\/xhtml/i.test(ct)) return { imageUrl: null, publishedTime: null };
     const html = await res.text();
     const head =
       html.slice(0, 200_000).match(/<head[^>]*>[\s\S]*?<\/head>/i)?.[0] ?? html.slice(0, 200_000);
-    return extractOgImageFromHtml(head, res.url || url);
+    return {
+      imageUrl: extractOgImageFromHtml(head, res.url || url),
+      publishedTime: extractArticlePublishedTime(head + "\n" + html.slice(0, 200_000)),
+    };
   } catch {
-    return null;
+    return { imageUrl: null, publishedTime: null };
   }
+}
+
+// Pull the article's REAL publish date out of the page: OpenGraph/meta tags,
+// JSON-LD datePublished, or the <time> element. Feeds often re-stamp old
+// content with crawl timestamps (aggregators, gov PR sites), so this is the
+// only trustworthy age signal before a breaking/war item is sent.
+function extractArticlePublishedTime(html: string): string | null {
+  const tagRe = /<meta[^>]+(?:property|name)=["'](?:article:published_time|og:article:published_time|date|pubdate|publishdate|article_date_original)["'][^>]*content=["']([^"']+)["']/i;
+  const revRe = /<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["'](?:article:published_time|og:article:published_time|date|pubdate|publishdate|article_date_original)["']/i;
+  const m = html.match(tagRe) ?? html.match(revRe);
+  if (m?.[1]) {
+    const ts = Date.parse(m[1]);
+    if (!Number.isNaN(ts)) return new Date(ts).toISOString();
+  }
+  const j = html.match(/"datePublished"\s*:\s*"([^"]+)"/i);
+  if (j?.[1]) {
+    const ts = Date.parse(j[1]);
+    if (!Number.isNaN(ts)) return new Date(ts).toISOString();
+  }
+  const t = html.match(/<time[^>]+datetime=["']([^"']+)["']/i);
+  if (t?.[1]) {
+    const ts = Date.parse(t[1]);
+    if (!Number.isNaN(ts)) return new Date(ts).toISOString();
+  }
+  return null;
 }
 
 // ── Fetchers ────────────────────────────────────────────────────────────────
@@ -867,6 +903,20 @@ function decodeAllEntities(input: string): string {
   }
   return out;
 }
+// Headlines and summaries must never carry links — source content (RSS
+// descriptions, Telegram post text) frequently embeds URLs, and the channel
+// is text-only by design. Strips http(s)/www URLs and bare t.me links.
+const STRIP_LINK_RE = /(?:https?:\/\/|www\.)[^\s<>"')\]}]+/gi;
+const STRIP_TME_RE = /\bt\.me\/[^\s<>"')\]}]+/gi;
+function stripLinks(text: string): string {
+  if (!text) return text;
+  return text
+    .replace(STRIP_LINK_RE, " ")
+    .replace(STRIP_TME_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function cleanEditorialText(value: string): string {
   return decodeAllEntities(
     decodeAllEntities(value)
@@ -1748,6 +1798,24 @@ async function patchSourceHealth(id: string, lastError: string | null, consecuti
   await rest("sources", { method: "PATCH", query: `id=eq.${enc(id)}`, body: patch, prefer: "return=minimal" }).catch(() => {});
 }
 
+// Persist a channel's Telegram snapshot fingerprint + next-fetch backoff into
+// its sources.config row (best-effort; a failed write just re-fetches sooner).
+async function patchSourceSnapshot(id: string, fp: string, nextFetchAt: number): Promise<void> {
+  if (!id) return;
+  try {
+    const rows = await rest<Array<{ config: unknown }>>("sources", { query: `id=eq.${enc(id)}&select=config&limit=1` });
+    const cfg = (rows?.[0]?.config as Record<string, unknown> | null) ?? {};
+    await rest("sources", {
+      method: "PATCH",
+      query: `id=eq.${enc(id)}`,
+      body: { config: { ...cfg, snapshot_fp: fp, next_fetch_at: nextFetchAt } },
+      prefer: "return=minimal",
+    });
+  } catch {
+    /* snapshot state is best-effort */
+  }
+}
+
 async function bumpSourceFailure(
   id: string,
   msg: string,
@@ -1900,11 +1968,13 @@ async function pruneQueueAndRetain(): Promise<void> {
 async function fetchTelegramArticles(
   channelRows: Array<Record<string, unknown>>,
   options: { botApiVideoFetch?: "off" | "bot_api"; stagingChatId?: number | null; autoPause?: { enabled: boolean; threshold: number } | null; deadline?: number; limit?: number } = {},
-): Promise<{ articles: Article[]; errors: string[]; botApiResolved: number }> {
+): Promise<{ articles: Article[]; errors: string[]; botApiResolved: number; snapshotsSkipped: number }> {
   const articles: Article[] = [];
   const errors: string[] = [];
   let botApiResolved = 0;
+  let snapshotsSkipped = 0;
   const boostByChannel = new Map<string, number>();
+  const snapshotByChannel = new Map<string, { fp: string; nextFetchAt: number }>();
   const channels: Array<{ handle: string; rowId: string; wasFailing: boolean }> = [];
   for (const r of channelRows) {
     const cfg = (r.config as Record<string, unknown> | null) ?? {};
@@ -1912,6 +1982,9 @@ async function fetchTelegramArticles(
     if (!handle) continue;
     const boost = Number(cfg.boost ?? 0) || 0;
     if (boost) boostByChannel.set(handle.toLowerCase(), boost);
+    const fp = String(cfg.snapshot_fp ?? "");
+    const nextFetchAt = Number(cfg.next_fetch_at ?? 0) || 0;
+    if (fp) snapshotByChannel.set(handle.toLowerCase(), { fp, nextFetchAt });
     channels.push({ handle, rowId: String(r.id ?? ""), wasFailing: Number(r.consecutive_failures ?? 0) > 0 });
   }
   const autoPause = options.autoPause ?? null;
@@ -1927,9 +2000,27 @@ async function fetchTelegramArticles(
     const tgWorker = async () => {
       while (tgCursor < channels.length) {
         const src = channels[tgCursor++]!;
+        // Egress guard: t.me/s serves a frozen snapshot; if this channel's
+        // fingerprint is unchanged and we're inside its backoff window, skip
+        // the download entirely.
+        const snap = snapshotByChannel.get(src.handle.toLowerCase());
+        if (snap && snap.nextFetchAt && Date.now() < snap.nextFetchAt) {
+          snapshotsSkipped += 1;
+          continue;
+        }
         try {
-          posts.push(...(await fetchTelegramChannel(src.handle, perChannelLimit)));
+          const fetched = await fetchTelegramChannel(src.handle, perChannelLimit);
+          posts.push(...fetched);
           await patchSourceHealth(src.rowId, null, 0);
+          // Fingerprint = newest post id + window size. Unchanged -> push the
+          // next fetch out by the backoff window; changed -> resume the
+          // 5-minute base cadence so fresh posts flow immediately.
+          const newestId = fetched.length ? Number((fetched[0]?.url ?? "").split("/").pop()) || 0 : 0;
+          const fp = newestId ? `${newestId}:${fetched.length}` : "";
+          if (fp) {
+            const unchanged = fp === snap?.fp;
+            await patchSourceSnapshot(src.rowId, fp, Date.now() + (unchanged ? TELEGRAM_SNAPSHOT_BACKOFF_MINUTES : 5) * 60_000);
+          }
           if (src.wasFailing) {
             await logActivity("source", "success", `@${src.handle} recovered — Telegram fetch OK again`);
           }
@@ -1965,7 +2056,12 @@ async function fetchTelegramArticles(
     for (const post of posts) {
       if (post.publishedAt && Date.now() - Date.parse(post.publishedAt) > 6 * 3_600_000) continue;
       const text = cleanEditorialText(post.text);
-      if (!isEnglishText(text).ok) continue;
+      // Instant channels (per-source speed = "Instant", boost >= 2) may post
+      // in any language (e.g. Arabic). Drop the English-only gate for them —
+      // the Kurdish translation at publish handles the text. Normal/Fast
+      // channels keep the English requirement.
+      const chBoost = boostByChannel.get(post.channel.toLowerCase()) ?? 0;
+      if (chBoost < 2 && !isEnglishText(text).ok) continue;
       const article: Article = {
         provider: `Telegram/${post.channel}`,
         sourceName: `@${post.channel}`,
@@ -2037,7 +2133,7 @@ async function fetchTelegramArticles(
   } catch (err) {
     errors.push(`telegram signals: ${err instanceof Error ? err.message : String(err)}`);
   }
-  return { articles, errors, botApiResolved };
+  return { articles, errors, botApiResolved, snapshotsSkipped };
 }
 
 async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all", opts: { deadline?: number } = {}): Promise<Record<string, unknown>> {
@@ -2167,8 +2263,13 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (!sourceBanGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!junkGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!respectGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
-    if (!relevanceGate(article.title, article.description).ok) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
-    if (!isEnglishText(`${article.title} ${article.description ?? ""}`).ok) { stats.junk = Number(stats.junk) + 1; continue; }
+    // Instant channels (boost >= 2) may post in Arabic etc. The relevance
+    // (beat) gate and the English gate are English-pattern gates, so they
+    // only apply to normal/fast sources; instant posts flow straight through
+    // to the queue + Kurdish translation.
+    const instantSrc = Number(article.boost ?? 0) >= 2;
+    if (!instantSrc && !relevanceGate(article.title, article.description).ok) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
+    if (!instantSrc && !isEnglishText(`${article.title} ${article.description ?? ""}`).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     const textForFreshness = `${article.title} ${article.description ?? ""}`;
     const maxAge = /\b(attack|strike|missile|drone|war|explosion|airstrike|houthi|hezbollah|irgc|centcom|hormuz|nuclear)\b/i.test(textForFreshness) ? 14
       : /\b(analysis|explainer|commentary|opinion)\b/i.test(textForFreshness) ? 48 : 22;
@@ -2293,8 +2394,16 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (droppedIdx.has(i)) continue;
     const { article, key } = fresh[i]!;
     const articleText = `${article.title} ${article.description ?? ""}`;
-    const category = keywordCategory(articleText);
-    if (!category) { stats.offTopic = Number(stats.offTopic) + 1; continue; }
+    const articleBoost = Number(article.boost ?? 0) || 0;
+    const instantSrc = articleBoost >= 2;
+    let category = keywordCategory(articleText);
+    // Arabic/foreign instant posts won't match the English category keywords;
+    // default them to "war" (operator-chosen conflict-news channels) so they
+    // are scored/published instead of dropped as off-topic.
+    if (!category) {
+      if (instantSrc) category = "war";
+      else { stats.offTopic = Number(stats.offTopic) + 1; continue; }
+    }
     let headline = article.title;
     let summary = article.description ?? "";
     let facts: Record<string, unknown> | null = null;
@@ -2316,9 +2425,11 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
         }
       }
     }
-    headline = cleanEditorialText(normalizeEditorial(headline));
-    summary = cleanEditorialText(normalizeEditorial(summary));
-    if (hasIncompleteSummary(summary)) { stats.junk = Number(stats.junk) + 1; continue; }
+    headline = stripLinks(cleanEditorialText(normalizeEditorial(headline)));
+    summary = stripLinks(cleanEditorialText(normalizeEditorial(summary)));
+    // Incomplete-summary guard only applies to English content; long Arabic
+    // posts often end without ASCII sentence punctuation and would be junked.
+    if (!instantSrc && hasIncompleteSummary(summary)) { stats.junk = Number(stats.junk) + 1; continue; }
 
     const boost = Number(article.boost ?? 0) || 0;
     // Per-source speed setting (the Normal/Fast/Instant dropdown on each
@@ -2329,7 +2440,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     // lane (no scoring order, no window gap) and skip the queue's
     // publish-time beat gate — so run the beat gate here: only on-beat posts
     // may go out, off-beat ones are dropped and never queued.
-    if (instant) {
+    if (instant && isEnglishText(articleText).ok) {
       const beat = relevanceGate(articleText, "");
       if (!beat.ok) {
         stats.instantOffBeat = Number(stats.instantOffBeat ?? 0) + 1;
@@ -2576,6 +2687,12 @@ async function runPublish(
   const timezone = String(settings.timezone ?? "Asia/Baghdad");
   const simThreshold = Number(settings.event_similarity_threshold ?? 0.52);
 
+  // Egress guard for og:image hunting: full article-page downloads are the
+  // biggest non-Telegram egress consumer, so only spend them on stories that
+  // actually lack an image, cleared the score bar, and fit the per-cycle cap.
+  const OG_FETCH_CAP_PER_CYCLE = 5;
+  const OG_FETCH_MIN_SCORE = 30;
+  let ogFetchesThisCycle = 0;
   let sentThisCycle = 0;
   let updatesPublishedThisCycle = 0;
   // Scan past duplicates/rejects instead of stopping at the first candidate:
@@ -2683,7 +2800,33 @@ async function runPublish(
           }
         }
       } else if (url) {
-        resolvedImageUrl = (await fetchArticleOgImage(url)) ?? resolvedImageUrl;
+        // Egress guard: one article-page fetch per candidate, shared by the
+        // og:image hunt and the real-article-date check, capped per cycle.
+        // The date check applies to breaking/war candidates so feed
+        // re-stamps of old stories (ddnews-style aggregators) are dropped
+        // before anything goes out.
+        const breakingCats = (settings.breaking_categories as string[] | undefined) ?? ["war", "iran", "proxies", "usa"];
+        const needsDateCheck = Boolean(item.breaking) || breakingCats.includes(String(item.category ?? ""));
+        const wantsImage = !resolvedImageUrl;
+        if (
+          ogFetchesThisCycle < OG_FETCH_CAP_PER_CYCLE &&
+          (needsDateCheck || (wantsImage && queueEffectiveScore(item) >= OG_FETCH_MIN_SCORE))
+        ) {
+          ogFetchesThisCycle += 1;
+          const meta = await fetchArticleMeta(url);
+          if (meta.imageUrl) resolvedImageUrl = meta.imageUrl;
+          if (needsDateCheck && meta.publishedTime) {
+            const realAgeHours = Math.max(0, (Date.now() - Date.parse(meta.publishedTime)) / 3_600_000);
+            const textForAge = headline + " " + summary;
+            const maxAge = /\b(attack|strike|missile|drone|war|explosion|airstrike|houthi|hezbollah|irgc|centcom|hormuz|nuclear)\b/i.test(textForAge) ? 14
+              : /\b(analysis|explainer|commentary|opinion)\b/i.test(textForAge) ? 48 : 22;
+            if (realAgeHours > maxAge) {
+              await deleteQueueRow(id);
+              await logActivity("publish", "info", "Real article date " + Math.round(realAgeHours) + "h old (> " + maxAge + "h) — dropped: " + headline.slice(0, 110));
+              continue;
+            }
+          }
+        }
       }
     }
 
@@ -2756,8 +2899,8 @@ async function runPublish(
     // translating the body overwrites finalSummary and would wipe it.
     // buildUpdateHeadline is idempotent, so the non-ckb path stays safe.
     if (isUpdate && isTelegramItem) finalSummary = buildUpdateHeadline(finalSummary, updatePrefix);
-    finalHeadline = normalizeEditorial(finalHeadline);
-    finalSummary = normalizeEditorial(finalSummary);
+    finalHeadline = stripLinks(normalizeEditorial(finalHeadline));
+    finalSummary = stripLinks(normalizeEditorial(finalSummary));
     if (isUpdate && !isTelegramItem) finalHeadline = buildUpdateHeadline(finalHeadline, updatePrefix);
 
     const post: Post & { mediaKind: "photo" | "video_thumb" | null } = {
