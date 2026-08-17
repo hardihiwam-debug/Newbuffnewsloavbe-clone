@@ -683,10 +683,11 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
       (a.priority ?? 0) - (b.priority ?? 0),
     );
 
-  const hardcodedGemini: { index: number; first8: string; last4: string }[] = [];
+  const hardcodedGemini: { index: number; first8: string; last4: string; email: string }[] = [];
   for (let i = 1; i <= 6; i++) {
     const key = Deno.env.get(`GEMINI_API_KEY_${i}`)?.trim() ?? "";
-    if (key) hardcodedGemini.push({ index: i, first8: key.slice(0, 8), last4: key.slice(-4) });
+    const email = Deno.env.get(`GEMINI_API_EMAIL_${i}`)?.trim() ?? "";
+    if (key) hardcodedGemini.push({ index: i, first8: key.slice(0, 8), last4: key.slice(-4), email });
   }
 
   // Per-key × per-model usage (from gemini_key_usage + recent gemini_call_log).
@@ -698,6 +699,7 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
     keyIndex: number;
     first8: string;
     last4: string;
+    email: string;
     configured: boolean;
     today: ReturnType<typeof empty>;
     total: ReturnType<typeof empty>;
@@ -706,6 +708,7 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
   }> = [];
   for (let i = 1; i <= 6; i++) {
     const envKey = Deno.env.get(`GEMINI_API_KEY_${i}`)?.trim() ?? "";
+    const email = Deno.env.get(`GEMINI_API_EMAIL_${i}`)?.trim() ?? "";
     const configured = Boolean(envKey);
     const today = empty();
     const models: Record<string, ReturnType<typeof empty>> = {};
@@ -750,6 +753,7 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
       keyIndex: i,
       first8: envKey.slice(0, 8),
       last4: envKey.slice(-4),
+      email,
       configured,
       today,
       total,
@@ -1057,14 +1061,25 @@ async function testTranslationKey(p: { id: string }): Promise<unknown> {
 
 // ── Action: testGeminiKeys ──────────────────────────────────────────────────
 // Live health-check every GEMINI_API_KEY_1..6 across each direct-REST model.
-// Costs real Gemini quota: 18 calls per click (6 keys × 3 models). The promise
-// of the admin UI is to show exactly which (key, model) pairs are still
+// Costs real Gemini quota: one tiny call per configured key × fallback model.
+// The promise of the admin UI is to show exactly which (key, model) pairs are
 // usable. The dashboard already shows a confirm-style button.
 async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
+  // Keep the manual live check below 5 RPM too. With five keys and four
+  // models this can take several minutes, but it avoids burning quota bursts.
+  const GEMINI_TEST_INTERVAL_MS = 13_000;
+  let nextGeminiTestAt = 0;
+  const waitForGeminiTestSlot = async () => {
+    const wait = nextGeminiTestAt - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    nextGeminiTestAt = Date.now() + GEMINI_TEST_INTERVAL_MS;
+  };
+
   const GEMINI_DIRECT_MODELS = [
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-002",
-    "gemini-2.0-flash-exp",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
   ];
   const keys: { index: number; key: string }[] = [];
   for (let i = 1; i <= 6; i++) {
@@ -1076,6 +1091,7 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
   const results: Array<{
     keyIndex: number;
     masked: string;
+    email: string;
     models: Array<{ model: string; status: "ok" | "rate_limited" | "auth_error" | "error"; code: number; detail: string }>;
   }> = [];
 
@@ -1086,6 +1102,7 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
       let code = 0;
       let detail = "";
       try {
+        await waitForGeminiTestSlot();
         const res = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
           {
@@ -1118,11 +1135,11 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
         detail = err instanceof Error ? err.message : String(err);
       }
       models.push({ model, status, code, detail: detail.slice(0, 200) });
-      await new Promise((r) => setTimeout(r, 350));
     }
     results.push({
       keyIndex: index,
       masked: `${key.slice(0, 6)}…${key.slice(-4)}`,
+      email: Deno.env.get(`GEMINI_API_EMAIL_${index}`)?.trim() ?? "",
       models,
     });
   }

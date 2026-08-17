@@ -1084,7 +1084,12 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
 
 // ── AI: Gemini direct translation (Sorani) ─────────────────────────────────
 const GEMINI_DIRECT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_DIRECT_MODELS = ["gemini-1.5-flash-latest"];
+const GEMINI_DIRECT_MODELS = [
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+];
 const SORANI_SYSTEM_PROMPT =
   "Translate the following message into Kurdish Sorani (Central Kurdish, in the Sorani script). Output ONLY the translation — no commentary, no \"Translation:\" prefix, no quotes around the text. Preserve emojis, links, line breaks, and any formatting exactly. Preserve all numbers, dates, times, percentages and quoted statements exactly as given — never change, round or reword a figure.";
 const SORANI_SYSTEM_PROMPT_STRICT =
@@ -1154,20 +1159,43 @@ async function logGeminiCall(c) {
   } catch { /* best-effort only */ }
 }
 
-const GEMINI_MIN_INTERVAL_MS = 6500;
+// Keep the whole Gemini translator below 5 requests/minute. Google applies
+// quotas per Cloud project (not per API key), so key rotation must not create
+// bursts across keys. 13 seconds between starts = about 4.6 RPM total.
+const GEMINI_MIN_INTERVAL_MS = 13_000;
+const GEMINI_RATE_LIMIT_COOLDOWN_MS = 65_000;
 const keyNextAt = new Map<number, number>();
+let geminiNextGlobalAt = 0;
+const modelCooldownUntil = new Map<string, number>();
+
+async function waitForGeminiRateSlot(keyIndex: number): Promise<void> {
+  const now = Date.now();
+  const wait = Math.max((keyNextAt.get(keyIndex) ?? 0) - now, geminiNextGlobalAt - now);
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  const nextAt = Date.now() + GEMINI_MIN_INTERVAL_MS;
+  keyNextAt.set(keyIndex, nextAt);
+  geminiNextGlobalAt = nextAt;
+}
+
+function retryAfterMs(res: Response): number | null {
+  const raw = res.headers.get("retry-after");
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(raw);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : null;
+}
 
 async function geminiTranslateOnce(text: string, glossary: string | undefined): Promise<{ text: string; model: string; keyIndex: number } | null> {
   const keys = geminiKeys();
   if (keys.length === 0) return null;
   const deadKeys = new Set<number>();
   for (const model of GEMINI_DIRECT_MODELS) {
+    const modelWait = (modelCooldownUntil.get(model) ?? 0) - Date.now();
+    if (modelWait > 0) continue;
     for (const { index, key } of keys) {
       if (deadKeys.has(index)) continue;
-      const now = Date.now();
-      const wait = (keyNextAt.get(index) ?? 0) - now;
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-      keyNextAt.set(index, Date.now() + GEMINI_MIN_INTERVAL_MS);
+      await waitForGeminiRateSlot(index);
 
       const glossaryBlock = glossary?.trim() ? `TRANSLATION GLOSSARY — use these exact translations for key terms:\n${glossary.trim()}\n\n` : "";
       const prompt = `${glossaryBlock}${SORANI_SYSTEM_PROMPT}\n\nMessage:\n${text.slice(0, 2500)}`;
@@ -1193,6 +1221,9 @@ async function geminiTranslateOnce(text: string, glossary: string | undefined): 
       if (!res.ok || data?.error) {
         const code = data?.error?.code ?? res.status;
         await logGeminiCall({ keyIndex: index, model, ok: false, code, message: data?.error?.message ?? `HTTP ${res.status}` });
+        if (code === 429) {
+          modelCooldownUntil.set(model, Date.now() + (retryAfterMs(res) ?? GEMINI_RATE_LIMIT_COOLDOWN_MS));
+        }
         if (code === 400 || code === 401 || code === 403) deadKeys.add(index);
         continue;
       }
