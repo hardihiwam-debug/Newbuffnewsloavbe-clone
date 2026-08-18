@@ -1,5 +1,5 @@
 import { useRef, useState, type ReactNode, type TouchEvent } from "react";
-import { Pencil, SendHorizonal, Trash2, X } from "lucide-react";
+import { Pencil, SendHorizonal, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -45,7 +45,7 @@ export function clockTime(iso?: string | null): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-export const CATEGORY_COLORS: Record<string, string> = {
+const CATEGORY_COLORS: Record<string, string> = {
   war: "text-destructive border-destructive/40 bg-destructive/10",
   iran: "text-info border-info/40 bg-info/10",
   proxies: "text-[color:oklch(0.68_0.14_305)] border-[color:oklch(0.68_0.14_305)]/40 bg-[color:oklch(0.68_0.14_305)]/10",
@@ -406,6 +406,3 @@ export function EmptyState({ icon, text }: { icon?: ReactNode; text: string }) {
   );
 }
 
-export function CloseIcon() {
-  return <X className="h-3.5 w-3.5" />;
-}

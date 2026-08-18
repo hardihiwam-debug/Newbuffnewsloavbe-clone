@@ -9,27 +9,38 @@
 
 import {
   CATEGORY_PRIORITY,
+  GEMINI_DIRECT_MODELS,
+  GREETING_LINE_RE,
+  MINIMAX_MODEL,
   SEVERITY_POINTS,
   STOPWORDS,
   buildUpdateHeadline,
   checkDigitPreservation,
   checkNumberConsistency,
   chooseDeliveryMode,
+  classifyModel,
+  cleanGeminiTranslation,
   crossLanguageSimilarity,
   computeQuotaPatch,
+  dedupeChats,
   eventSimilarity,
   extractFirstJsonObject,
   fitCaption,
   formatMessage,
+  allCategoriesOf,
+  botMatchesCategories,
+  editorialJunkGate,
   isBreaking,
   isLeaderStatement,
   keywordCategory,
+  kurdHostileGate,
   matchEventCluster,
   normalizeTitle,
   relevanceGate,
   sameEvent,
   severityLevel,
   validateSorani,
+  type ChatRow,
   type Post,
   type PostFormat,
 } from "./_shared.ts";
@@ -48,6 +59,11 @@ const MINIMAX_API_KEY = Deno.env.get("MINIMAX_API_KEY") ?? "";
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY") ?? "";
 const CLOUDFLARE_API_TOKEN = Deno.env.get("CLOUDFLARE_API_TOKEN") ?? "";
 const CLOUDFLARE_ACCOUNT_ID = Deno.env.get("CLOUDFLARE_ACCOUNT_ID") ?? "";
+// Cloudflare egress offload (deployed via scripts/deploy_cloudflare_worker.mjs).
+// When both are set, heavy outbound fetches (t.me HTML, article pages, media
+// bytes) go through the Worker so bytes never cross Supabase's egress budget.
+const CLOUDFLARE_WORKER_URL = (Deno.env.get("CLOUDFLARE_WORKER_URL") ?? "").replace(/\/+$/, "");
+const CLOUDFLARE_RELAY_KEY = Deno.env.get("CLOUDFLARE_RELAY_KEY") ?? "";
 
 // ── Pipeline tuning (operator decisions) ────────────────────────────────────
 // Posts sent per MANUAL publish cycle (the dashboard "publish now" path).
@@ -253,6 +269,54 @@ const SCRAPE_HEADERS = {
   "accept-language": "en-US,en;q=0.9",
 };
 
+// ── Cloudflare egress offload helpers ──────────────────────────────────────
+// Every call falls back to a direct fetch when the worker is unset or fails,
+// so quality and availability never depend on Cloudflare being up.
+type RelayResult = { html: string } | null;
+
+async function relayViaWorker(path: string, params: Record<string, string>): Promise<RelayResult> {
+  if (!CLOUDFLARE_WORKER_URL || !CLOUDFLARE_RELAY_KEY) return null;
+  try {
+    const qs = new URLSearchParams(params).toString();
+    const res = await fetch(`${CLOUDFLARE_WORKER_URL}${path}?${qs}`, {
+      headers: { "x-relay-key": CLOUDFLARE_RELAY_KEY },
+      redirect: "follow",
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) return null;
+    if (!relayLogShown) {
+      relayLogShown = true;
+      await logActivity("egress", "success", "Cloudflare egress offload active — Telegram/article/media fetches now relay via Cloudflare").catch(() => {});
+    }
+    return { html: await res.text() };
+  } catch {
+    return null;
+  }
+}
+
+// One-time activity-log marker so the dashboard shows (and the operator can
+// confirm) that the Cloudflare egress offload is live. Cleared per process,
+// so it appears at most once per cold start.
+let relayLogShown = false;
+
+// Cache media bytes once into R2 via the Worker and return the public URL,
+// so Telegram pulls the bytes from Cloudflare instead of this function.
+async function cachedMediaUrl(url: string, kind: "image" | "video"): Promise<string | null> {
+  if (!CLOUDFLARE_WORKER_URL || !CLOUDFLARE_RELAY_KEY) return null;
+  try {
+    const qs = new URLSearchParams({ url, kind }).toString();
+    const res = await fetch(`${CLOUDFLARE_WORKER_URL}/tg/media?${qs}`, {
+      headers: { "x-relay-key": CLOUDFLARE_RELAY_KEY },
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { ok?: boolean; url?: string };
+    return data.ok && data.url ? data.url : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchArticleMeta(url: string): Promise<{ imageUrl: string | null; publishedTime: string | null }> {
   // Google News redirect URLs only resolve (via JS) to a reader page whose
   // og:image is Google's own 300px placeholder — never the story image. Skip.
@@ -263,19 +327,28 @@ async function fetchArticleMeta(url: string): Promise<{ imageUrl: string | null;
     return { imageUrl: null, publishedTime: null };
   }
   try {
-    const res = await fetch(url, {
-      headers: SCRAPE_HEADERS,
-      redirect: "follow",
-      signal: AbortSignal.timeout(8000),
-    });
+    const relayed = await relayViaWorker("/tg/article", { url });
+    let res: Response;
+    if (relayed) {
+      res = new Response(relayed.html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    } else {
+      res = await fetch(url, {
+        headers: SCRAPE_HEADERS,
+        redirect: "follow",
+        signal: AbortSignal.timeout(8000),
+      });
+    }
     if (!res.ok) return { imageUrl: null, publishedTime: null };
     const ct = res.headers.get("content-type") ?? "";
     if (!/text\/html|application\/xhtml/i.test(ct)) return { imageUrl: null, publishedTime: null };
     const html = await res.text();
     const head =
       html.slice(0, 200_000).match(/<head[^>]*>[\s\S]*?<\/head>/i)?.[0] ?? html.slice(0, 200_000);
+    // The Worker relays after following redirects, so the original URL is the
+    // correct base for resolving relative og:image paths on the relay path; the
+    // direct-fallback path keeps the final post-redirect URL (res.url) instead.
     return {
-      imageUrl: extractOgImageFromHtml(head, res.url || url),
+      imageUrl: extractOgImageFromHtml(head, relayed ? url : res.url || url),
       publishedTime: extractArticlePublishedTime(head + "\n" + html.slice(0, 200_000)),
     };
   } catch {
@@ -526,11 +599,17 @@ function extractArticleTextFromHtml(html: string): string {
 async function fetchArticleFullText(url: string): Promise<string | null> {
   if (!/^https?:\/\//i.test(url)) return null;
   try {
-    const res = await fetch(url, {
-      headers: SCRAPE_HEADERS,
-      redirect: "follow",
-      signal: AbortSignal.timeout(7000),
-    });
+    const relayed = await relayViaWorker("/tg/article", { url });
+    let res: Response;
+    if (relayed) {
+      res = new Response(relayed.html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    } else {
+      res = await fetch(url, {
+        headers: SCRAPE_HEADERS,
+        redirect: "follow",
+        signal: AbortSignal.timeout(7000),
+      });
+    }
     if (!res.ok) return null;
     const ct = res.headers.get("content-type") ?? "";
     if (!/text\/html|application\/xhtml/i.test(ct)) return null;
@@ -689,14 +768,22 @@ function extractSinglePostMedia(html: string, channel: string, postId: string): 
 async function fetchTelegramPostImage(postUrl: string): Promise<{ url: string; kind: "photo" | "video_thumb" } | null> {
   const parsed = parseTelegramPostUrl(postUrl);
   if (!parsed) return null;
+  const postPage = `https://t.me/s/${enc(parsed.channel)}/${parsed.postId}`;
   try {
-    const res = await fetch(`https://t.me/s/${enc(parsed.channel)}/${parsed.postId}`, {
-      headers: TELEGRAM_HEADERS,
-      redirect: "follow",
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) return null;
-    return extractSinglePostMedia(await res.text(), parsed.channel, parsed.postId);
+    const relayed = await relayViaWorker("/tg/post", { url: postPage });
+    let html: string;
+    if (relayed) {
+      html = relayed.html;
+    } else {
+      const res = await fetch(postPage, {
+        headers: TELEGRAM_HEADERS,
+        redirect: "follow",
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) return null;
+      html = await res.text();
+    }
+    return extractSinglePostMedia(html, parsed.channel, parsed.postId);
   } catch {
     return null;
   }
@@ -705,14 +792,21 @@ async function fetchTelegramPostImage(postUrl: string): Promise<{ url: string; k
 async function fetchTelegramPostVideo(postUrl: string): Promise<string | null> {
   const parsed = parseTelegramPostUrl(postUrl);
   if (!parsed) return null;
+  const postPage = `https://t.me/s/${enc(parsed.channel)}/${parsed.postId}`;
   try {
-    const res = await fetch(`https://t.me/s/${enc(parsed.channel)}/${parsed.postId}`, {
-      headers: TELEGRAM_HEADERS,
-      redirect: "follow",
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
+    const relayed = await relayViaWorker("/tg/post", { url: postPage });
+    let html: string;
+    if (relayed) {
+      html = relayed.html;
+    } else {
+      const res = await fetch(postPage, {
+        headers: TELEGRAM_HEADERS,
+        redirect: "follow",
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) return null;
+      html = await res.text();
+    }
     const wanted = `${parsed.channel}/${parsed.postId}`;
     const start = html.indexOf(`data-post="${wanted}"`);
     if (start < 0) return null;
@@ -725,12 +819,18 @@ async function fetchTelegramPostVideo(postUrl: string): Promise<string | null> {
 
 async function fetchTelegramChannel(channel: string, limit = TELEGRAM_POSTS_PER_CHANNEL): Promise<ChannelPost[]> {
   const name = channel.replace(/^@/, "").trim();
-  const res = await fetch(`https://t.me/s/${enc(name)}`, {
-    headers: TELEGRAM_HEADERS,
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) throw new Error(`t.me/s/${name} ${res.status}`);
-  const html = await res.text();
+  const relayed = await relayViaWorker("/tg/channel", { handle: name, limit: String(limit) });
+  let html: string;
+  if (relayed) {
+    html = relayed.html;
+  } else {
+    const res = await fetch(`https://t.me/s/${enc(name)}`, {
+      headers: TELEGRAM_HEADERS,
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`t.me/s/${name} ${res.status}`);
+    html = await res.text();
+  }
   const blocks = html.match(/<div class="tgme_widget_message[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/g) ?? [];
   const posts: ChannelPost[] = [];
   for (const block of blocks.slice(-limit)) {
@@ -987,18 +1087,6 @@ function hasIncompleteSummary(text: string): boolean {
   if (/(?:\.\.\.|…)$/.test(value)) return true;
   return value.length > 120 && !/[.!?""']$/.test(value);
 }
-function leadSentences(text: string, maxChars = 550): string {
-  const value = (text ?? "").replace(/\s+/g, " ").trim();
-  if (value.length <= maxChars) return value;
-  const head = value.slice(0, maxChars);
-  const boundary = Math.max(head.lastIndexOf(". "), head.lastIndexOf("! "), head.lastIndexOf("? "), head.lastIndexOf("\n"));
-  if (boundary > 60) return head.slice(0, boundary + 1).trim();
-  const space = head.lastIndexOf(" ");
-  const cut = space > 60 ? head.slice(0, space).trim() : head.trim();
-  return /[.!?]$/.test(cut) ? cut : `${cut}.`;
-}
-
-
 
 // ── AI: structured fact extraction (phase 2) ────────────────────────────────
 // Replaces the old free-form "rewrite" with a two-step model: the model first
@@ -1121,32 +1209,11 @@ async function groqExtractFacts(items: Array<{ title: string; description: strin
 
 // ── AI: Gemini direct translation (Sorani) ─────────────────────────────────
 const GEMINI_DIRECT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_DIRECT_MODELS = [
-  "gemini-3.7-flash",
-  "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-3.5-flash-lite",
-];
 const SORANI_SYSTEM_PROMPT =
   "Translate the following message into Kurdish Sorani (Central Kurdish, in the Sorani script). Output ONLY the translation — no commentary, no \"Translation:\" prefix, no quotes around the text. Preserve emojis, links, line breaks, and any formatting exactly. Preserve all numbers, dates, times, percentages and quoted statements exactly as given — never change, round or reword a figure.";
 const SORANI_SYSTEM_PROMPT_STRICT =
   "Translate the following message into Kurdish Sorani (Central Kurdish). You MUST output ONLY the translation in the Sorani Arabic script (ئەلفوبێی عەرەبیی سۆرانی). Do NOT answer in English or Latin script — translate every word into Sorani script except widely-recognised abbreviations (CIA, US, UN, NATO, CEO). Do NOT add commentary, explanations, a \"Translation:\" prefix, or quotes. Output ONLY the Sorani translation. Preserve emojis, links, line breaks, and formatting exactly. Preserve all numbers, dates, times and quoted statements exactly as given — never change, round or reword a figure.";
 
-
-function cleanGeminiTranslation(raw: string): string {
-  let text = raw.trim();
-  const lines = text.split(/\r?\n/);
-  while (lines.length > 0) {
-    const head = (lines[0] ?? "").trim();
-    if (!head) break;
-    if (/^(here(\u2019s|'s| is)?|translation[:：]|the (standard |english |kurdish )?translation|in (kurdish|sorani|english)[:：]?|output[:：])/i.test(head) && !/^[\u0600-\u06FF]/.test(head)) {
-      lines.shift();
-    } else break;
-  }
-  text = lines.join("\n").trim();
-  text = text.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/\*([^*]+)\*/g, "$1");
-  return text.replace(/^\s*[-*]\s+/gm, "").trim();
-}
 
 // Best-effort Gemini usage logging so the admin console per-key × per-model
 // cards stay truthful (they read gemini_call_log + gemini_key_usage). Never
@@ -1198,9 +1265,16 @@ async function logGeminiCall(c) {
 
 const GEMINI_MIN_INTERVAL_MS = 13_000;
 const GEMINI_RATE_LIMIT_COOLDOWN_MS = 65_000;
+// Quota-exhaustion fail-fast: N consecutive 429s in one sweep means the whole
+// key pool is drained (free-tier daily quota), so stop retrying Gemini and
+// let MiniMax take the item — retries only burn the ~100s cycle budget.
+const GEMINI_429_FAILFAST_THRESHOLD = 3;
 const keyNextAt = new Map<number, number>();
 let geminiNextGlobalAt = 0;
 const modelCooldownUntil = new Map<string, number>();
+// While set, geminiTranslateOnce returns null immediately (zero cost) so the
+// rest of the cycle goes straight to MiniMax. Re-checked next cycle.
+let geminiPoolExhaustedUntil = 0;
 
 // Keep the whole Gemini translator under 5 requests/minute. Do not allow key
 // rotation to create bursts: 13 seconds between Gemini request starts = about
@@ -1223,11 +1297,14 @@ function retryAfterMs(res: Response): number | null {
   return Number.isFinite(dateMs) ? Math.max(0, dateMs - Date.now()) : null;
 }
 
-async function geminiTranslateOnce(text: string, glossary: string | undefined): Promise<{ text: string; model: string; keyIndex: number } | null> {
+async function geminiTranslateOnce(text: string, glossary: string | undefined, modelOverride?: string): Promise<{ text: string; model: string; keyIndex: number } | null> {
+  if (Date.now() < geminiPoolExhaustedUntil) return null;
   const keys = geminiKeys();
   if (keys.length === 0) return null;
   const deadKeys = new Set<number>();
-  for (const model of GEMINI_DIRECT_MODELS) {
+  let consecutive429 = 0;
+  const models = modelOverride ? [modelOverride] : GEMINI_DIRECT_MODELS;
+  for (const model of models) {
     if (modelCooldownUntil.has(model) && Date.now() < (modelCooldownUntil.get(model) ?? 0)) continue;
     for (const { index, key } of keys) {
       if (deadKeys.has(index)) continue;
@@ -1260,6 +1337,17 @@ async function geminiTranslateOnce(text: string, glossary: string | undefined): 
         if (code === 400 || code === 401 || code === 403) deadKeys.add(index);
         if (code === 429) {
           const ra = retryAfterMs(res);
+          consecutive429 += 1;
+          // Every attempt this sweep is 429 (or a long Retry-After arrived):
+          // the pool is quota-drained, not throttled. Stop here — MiniMax is
+          // the fallback and it can finish inside the cycle budget.
+          if (consecutive429 >= GEMINI_429_FAILFAST_THRESHOLD || (ra && ra > 15_000)) {
+            if (Date.now() >= geminiPoolExhaustedUntil) {
+              await logActivity("translation", "warning", "Gemini pool quota-exhausted (429) — using MiniMax fallback");
+            }
+            geminiPoolExhaustedUntil = Date.now() + Math.min(Math.max(60_000, ra ?? 0), 30 * 60_000);
+            return null;
+          }
           const cooldownUntil = Date.now() + (ra ?? GEMINI_RATE_LIMIT_COOLDOWN_MS);
           modelCooldownUntil.set(model, cooldownUntil);
           if (ra) geminiNextGlobalAt = Math.max(geminiNextGlobalAt, cooldownUntil);
@@ -1281,10 +1369,10 @@ async function geminiTranslateOnce(text: string, glossary: string | undefined): 
   return null;
 }
 
-// MiniMax via the Vercel AI Gateway, used as the fallback behind the
-// Gemini key pool (gemini_first default). MiniMax does not carry the
-// per-key daily/RPM quota cliffs that burn through Gemini keys.
-async function minimaxTranslate(text: string, glossary: string | undefined, strict: boolean): Promise<string | null> {
+// Any model through the Vercel AI Gateway (one gateway token, no per-key
+// daily/RPM quota cliffs). Used for MiniMax and for gateway-hosted Google
+// Gemini models (google/gemini-2.5-flash, google/gemini-2.5-flash-lite, …).
+async function gatewayTranslate(text: string, glossary: string | undefined, model: string, strict: boolean): Promise<string | null> {
   if (!MINIMAX_API_KEY) return null;
   try {
     const glossaryBlock = glossary?.trim() ? `TRANSLATION GLOSSARY — use these exact translations for key terms:\n${glossary.trim()}\n\n` : "";
@@ -1292,7 +1380,7 @@ async function minimaxTranslate(text: string, glossary: string | undefined, stri
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${MINIMAX_API_KEY}` },
       body: JSON.stringify({
-        model: "minimax/minimax-m3",
+        model,
         messages: [
           { role: "system", content: strict ? SORANI_SYSTEM_PROMPT_STRICT : SORANI_SYSTEM_PROMPT },
           { role: "user", content: `${glossaryBlock}${text.slice(0, 1500)}` },
@@ -1304,24 +1392,54 @@ async function minimaxTranslate(text: string, glossary: string | undefined, stri
     });
     if (!res.ok) return null;
     const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    const out = (json.choices?.[0]?.message?.content ?? "").trim();
+    const out = cleanGeminiTranslation((json.choices?.[0]?.message?.content ?? "").trim());
     return validateSorani(out) ? out : null;
   } catch {
     return null;
   }
 }
 
+// MiniMax via the Vercel AI Gateway, used as the fallback behind the
+// Gemini key pool (gemini_first default). MiniMax does not carry the
+// per-key daily/RPM quota cliffs that burn through Gemini keys.
+async function minimaxTranslate(text: string, glossary: string | undefined, strict: boolean): Promise<string | null> {
+  return gatewayTranslate(text, glossary, MINIMAX_MODEL, strict);
+}
+
 async function translateToSorani(
   text: string,
   glossary: string | undefined,
   mode = "gemini_first",
+  modelOrder?: string[],
 ): Promise<{ text: string | null; model: string }> {
-  // Operator-controllable chain order (settings.translation_mode).
+  // Operator-controllable chain order (settings.translation_mode), and the
+  // newer fine-grained order (settings.translation_model_order) which wins:
+  // a top-to-bottom list of model ids — each Gemini model id (run across
+  // every configured key) or the MiniMax gateway id "minimax/minimax-m3".
+  const m = mode || "gemini_first";
+
+  const explicit = Array.isArray(modelOrder)
+    ? [...new Set(modelOrder.map((x) => String(x).trim()).filter((x) => x && classifyModel(x) !== "unknown"))]
+    : [];
+  if (explicit.length > 0) {
+    for (const model of explicit) {
+      const kind = classifyModel(model);
+      if (kind === "gateway") {
+        const gw = (await gatewayTranslate(text, glossary, model, false)) ?? (await gatewayTranslate(text, glossary, model, true));
+        if (gw) return { text: gw, model };
+      } else if (kind === "direct") {
+        const g = await geminiTranslateOnce(text, glossary, model);
+        if (g) return { text: g.text, model: g.model };
+      }
+    }
+    return { text: null, model: "none" };
+  }
+
+  // Legacy translation_mode chain (unchanged when no explicit order is set).
   // "gemini_first" (default) runs the Gemini key pool first — the operator
   // pays for those keys and wants them used; MiniMax is the fallback.
   // "minimax_first" keeps the AI-Gateway call in front; the "*_only" modes
   // skip the other provider.
-  const m = mode || "gemini_first";
   const useMinimax = m !== "gemini_only";
   const useGemini = m !== "minimax_only";
   const minimaxFirst = m === "minimax_first" || m === "minimax_only";
@@ -1337,14 +1455,14 @@ async function translateToSorani(
 
   if (minimaxFirst) {
     const mm = await tryMinimax();
-    if (mm) return { text: mm, model: "minimax/minimax-m3" };
+    if (mm) return { text: mm, model: MINIMAX_MODEL };
     const g = await tryGemini();
     if (g) return { text: g.text, model: g.model };
   } else {
     const g = await tryGemini();
     if (g) return { text: g.text, model: g.model };
     const mm = await tryMinimax();
-    if (mm) return { text: mm, model: "minimax/minimax-m3" };
+    if (mm) return { text: mm, model: MINIMAX_MODEL };
   }
   return { text: null, model: "none" };
 }
@@ -1474,8 +1592,8 @@ async function aiDecideIsDuplicate(
 // ── Telegram send ───────────────────────────────────────────────────────────
 
 
-async function telegramCall(method: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+async function telegramCall(method: string, payload: Record<string, unknown>, token = TELEGRAM_BOT_TOKEN): Promise<Record<string, unknown>> {
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
@@ -1615,22 +1733,22 @@ async function downloadImage(url: string, kind: "image" | "video"): Promise<Down
     return null;
   }
 }
-async function sendPhotoFile(chatId: number, image: Downloaded, caption: string): Promise<void> {
+async function sendPhotoFile(chatId: number, image: Downloaded, caption: string, token = TELEGRAM_BOT_TOKEN): Promise<void> {
   const form = new FormData();
   form.append("chat_id", String(chatId));
   form.append("caption", caption);
   form.append("parse_mode", "HTML");
   form.append("photo", new Blob([image.bytes], { type: image.contentType }), image.filename);
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, { method: "POST", body: form, signal: AbortSignal.timeout(20_000) });
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: "POST", body: form, signal: AbortSignal.timeout(20_000) });
   const json = (await res.json()) as { ok?: boolean; description?: string };
   if (!res.ok || !json.ok) throw new Error(`Telegram sendPhoto upload: ${json.description ?? "failed"}`);
 }
-async function sendVideoUrl(chatId: number, videoUrl: string, thumbUrl: string | null, caption: string): Promise<void> {
+async function sendVideoUrl(chatId: number, videoUrl: string, thumbUrl: string | null, caption: string, token = TELEGRAM_BOT_TOKEN): Promise<void> {
   const payload: Record<string, unknown> = { chat_id: String(chatId), video: videoUrl, caption, parse_mode: "HTML", supports_streaming: true };
   if (thumbUrl) payload.thumb = thumbUrl;
-  await telegramCall("sendVideo", payload);
+  await telegramCall("sendVideo", payload, token);
 }
-async function sendVideoFileUpload(chatId: number, video: Downloaded, thumb: Downloaded | null, caption: string): Promise<void> {
+async function sendVideoFileUpload(chatId: number, video: Downloaded, thumb: Downloaded | null, caption: string, token = TELEGRAM_BOT_TOKEN): Promise<void> {
   const form = new FormData();
   form.append("chat_id", String(chatId));
   form.append("caption", caption);
@@ -1638,7 +1756,7 @@ async function sendVideoFileUpload(chatId: number, video: Downloaded, thumb: Dow
   form.append("supports_streaming", "true");
   form.append("video", new Blob([video.bytes], { type: video.contentType }), video.filename);
   if (thumb) form.append("thumb", new Blob([thumb.bytes], { type: thumb.contentType }), thumb.filename);
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`, { method: "POST", body: form, signal: AbortSignal.timeout(120_000) });
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, { method: "POST", body: form, signal: AbortSignal.timeout(120_000) });
   const json = (await res.json()) as { ok?: boolean; description?: string };
   if (!res.ok || !json.ok) throw new Error(`Telegram sendVideo upload: ${json.description ?? "failed"}`);
 }
@@ -1648,6 +1766,7 @@ async function sendPost(
   post: Post,
   fmt?: PostFormat,
   mediaKind: "photo" | "video_thumb" | null = null,
+  token = TELEGRAM_BOT_TOKEN,
 ): Promise<{ mode: "photo" | "video" | "text" }> {
   const text = formatMessage(post, fmt);
   const mode = chooseDeliveryMode(post, mediaKind);
@@ -1658,14 +1777,25 @@ async function sendPost(
     const video = post.videoUrl;
     const thumb = post.imageUrl ?? null;
     try {
-      await sendVideoUrl(chatId, video, thumb, fitCaption(text));
+      await sendVideoUrl(chatId, video, thumb, fitCaption(text), token);
       return { mode: "video" };
     } catch {
+      // Prefer a Cloudflare-cached copy (Telegram pulls bytes from R2, not
+      // this function); only download bytes here as a last resort.
+      const cachedVideo = await cachedMediaUrl(video, "video");
+      if (cachedVideo) {
+        try {
+          await sendVideoUrl(chatId, cachedVideo, thumb, fitCaption(text), token);
+          return { mode: "video" };
+        } catch {
+          /* fall through to byte download */
+        }
+      }
       const downloadedVideo = await downloadImage(video, "video");
       if (downloadedVideo) {
         try {
           const downloadedThumb = thumb ? await downloadImage(thumb, "image") : null;
-          await sendVideoFileUpload(chatId, downloadedVideo, downloadedThumb, fitCaption(text));
+          await sendVideoFileUpload(chatId, downloadedVideo, downloadedThumb, fitCaption(text), token);
           return { mode: "video" };
         } catch {
           /* fall through */
@@ -1681,13 +1811,24 @@ async function sendPost(
   // text-only branch below.
   if (mode === "photo" && post.imageUrl) {
     try {
-      await telegramCall("sendPhoto", { chat_id: chatId, photo: post.imageUrl, caption: fitCaption(text), parse_mode: "HTML" });
+      await telegramCall("sendPhoto", { chat_id: chatId, photo: post.imageUrl, caption: fitCaption(text), parse_mode: "HTML" }, token);
       return { mode: "photo" };
     } catch {
+      // Cloudflare-cached copy first (R2 URL -> Telegram downloads from there),
+      // byte download + re-upload only as a last resort.
+      const cachedImage = await cachedMediaUrl(post.imageUrl, "image");
+      if (cachedImage) {
+        try {
+          await telegramCall("sendPhoto", { chat_id: chatId, photo: cachedImage, caption: fitCaption(text), parse_mode: "HTML" }, token);
+          return { mode: "photo" };
+        } catch {
+          /* fall through to byte download */
+        }
+      }
       const downloaded = await downloadImage(post.imageUrl, "image");
       if (downloaded) {
         try {
-          await sendPhotoFile(chatId, downloaded, fitCaption(text));
+          await sendPhotoFile(chatId, downloaded, fitCaption(text), token);
           return { mode: "photo" };
         } catch {
           /* fall through to text */
@@ -1710,7 +1851,7 @@ async function sendPost(
     link_preview_options: {
       is_disabled: fmt?.linkPreview === false ? true : Boolean(post.imageUrl),
     },
-  });
+  }, token);
   return { mode: "text" };
 }
 
@@ -1735,10 +1876,6 @@ function randomInt(lo: number, hi: number): number {
   if (hi <= lo) return lo;
   return lo + Math.floor(Math.random() * (hi - lo + 1));
 }
-function localDate(d: Date, timeZone: string): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
-}
-
 // ── Data access ─────────────────────────────────────────────────────────────
 async function getSettings(): Promise<SettingsRow | null> {
   const rows = await rest<SettingsRow[]>("settings", { query: "select=*&limit=1" });
@@ -1753,20 +1890,102 @@ async function listSources(): Promise<Array<Record<string, unknown>>> {
 async function listTopicQueries(): Promise<Array<{ query: string; category: string; enabled: boolean }>> {
   return (await rest<Array<{ query: string; category: string; enabled: boolean }>>("topic_queries", { query: "select=query,category,enabled" })) ?? [];
 }
-async function listActiveChats(): Promise<Array<{ id: string; chat_id: number }>> {
-  return (await rest<Array<{ id: string; chat_id: number }>>("chats", { query: "select=id,chat_id&active=eq.true" })) ?? [];
+async function listActiveChats(): Promise<Array<ChatRow>> {
+  return (await rest<Array<ChatRow>>("chats", { query: "select=id,chat_id,bot_id&active=eq.true" })) ?? [];
 }
-// The same chat can end up registered more than once (e.g. re-adding a group
-// the bot already belongs to). Publishing to each duplicate row double-sends
-// every story, so collapse to unique chat_ids before any send loop.
-function dedupeChats(chats: Array<{ id: string; chat_id: number }>): Array<{ id: string; chat_id: number }> {
-  const seen = new Set<string>();
-  return chats.filter((c) => {
-    const key = String(c.chat_id ?? "");
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+type BotRow = { id: string; name?: string | null; token?: string | null; categories?: unknown; enabled?: boolean | null };
+// Every registered bot's token + category whitelist. bot_id = null on a chat
+// means the primary bot (env TELEGRAM_BOT_TOKEN, all categories).
+async function listBots(): Promise<Map<string, BotRow>> {
+  const rows = await rest<BotRow[]>("bots", { query: "select=id,name,token,categories,enabled&limit=100" });
+  return new Map((rows ?? []).filter((b) => b.enabled !== false).map((b) => [String(b.id), b]));
+}
+// dedupeChats lives in _shared.ts (unit-tested): it prefers the primary-bot
+// row (bot_id = null) so a channel where both the primary and an additional
+// bot are members deterministically receives everything from the primary bot.
+
+// ── Auto chat discovery (manual Sync chats + daily auto-sync) ──────────────
+// Telegram does not let a bot enumerate its chats, so the only way to pick up
+// a new subscriber/channel is to poll getUpdates and register every chat that
+// appears. Scans the primary bot AND every enabled additional bot; chats found
+// under an additional bot carry bot_id so the router sends through that bot's
+// token + category whitelist. Existing rows are never re-pointed.
+//
+// A bot with an active webhook rejects getUpdates (Telegram conflict). Such
+// bots get a temporary deleteWebhook → poll → restore so discovery still
+// works — the webhook URL/limits are restored exactly as they were.
+async function syncChatsFromBots(): Promise<{ added: number; bots: number; errors: string[] }> {
+  const errors: string[] = [];
+  const targets: Array<{ label: string; token: string; botId: string | null }> = [];
+  if (TELEGRAM_BOT_TOKEN) targets.push({ label: "primary bot", token: TELEGRAM_BOT_TOKEN, botId: null });
+  const bots = await listBots().catch(() => new Map<string, BotRow>());
+  for (const b of bots.values()) {
+    const tok = String(b.token ?? "").trim();
+    if (!tok) continue;
+    targets.push({ label: b.name ?? b.id, token: tok, botId: b.id });
+  }
+
+  const UPDATES_ALLOWED = { timeout: 0, limit: 100, allowed_updates: ["message", "channel_post", "my_chat_member"] };
+  let added = 0;
+  for (const t of targets) {
+    let updates: Array<Record<string, unknown>> = [];
+    try {
+      try {
+        updates = (await telegramCall("getUpdates", UPDATES_ALLOWED, t.token)) as Array<Record<string, unknown>>;
+      } catch (e) {
+        // Webhook conflict → temporarily remove, poll once, restore.
+        if (!/webhook/i.test(String(e instanceof Error ? e.message : e))) throw e;
+        let wh: Record<string, unknown> | null = null;
+        try {
+          wh = (await telegramCall("getWebhookInfo", {}, t.token)) as Record<string, unknown> | null;
+        } catch { /* restore nothing */ }
+        await telegramCall("deleteWebhook", { drop_pending_updates: false }, t.token).catch(() => {});
+        updates = (await telegramCall("getUpdates", UPDATES_ALLOWED, t.token)) as Array<Record<string, unknown>>;
+        const url = String(wh?.url ?? "").trim();
+        if (wh && url) {
+          const restore: Record<string, unknown> = { url };
+          if (Array.isArray(wh.allowed_updates)) restore.allowed_updates = wh.allowed_updates;
+          if (Number(wh.max_connections ?? 0) > 0) restore.max_connections = Number(wh.max_connections);
+          await telegramCall("setWebhook", restore, t.token).catch(() => {});
+        }
+      }
+      for (const u of updates) {
+        const myChatMember = u.my_chat_member as Record<string, unknown> | undefined;
+        const chat =
+          (u.message ?? u.channel_post ?? u.edited_channel_post)?.chat ??
+          myChatMember?.chat;
+        if (!chat || typeof chat !== "object") continue;
+        // my_chat_member also fires when the bot is REMOVED from a group or
+        // channel — a kicked/left bot cannot post there, so never register it.
+        if (myChatMember) {
+          const status = (myChatMember.new_chat_member as Record<string, unknown> | undefined)?.status;
+          if (status === "left" || status === "kicked") continue;
+        }
+        const cid = Number((chat as Record<string, unknown>).id ?? 0);
+        if (!cid) continue;
+        const exists = await rest<Array<{ id: string }>>("chats", { query: `chat_id=eq.${cid}&limit=1` }).catch(() => []);
+        if (Array.isArray(exists) && exists.length > 0) continue;
+        await rest("chats", {
+          method: "POST",
+          body: {
+            chat_id: cid,
+            title: (chat as Record<string, unknown>).title ?? (chat as Record<string, unknown>).username ?? null,
+            username: (chat as Record<string, unknown>).username ?? null,
+            type: (chat as Record<string, unknown>).type ?? "private",
+            active: true,
+            bot_id: t.botId,
+            last_seen_at: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+          },
+          prefer: "return=minimal",
+        }).catch(() => {});
+        added += 1;
+      }
+    } catch (e) {
+      errors.push(`${t.label}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return { added, bots: targets.length, errors };
 }
 async function logActivity(type: string, level: string, message: string, detail?: string): Promise<void> {
   try {
@@ -2027,6 +2246,32 @@ async function pruneQueueAndRetain(): Promise<void> {
       query: `day=lt.${enc(usageDayCutoff)}`,
       prefer: "return=minimal",
     });
+    // Max-queue auto-trim: when the queued backlog exceeds the configured cap
+    // (settings.max_queue_size, default 150), drop the lowest-scored
+    // NON-breaking items beyond the cap so the queue can't balloon. Breaking
+    // items are never trimmed (they need operator review); 0 disables the trim.
+    const maxQueueSize = Math.max(0, Math.floor(Number((await getSettings().catch(() => null))?.max_queue_size ?? 150)));
+    if (maxQueueSize > 0) {
+      const queued = await rest<Array<{ id: string }>>("queue", { query: "select=id&status=eq.queued&limit=1000" }).catch(() => []);
+      const overflow = (queued?.length ?? 0) - maxQueueSize;
+      if (overflow > 0) {
+        const victims = await rest<Array<{ id: string }>>("queue", {
+          query: `select=id&status=eq.queued&breaking=eq.false&order=score.asc&limit=${overflow}`,
+        }).catch(() => []);
+        const ids = (victims ?? []).map((v) => String(v.id)).filter(Boolean);
+        for (let i = 0; i < ids.length; i += 50) {
+          const batch = ids.slice(i, i + 50);
+          await rest("queue", {
+            method: "DELETE",
+            query: `id=in.(${batch.map(enc).join(",")})`,
+            prefer: "return=minimal",
+          }).catch(() => {});
+        }
+        if (ids.length > 0) {
+          await logActivity("queue", "info", `Auto-trim: dropped ${ids.length} lowest-score item(s) over the ${maxQueueSize}-item cap`);
+        }
+      }
+    }
   } catch {
     /* retention must never break the cycle */
   }
@@ -2213,6 +2458,9 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   const deadline = opts.deadline ?? Number.POSITIVE_INFINITY;
   const budgetLeft = () => Date.now() < deadline;
   const stats: Record<string, unknown> = { fetched: 0, junk: 0, offTopic: 0, stale: 0, duplicate: 0, reReports: 0, extractionFails: 0, updates: 0, queued: 0, breakingQueued: 0, errors: [] as string[] };
+  // Egress offload wiring status (diagnostic): "cloudflare" when the Worker
+  // env is present, "direct" when unset (relayViaWorker falls back silently).
+  stats.relayMode = CLOUDFLARE_WORKER_URL && CLOUDFLARE_RELAY_KEY ? "cloudflare" : "direct";
   const errors = stats.errors as string[];
 
   const topics = await listTopicQueries();
@@ -2222,7 +2470,10 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   const collected: Article[] = [];
 
   // Telegram channels (breaking signals) — always fetched.
-  const channelRows = sources.filter((s) => s.kind === "telegram" && s.enabled !== false);
+  const channelRows =
+    settings.fetch_telegram_enabled === false
+      ? []
+      : sources.filter((s) => s.kind === "telegram" && s.enabled !== false);
   // Honour the operator's Telegram video-fetch toggle. "bot_api" runs the
   // forwardMessage + getFile chain for video_thumb posts so sendVideo posts
   // the real .mp4 instead of a still image. "off" leaves post.videoUrl null
@@ -2251,7 +2502,7 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
 
   // Web sources
   const newsdataRow = sources.find((s) => s.kind === "newsdata");
-  if (mode === "all" && budgetLeft() && newsdataRow && NEWSDATA_API_KEY && queries.length) {
+  if (mode === "all" && budgetLeft() && settings.fetch_newsdata_enabled !== false && newsdataRow && NEWSDATA_API_KEY && queries.length) {
     const groups: string[] = [];
     let current = "";
     for (const q of queries) {
@@ -2292,20 +2543,22 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
   if (mode === "all" && budgetLeft() && sources.some((s) => s.kind === "rss")) {
     // RSS queries are I/O-bound and fetch concurrently; sequential would add
     // up to 12 × 20s worst case to every ingest cycle.
-    const rssResults = await Promise.all(
-      queries.slice(0, RSS_MAX_QUERIES).map(async (query) => {
-        try {
-          return await fetchGoogleNewsRss(query);
-        } catch (err) {
-          errors.push(`rss / ${query.slice(0, 40)}: ${err instanceof Error ? err.message : String(err)}`);
-          return [] as Article[];
-        }
-      }),
-    );
-    for (const r of rssResults) collected.push(...r);
+    if (settings.fetch_google_news_enabled !== false) {
+      const rssResults = await Promise.all(
+        queries.slice(0, RSS_MAX_QUERIES).map(async (query) => {
+          try {
+            return await fetchGoogleNewsRss(query);
+          } catch (err) {
+            errors.push(`rss / ${query.slice(0, 40)}: ${err instanceof Error ? err.message : String(err)}`);
+            return [] as Article[];
+          }
+        }),
+      );
+      for (const r of rssResults) collected.push(...r);
+    }
     try {
       const topical = /iran|tehran|irgc|khamenei|israel|hezbollah|houthi|yemen|iraq|syria|lebanon|militia|hormuz|persian gulf|tanker|oil|gold|bullion|natural gas|lng|petrochemical|nuclear|uranium|enrich|iaea|sanction|trump|pentagon|centcom|us navy|missile|drone|airstrike|strike|ceasefire|nato|mossad|gaza|west bank|palestin|kurd|jordan|egypt|amman|cairo/i;
-      if (budgetLeft()) collected.push(...(await fetchPublisherFeeds()).filter((a) => topical.test(`${a.title} ${a.description ?? ""}`) || isLeaderStatement(`${a.title} ${a.description ?? ""}`)));
+      if (settings.fetch_publisher_feeds_enabled !== false && budgetLeft()) collected.push(...(await fetchPublisherFeeds()).filter((a) => topical.test(`${a.title} ${a.description ?? ""}`) || isLeaderStatement(`${a.title} ${a.description ?? ""}`)));
     } catch {
       /* optional */
     }
@@ -2335,6 +2588,8 @@ async function runIngest(settings: SettingsRow, mode: "all" | "telegram" = "all"
     if (!respectGate(article).ok) { stats.junk = Number(stats.junk) + 1; continue; }
     if (!sectarianGate(article.title, article.description).ok) { stats.junk = Number(stats.junk) + 1; stats.sectarian = Number(stats.sectarian ?? 0) + 1; continue; }
     if (!neutralityGate(article.title, article.description).ok) { stats.junk = Number(stats.junk) + 1; stats.neutrality = Number(stats.neutrality ?? 0) + 1; continue; }
+    if (!editorialJunkGate(article.title, article.description).ok) { stats.junk = Number(stats.junk) + 1; stats.editorialJunk = Number(stats.editorialJunk ?? 0) + 1; continue; }
+    if (!kurdHostileGate(article.title, article.description).ok) { stats.junk = Number(stats.junk) + 1; stats.kurdHostile = Number(stats.kurdHostile ?? 0) + 1; continue; }
     // Instant channels (boost >= 2) may post in Arabic etc. The relevance
     // (beat) gate and the English gate are English-pattern gates, so they
     // only apply to normal/fast sources; instant posts flow straight through
@@ -2713,6 +2968,7 @@ async function runPublish(
 ): Promise<Record<string, unknown>> {
   const result: Record<string, unknown> = { sent: 0, items: [] as string[] };
   const chats = dedupeChats(await listActiveChats());
+  const bots = await listBots().catch(() => new Map<string, BotRow>());
   if (chats.length === 0) {
     await logActivity("publish", "warning", "Publish skipped — no active destination chats configured");
     return { ...result, skipped: "no chats" };
@@ -2793,7 +3049,9 @@ async function runPublish(
     const respectCheck = respectGate(editorialArticle);
     const sectCheck = sectarianGate(headline, editorialText);
     const neutCheck = neutralityGate(headline, editorialText);
-    const editorialReason = !respectCheck.ok ? respectCheck.reason : !sectCheck.ok ? sectCheck.reason : !neutCheck.ok ? neutCheck.reason : null;
+    const junkCheck = editorialJunkGate(headline, editorialText);
+    const kurdCheck = kurdHostileGate(headline, editorialText);
+    const editorialReason = !respectCheck.ok ? respectCheck.reason : !sectCheck.ok ? sectCheck.reason : !neutCheck.ok ? neutCheck.reason : !junkCheck.ok ? junkCheck.reason : !kurdCheck.ok ? kurdCheck.reason : null;
     if (editorialReason) {
       await setQueueStatus(id, "rejected");
       await logActivity("publish", "info", `Editorial gate (${editorialReason}) — dropped: ${headline.slice(0, 110)}`);
@@ -2942,7 +3200,8 @@ async function runPublish(
       const cached = await getTranslationCache(toTranslate);
       const glossary = settings.translation_glossary as string | undefined;
       const mode = String(settings.translation_mode ?? "gemini_first");
-      let translated = cached ? { text: cached.kurdish, model: cached.model } : await translateToSorani(toTranslate, glossary, mode);
+      const modelOrder = settings.translation_model_order as string[] | undefined;
+      let translated = cached ? { text: cached.kurdish, model: cached.model } : await translateToSorani(toTranslate, glossary, mode, modelOrder);
       if (translated.text && translated.model !== "none" && !cached) {
         // Phase-2 digit-preservation guard: a translation must keep the exact
         // figures of the source ("12 killed" may not become "15 killed").
@@ -2950,7 +3209,7 @@ async function runPublish(
         // digit, but we never silently ship a changed figure either.
         const digits = checkDigitPreservation(toTranslate, translated.text);
         if (!digits.ok) {
-          const retry = await translateToSorani(toTranslate, glossary, mode);
+          const retry = await translateToSorani(toTranslate, glossary, mode, modelOrder);
           const retryOk = Boolean(retry.text) && checkDigitPreservation(toTranslate, retry.text).ok;
           if (retryOk) translated = retry;
           await logActivity("translation", "warning", `Digit guard — ${digits.missing.slice(0, 3).join(", ")} not in source${retryOk ? " (fixed on retry)" : ""}: ${headline.slice(0, 90)}`);
@@ -3012,6 +3271,8 @@ async function runPublish(
       emoji: settings.post_emoji as string | null | undefined,
       linkLabel: settings.post_link_label as string | null | undefined,
       showSource: settings.post_show_source as boolean | undefined,
+      showTelegramSource: settings.post_show_telegram_source as boolean | undefined,
+      showWebSource: settings.post_show_web_source as boolean | undefined,
       showTimestamp: settings.post_show_timestamp as boolean | undefined,
       breakingPrefix: settings.breaking_prefix as string | null | undefined,
       linkPreview: settings.link_previews as boolean | undefined,
@@ -3021,6 +3282,23 @@ async function runPublish(
     let sentThisItem = 0;
     for (const chat of chats) {
       if (sentToChat.has(`${dedupKey}:${chat.chat_id}`)) continue;
+      // N-bot routing: a chat assigned to a bot sends with that bot's token
+      // and only receives the categories in the bot's whitelist (empty = all).
+      // A chat whose bot was deleted or disabled is skipped — it never falls
+      // back to the primary bot silently.
+      const chatBot = chat.bot_id ? bots.get(String(chat.bot_id)) : undefined;
+      if (chat.bot_id && !chatBot) continue;
+      const botCatList = Array.isArray(chatBot?.categories)
+        ? (chatBot.categories as unknown[]).filter(Boolean).map(String)
+        : [];
+      // A chat assigned to a bot that owns no token must be skipped — sending
+      // it with the PRIMARY bot's token would deliver via the wrong bot.
+      if (chatBot && !chatBot.token) continue;
+      // Multi-category matching: an article can belong to several categories
+      // (primary + every other keyword block its text hits). A bot subscribed
+      // to ANY of them receives it — specialized bots can overlap.
+      if (!botMatchesCategories(botCatList, String(item.category ?? ""), String(item.source_text ?? `${headline} ${summary}`))) continue;
+      const sendToken = chatBot?.token || TELEGRAM_BOT_TOKEN;
       // Idempotency: reserve the (dedup_key, chat_id) published_history row
       // BEFORE sending so a crash between "Telegram delivered" and "database
       // written" can never cause a duplicate send on the next cycle. The
@@ -3063,7 +3341,7 @@ async function runPublish(
         historyId = ex?.id ?? null;
       }
       try {
-        const delivery = await sendPost(Number(chat.chat_id), post, fmt, post.mediaKind ?? null);
+        const delivery = await sendPost(Number(chat.chat_id), post, fmt, post.mediaKind ?? null, sendToken);
         const flip = () =>
           rest(`published_history?id=eq.${enc(String(historyId))}`, {
             method: "PATCH",
@@ -3233,6 +3511,29 @@ async function runCycle(force: boolean): Promise<Record<string, unknown>> {
 
   // Retention/pruning runs even while a publish lock is held (cheap PATCH/DELETEs).
   await pruneQueueAndRetain().catch(() => {});
+
+  // Auto chat discovery — re-scan every bot's recent Telegram updates at most
+  // once per 24h so a new user/channel that messaged the bot is registered and
+  // starts receiving news without pressing Sync chats. Deliberately NOT gated
+  // on force: a manual publish must not trigger getUpdates (which drains a
+  // webhook-backed bot's pending update queue). Runs before the publish lock
+  // so discovery can never hold up publishing.
+  const lastChatSync = settings.last_chat_sync_at as string | undefined;
+  if (!lastChatSync || Date.now() - Date.parse(lastChatSync) >= 24 * 3_600_000) {
+    try {
+      const syncStats = await syncChatsFromBots();
+      if (syncStats.added > 0 || syncStats.errors.length > 0) {
+        await logActivity(
+          "system",
+          syncStats.errors.length > 0 ? "warning" : "info",
+          `Auto chat sync: ${syncStats.added} new chat(s) across ${syncStats.bots} bot(s)${syncStats.errors.length ? `, ${syncStats.errors.length} error(s)` : ""}`,
+        );
+      }
+      await patchSettings(String(settings.id), { last_chat_sync_at: new Date().toISOString() });
+    } catch (err) {
+      await logActivity("system", "warning", `Auto chat sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   if (!(await acquireLock(settings))) return { skipped: "publish run in progress" };
   try {

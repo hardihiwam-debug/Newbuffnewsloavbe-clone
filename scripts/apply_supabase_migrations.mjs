@@ -112,11 +112,19 @@ const files = [
   "supabase/migrations/0007_enable_rls.sql",
   "supabase/migrations/0008_ai_and_idempotency.sql",
   "supabase/migrations/0009_news_quality.sql",
-  "supabase/migrations/0010_bulletin_cron.sql",
   "supabase/migrations/0011_gemini_first_translation.sql",
   "supabase/migrations/0012_post_links.sql",
   "supabase/migrations/0013_cron_config.sql",
   "supabase/migrations/0014_cron_health.sql",
+  "supabase/migrations/0015_cron_5min.sql",
+  "supabase/migrations/0016_translation_model_order.sql",
+  "supabase/migrations/0017_gateway_gemini_models.sql",
+  "supabase/migrations/0018_bots.sql",
+  "supabase/migrations/0019_chat_sync.sql",
+  "supabase/migrations/0020_remove_bulletin.sql",
+  "supabase/migrations/0021_post_source_toggles.sql",
+  "supabase/migrations/0022_fetch_source_toggles.sql",
+  "supabase/migrations/0023_queue_trim.sql",
 ];
 let failed = 0;
 for (const file of files) {

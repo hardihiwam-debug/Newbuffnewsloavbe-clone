@@ -1,5 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
+import { Sun, Moon } from "lucide-react";
 import { adminApi } from "@/lib/adminApi";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,6 +29,22 @@ function SignIn() {
   const navigate = useNavigate();
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    typeof document !== "undefined" && document.documentElement.classList.contains("dark")
+      ? "dark"
+      : "light",
+  );
+
+  function toggleTheme() {
+    const next: "dark" | "light" = document.documentElement.classList.contains("dark") ? "light" : "dark";
+    document.documentElement.classList.toggle("dark", next === "dark");
+    try {
+      localStorage.setItem("theme", next);
+    } catch {
+      /* ignore storage errors */
+    }
+    setTheme(next);
+  }
 
   useEffect(() => {
     if (typeof window !== "undefined" && localStorage.getItem(PIN_STORAGE_KEY)) {
@@ -65,7 +82,15 @@ function SignIn() {
   }
 
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center px-4">
+    <main className="relative flex min-h-screen flex-col items-center justify-center px-4">
+      <button
+        type="button"
+        onClick={toggleTheme}
+        className="absolute right-4 top-4 rounded-md p-2 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+      >
+        {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+      </button>
       <div className="w-full max-w-sm text-center">
         <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-muted-foreground">
           Newsroom operations

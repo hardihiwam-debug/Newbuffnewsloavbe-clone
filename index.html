@@ -7,6 +7,17 @@
     <title>Iran Desk Bot Console</title>
     <meta name="description" content="Private admin console for the Iran–U.S. conflict Telegram news bot." />
     <meta name="robots" content="noindex,nofollow" />
+    <script>
+      // Apply the saved theme before first paint to avoid a flash.
+      // Default is dark (the newsroom desk); light is opt-in via the toggle.
+      (function () {
+        try {
+          var saved = localStorage.getItem("theme");
+          var dark = saved ? saved === "dark" : true;
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

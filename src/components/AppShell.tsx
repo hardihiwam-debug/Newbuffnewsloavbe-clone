@@ -11,13 +11,15 @@ import {
   Lock,
   Menu,
   X,
+  Sun,
+  Moon,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { api, useAdminQuery } from "@/lib/supabaseAdminHooks";
 import { readStoredPin, clearStoredPin } from "@/routes/index";
 import { Button } from "@/components/ui/button";
 
-export const NAV_ITEMS = [
+const NAV_ITEMS = [
   { to: "/overview", label: "Overview", icon: LayoutDashboard },
   { to: "/inbox", label: "Inbox", icon: Inbox },
   { to: "/events", label: "Events", icon: GitBranch },
@@ -34,8 +36,6 @@ const MOBILE_NAV = [
   { to: "/sources", label: "Sources", icon: RadioTower },
   { to: "/more", label: "More", icon: Menu },
 ] as const;
-
-export type NavTarget = (typeof NAV_ITEMS)[number]["to"];
 
 // One shared data hook so the shell badge, bot status and every page read
 // the same live payload. The shell consumes only the count + pause state;
@@ -73,6 +73,22 @@ export function AppShell({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
   const path = useRouterState({ select: (s) => s.location.pathname });
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    typeof document !== "undefined" && document.documentElement.classList.contains("dark")
+      ? "dark"
+      : "light",
+  );
+
+  function toggleTheme() {
+    const next: "dark" | "light" = document.documentElement.classList.contains("dark") ? "light" : "dark";
+    document.documentElement.classList.toggle("dark", next === "dark");
+    try {
+      localStorage.setItem("theme", next);
+    } catch {
+      /* ignore storage errors */
+    }
+    setTheme(next);
+  }
   const data = useNewsroomData();
   const s = (data?.settings ?? {}) as Record<string, any>;
   const paused = Boolean(s["botPaused"]);
@@ -159,6 +175,14 @@ export function AppShell({ children }: { children?: ReactNode }) {
           </div>
           <button
             type="button"
+            onClick={toggleTheme}
+            className="flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
+          >
+            {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            {theme === "dark" ? "Light mode" : "Dark mode"}
+          </button>
+          <button
+            type="button"
             onClick={lock}
             className="flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
           >
@@ -191,6 +215,14 @@ export function AppShell({ children }: { children?: ReactNode }) {
           <span className={`h-1.5 w-1.5 rounded-full ${paused ? "bg-destructive" : "bg-healthy"}`} />
           {paused ? "PAUSED" : "OPERATIONAL"}
         </span>
+        <button
+          type="button"
+          onClick={toggleTheme}
+          className="rounded-md p-1.5 text-muted-foreground hover:text-foreground"
+          aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        >
+          {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+        </button>
         <button
           type="button"
           onClick={lock}

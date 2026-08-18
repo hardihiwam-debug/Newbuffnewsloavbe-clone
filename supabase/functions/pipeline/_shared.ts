@@ -226,6 +226,80 @@ export function severityLevel(text: string): number {
 }
 export const SEVERITY_POINTS: Record<number, number> = { 0: 0, 1: 20, 2: 45, 3: 80 };
 
+// ── Arabic category classifier ─────────────────────────────────────────────
+// Arabic-sourced Telegram channels (al-Mayadeen, Iraqi militia channels, …)
+// post in Arabic, and the English keyword blocks in keywordCategory /
+// allCategoriesOf can never see them — which previously dumped every such
+// post into the generic "war" fallback and starved category-specific bots
+// (a bot subscribed to "iraq" never received an Arabic Iraq story). This
+// pass mirrors the English precedence rules with Arabic keywords:
+//   iraq → proxies → war → oil → gold → economic-impact → usa → iran
+//   (non-Iran branch: war → middle-east)
+export function arabicCategoriesOf(text: string): string[] {
+  const t = text.toLowerCase();
+  const found = new Set<string>();
+  if (/العراق|بغداد|البصرة|الموصل|أربيل|اربيل|السليمانية|كركوك|الأنبار|نينوى|الحشد الشعبي|السوداني|كردستان العراق/.test(t)) found.add("iraq");
+  const iranRelated = /إيران|ايران|طهران|الحرس الثوري|خامنئي|بزشكيان|بيزشكيان|قاليباف|عراقجي|الخليج الفارسي|مضيق هرمز|المرشد الأعلى|حزب الله|الحوثي|الحوثيون|أنصار الله|حماس|محور المقاومة|الحشد الشعبي|ميليشيا|ميليشيات|النجباء|سرايا/.test(t);
+  if (iranRelated) {
+    if (/حزب الله|الحوثي|الحوثيون|أنصار الله|كتائب|ميليشيا|ميليشيات|حماس|محور المقاومة|النجباء|سرايا|الحشد الشعبي/.test(t)) found.add("proxies");
+    if (/هجوم|هجمات|ضربة|ضربات|صاروخ|صواريخ|مسيرة|مسيرات|قصف|غارة|غارات|انفجار|انفجارات|قتلى|قتيل|تصعيد|استهداف|عملية عسكرية|حرب|قوات|توغل|اشتباك|اشتباكات|غزو/.test(t)) found.add("war");
+    if (/نفط|خام|أوبك|ناقلة|ناقلات|مصفاة|مصافي|برميل|بتروكيماويات|الطاقة|أسعار النفط|الغاز الطبيعي/.test(t)) found.add("oil");
+    if (/ذهب|سبائك|أسعار الذهب/.test(t)) found.add("gold");
+    if (/عقوبات|تضخم|أسواق|سوق|اقتصاد|صادرات|واردات|عملة|احتياطي|بورصة/.test(t)) found.add("economic-impact");
+    if (/أمريكا|أميركا|الولايات المتحدة|البيت الأبيض|ترامب|واشنطن|البنتاغون|الكونغرس/.test(t)) found.add("usa");
+    if (found.size === 0) found.add("iran");
+  } else {
+    if (/هجوم|هجمات|ضربة|ضربات|صاروخ|صواريخ|مسيرة|مسيرات|قصف|غارة|غارات|انفجار|انفجارات|قتلى|قتيل|تصعيد|استهداف|عملية عسكرية|حرب|قوات|توغل|اشتباك|اشتباكات|غزو/.test(t)) found.add("war");
+    if (/إسرائيل|اسرائيل|فلسطين|غزة|لبنان|سوريا|اليمن|السعودية|الرياض|قطر|الإمارات|الامارات|تركيا|أنقرة|الأردن|الاردن|مصر/.test(t)) found.add("middle-east");
+  }
+  return [...found];
+}
+
+// Every category this text belongs to (same rules as keywordCategory, no
+// early return). Used by the multi-bot router so a bot subscribed to ANY
+// matching category receives the article, even when the primary category is
+// a different one. Runs the English pass plus the Arabic pass, so Arabic-
+// sourced Telegram posts route to category bots too.
+export function allCategoriesOf(text: string): string[] {
+  const t = text.toLowerCase();
+  const found = new Set<string>();
+  if (/\biraq|baghdad|basra|mosul|kurdistan region|erbil|sulaymaniyah|iraqi\b/.test(t)) found.add("iraq");
+  if (/\bmiddle east eye\b/.test(t) && /analysis|explainer|opinion|why |how /.test(t)) found.add("analysis");
+  const iranRelated = /iran|tehran|irgc|khamenei|persian gulf|hormuz|hezbollah|houthi|kataib|axis of resistance/.test(t);
+  if (iranRelated) {
+    if (/hezbollah|houthi|kataib|militia|hamas|axis of resistance/.test(t)) found.add("proxies");
+    if (/strike|missile|drone|attack|airstrike|war|bomb|troops|centcom|carrier|explosion/.test(t)) found.add("war");
+    if (/oil|crude|opec|tanker|hormuz|refinery|barrel/.test(t)) found.add("oil");
+    if (/gold|bullion/.test(t)) found.add("gold");
+    if (/sanction|inflation|market|economy|export/.test(t)) found.add("economic-impact");
+    if (/trump|pentagon|washington|white house|congress|u\.s\.|united states/.test(t)) found.add("usa");
+    if (found.size === 0) found.add("iran");
+  } else {
+    if (/strike|missile|drone|attack|airstrike|air strike|bomb|shelling|barrage|killed|kills|casualt|invasion|troops|hostage|military operation/.test(t)) found.add("war");
+    if (/israel|palestin|gaza|lebanon|syria|yemen|saudi|qatar|uae|turkey/.test(t)) found.add("middle-east");
+    if (/russia|russian|ukrain|kyiv|moscow|zelensky|putin|kremlin|donbass|crimea/.test(t)) found.add("war");
+  }
+  // Arabic pass: the instant Telegram channels the operator follows post in
+  // Arabic, and the English blocks above never match them.
+  for (const c of arabicCategoriesOf(t)) found.add(c);
+  return [...found];
+}
+
+// Category-whitelist match for the multi-bot router. An article belongs to
+// its primary category PLUS every category its source text hits (English and
+// Arabic passes combined). An empty whitelist = ALL categories. A bot
+// subscribed to ANY matching category receives the article.
+export function botMatchesCategories(
+  botCategories: string[],
+  itemCategory: string,
+  sourceText: string,
+): boolean {
+  if (botCategories.length === 0) return true;
+  const itemCats = new Set<string>([itemCategory]);
+  for (const c of allCategoriesOf(sourceText)) itemCats.add(c);
+  return botCategories.some((c) => itemCats.has(c));
+}
+
 export function keywordCategory(text: string): string | null {
   const t = text.toLowerCase();
   if (/\biraq|baghdad|basra|mosul|kurdistan region|erbil|sulaymaniyah|iraqi\b/.test(t)) return "iraq";
@@ -241,6 +315,13 @@ export function keywordCategory(text: string): string | null {
     // Operator carve-out: major Russia–Ukraine war news (already admitted by
     // the ingest relevanceGate) is published as a "war" item.
     if (/russia|russian|ukrain|kyiv|moscow|zelensky|putin|kremlin|donbass|crimea/.test(t)) return "war";
+    // Arabic-sourced posts (the bulk of instant Telegram channels) never
+    // match the English keyword blocks; classify them with the Arabic pass so
+    // they carry a real category (iraq, proxies, oil, …) instead of the
+    // generic "war" fallback — this is what lets category-specific bots
+    // actually receive Arabic stories about their topics.
+    const ar = arabicCategoriesOf(t);
+    if (ar.length > 0) return ar[0];
     return null;
   }
   if (/hezbollah|houthi|kataib|militia|hamas|axis of resistance/.test(t)) return "proxies";
@@ -307,6 +388,12 @@ export type PostFormat = {
   linkLabel?: string | null;
   showSource?: boolean;
   showTimestamp?: boolean;
+  // Per-source-type attribution toggles. Telegram sources have @-prefixed
+  // names ("@ajanews"), everything else (RSS/NewsData/websites) is a plain
+  // name ("Mehr News"). undefined means "on", matching the master toggle's
+  // convention of treating null/undefined as the default.
+  showTelegramSource?: boolean;
+  showWebSource?: boolean;
   breakingPrefix?: string | null;
   linkPreview?: boolean;
   links?: Array<{ url: string; text: string }> | null;
@@ -329,14 +416,24 @@ export function formatMessage(post: Post, fmt: PostFormat = {}): string {
   const footer = fmt.footer == null ? DEFAULT_FOOTER : fmt.footer;
   const emoji = fmt.emoji == null ? DEFAULT_EMOJI : fmt.emoji;
   const linkLabel = fmt.linkLabel == null ? DEFAULT_LINK_LABEL : fmt.linkLabel;
+  // Telegram channels use @-prefixed names; web sources (RSS/NewsData/
+  // websites) use plain site names. Per-type toggles let the operator hide
+  // one family without touching the other. undefined → shown, like the
+  // master toggle.
+  const isTelegramSource = post.sourceName.trim().startsWith("@");
+  const typeShown = isTelegramSource ? fmt.showTelegramSource !== false : fmt.showWebSource !== false;
+  const sourceShown = fmt.showSource !== false && typeShown;
   const lines: string[] = [];
   if (headline.trim()) lines.push(`<b>${escapeHtml(headline)}</b>`, "");
   lines.push(escapeHtml(summary));
-  if (fmt.showSource !== false) {
+  if (sourceShown) {
     const whenPart = fmt.showTimestamp === false || !when ? "" : ` · ${escapeHtml(when)}`;
     lines.push("", `${emoji ? `${escapeHtml(emoji)} ` : ""}<i>${escapeHtml(post.sourceName)}</i>${whenPart}`);
   }
-  if (sources.length > 1) {
+  // Multi-source posts replace the "Read more" link with a source list. When
+  // source names are hidden for this post's type, fall back to the link so a
+  // hidden attribution never costs the reader the clickable reference.
+  if (sources.length > 1 && sourceShown) {
     lines.push(`Sources: ${sources.map((s) => escapeHtml(s.name)).join(", ")}`);
   } else {
     lines.push(`<a href="${escapeHtml(post.url)}">${escapeHtml(linkLabel || "")}</a>`);
@@ -522,4 +619,143 @@ export function computeQuotaPatch(
     used_today: (sameDay ? Number(usedToday ?? 0) : 0) + calls,
     quota_date: today,
   };
+}
+
+// ── Translation cleanup (greeting / prefix stripping) ──────────────────────
+// Models (MiniMax, Gemini 2.5 via gateway, …) sometimes open a translation
+// with a greeting — "سڵاو" (hello) etc. A news post never needs one, and one
+// bad case published ONLY the greeting as the whole post. Strip leading
+// greeting lines; a greeting-only output becomes empty and is then rejected
+// by validateSorani, so the chain falls through to the next model.
+export const GREETING_LINE_RE =
+  /^(سڵاو(ی|تان|یە)?|سڵا|بەخێربێ(ن|یت|ی)?|السلام عليكم|السلام علیکم|اهلا|اهلاً|مرحبا|hello|hi|hallo|hey)[.!،,]*\s*$/i;
+
+export function cleanGeminiTranslation(raw: string): string {
+  let text = raw.trim();
+  const lines = text.split(/\r?\n/);
+  while (lines.length > 0) {
+    const head = (lines[0] ?? "").trim();
+    if (!head) break;
+    if (GREETING_LINE_RE.test(head)) {
+      lines.shift();
+      continue;
+    }
+    if (/^(here(\u2019s|'s| is)?|translation[:：]|the (standard |english |kurdish )?translation|in (kurdish|sorani|english)[:：]?|output[:：])/i.test(head) && !/^[\u0600-\u06FF]/.test(head)) {
+      lines.shift();
+    } else break;
+  }
+  text = lines.join("\n").trim();
+  text = text.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/\*([^*]+)\*/g, "$1");
+  return text.replace(/^\s*[-*]\s+/gm, "").trim();
+}
+
+// ── Translation model classification ───────────────────────────────────────
+// Direct-REST Gemini model chain (runs against the GEMINI_API_KEY_1..6 pool)
+// and the MiniMax model id as surfaced in Settings → Translation model order.
+// Kept in sync with migration 0017's seed and the Settings page default.
+export const GEMINI_DIRECT_MODELS = [
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+];
+export const MINIMAX_MODEL = "minimax/minimax-m3";
+
+// Classify a model id from the translation_model_order list: gateway-hosted
+// (google/*, minimax/*) route through the Vercel AI Gateway; bare direct
+// Gemini ids (gemini-3.7-flash, …) hit the Google REST API with the
+// GEMINI_API_KEY_1..6 pool.
+export function classifyModel(id: string): "gateway" | "direct" | "unknown" {
+  if (id === MINIMAX_MODEL || id.startsWith("google/") || id.startsWith("minimax/")) return "gateway";
+  if (GEMINI_DIRECT_MODELS.includes(id)) return "direct";
+  return "unknown";
+}
+
+// ── Multi-bot chat dedup ────────────────────────────────────────────────────
+// The same chat can end up registered more than once (the primary bot and an
+// additional bot are both members of one channel, or a group was re-added).
+// Publishing to each duplicate row double-sends every story, so collapse to
+// unique chat_ids before any send loop.
+//
+// When a chat has BOTH a primary-bot row (bot_id = null) and an additional-
+// bot row, the primary row wins deterministically: the additive design keeps
+// the primary bot delivering everything, and an additional bot only ADDS
+// category-filtered copies to chats the primary bot cannot reach. Without a
+// stable preference, row order decides which bot sends, so a channel where
+// both bots are members would nondeterministically get either all categories
+// or only the whitelisted ones.
+export type ChatRow = { id: string; chat_id: number; bot_id: string | null };
+
+export function dedupeChats(chats: Array<ChatRow>): Array<ChatRow> {
+  const seen = new Set<string>();
+  const sorted = [...chats].sort((a, b) => {
+    const aPrimary = a.bot_id === null || a.bot_id === undefined ? 0 : 1;
+    const bPrimary = b.bot_id === null || b.bot_id === undefined ? 0 : 1;
+    return aPrimary - bPrimary;
+  });
+  return sorted.filter((c) => {
+    const key = String(c.chat_id ?? "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function gateVerdict(ok: boolean, reason: string): { ok: boolean; reason?: string } {
+  return ok ? { ok: true } : { ok: false, reason };
+}
+
+// ── Anti-Kurd hostile framing gate ──────────────────────────────────────────
+// Operator rule: the channel is neutral and never carries hostile content
+// against Kurds. Many Shia/militia channels publish statements attacking the
+// Peshmerga or Kurdistan (calls to disband them, "most armed militia",
+// "danger to Iraq's unity", "traitors"). Those are dropped in Arabic, Sorani
+// and English; neutral or pro-Kurd news (condemnations of attacks on Erbil,
+// friendly statements) passes normally.
+export const KURD_HOSTILE_PATTERNS: RegExp[] = [
+  // calls to disband / dismantle the Peshmerga
+  /حل (قوات )?(البيشمركة|البشمركة|البيشمرگة)|حل قوات البشمركة|هەڵوەشاندنەوەی (هێزەکانی )?پێشمەرگە|هەڵوەشاندنەوەی پێشمەرگە/i,
+  // Peshmerga labelled a militia / outlaw / danger / threat (not when it is
+  // the target — "تتصدى لتهديدات داعش" (confronts ISIS threats) is neutral
+  // news and must pass)
+  /(البيشمركة|البشمركة|پێشمەرگە)(?!\s*(تتصدى|تصد|يدافع|تدافع|يقاوم|ترد|تردع|تصدي))[^.]{0,40}(ميليشيا|ميليشيات|الميليشيات|خارج عن القانون|خطر|خطورة|تهديد|تهديدات|مترسی|مەترسی|هەڕەشە|خەطر)/i,
+  /(ميليشيا|ميليشيات|الميليشيات|ميليشيا مسلحة)[^.]{0,40}(البيشمركة|البشمركة|پێشمەرگە)/i,
+  // Kurds / Kurdistan framed as a threat to Iraq's unity or as traitors
+  /(الأكراد|أكراد|الاكراد|كردستان|كوردستان|کوردستان|کورد|كورد)[^.]{0,50}(خطر|تهديد|خطورة|مؤامرة|خونة|خونة|خيانة|عمالة|عملاء|غدر|تقسيم العراق|وحدة العراق)/i,
+  /(وحدة العراق|تقسيم العراق)[^.]{0,50}(الأكراد|أكراد|الاكراد|كردستان|كوردستان|البيشمركة|البشمركة)/i,
+  /(الأكراد|أكراد|الاكراد)[^.]{0,40}(إرهابيون|إرهابيين|ارهابيون|ارهابيين|داعشيون)/i,
+  /(کورد|كورد)[^.]{0,40}(خیانەت|نابەدڵ|تیرۆریست)/i,
+  /(کوردستان|كوردستان)[^.]{0,50}(مەترسی|هەڕەشە|خەطر|تیرۆر)/i,
+  // English mirror of the Arabic/Sorani patterns
+  /\bdisband\b[^.]{0,40}\bpeshmerga\b/i,
+  /\bpeshmerga\b[^.]{0,40}\b(militia|terrorists?|traitors?|danger|threat|must be (disbanded|crushed))\b/i,
+  /\b(kurds?|kurdish|kurdistan)\b[^.]{0,50}\b(traitors?|terrorists?|danger to|threat to|must be crushed)\b/i,
+];
+
+export function kurdHostileGate(title: string, description?: string | null): { ok: boolean; reason?: string } {
+  const text = `${title} ${description ?? ""}`;
+  if (KURD_HOSTILE_PATTERNS.some((p) => p.test(text))) return gateVerdict(false, "anti-Kurd hostile framing (not neutral news)");
+  return gateVerdict(true, "");
+}
+
+// ── Arabic / editorial junk gate ────────────────────────────────────────────
+// Many Telegram channels mix real news with dialectal poetry, militia
+// statements, food/lifestyle posts and opinion essays that carry no factual
+// news value. The English JUNK_TITLE_PATTERNS cannot see these, so a
+// dedicated Arabic blocklist keeps the feed factual.
+export const ARABIC_JUNK_PATTERNS: RegExp[] = [
+  // dialectal poetry / riddles
+  /أيسرُّك|ما بعت|ما خفت|ما صافحت|يا (الشاب|شاب)|التشوفه|تلگى بيه|عنده نخوة|الزّلم|الملثم|من ينفذ صبرها/i,
+  // food / lifestyle
+  /وجبة (العشاء|الغداء|الفطور)|سهمكم العافية/i,
+  // militia statements / propaganda rants
+  /العساف|ابو مجاهد|كتائب حزب ابو|المسؤول الأمني لكتائب|لقد صبرنا|صبرنا لاكثر|فإننا نذكر|نذكر الزيدي|دماؤنا تنزف|خزائنك بالمليارات|إنك كنت تمارس التجارة/i,
+  // self-attributed opinion essays / editorializing
+  /مصدر كردي للفقار|تساؤلات حول ما إذا كان|ليس (حادثًا|حادثا) عرضيًا|تطور خطير يهدد|(وهو|وهي) ما يخدم|التي تخدم المشاريع/i,
+];
+
+export function editorialJunkGate(title: string, description?: string | null): { ok: boolean; reason?: string } {
+  const text = `${title} ${description ?? ""}`;
+  if (ARABIC_JUNK_PATTERNS.some((p) => p.test(text))) return gateVerdict(false, "Arabic junk/opinion/poetry");
+  return gateVerdict(true, "");
 }

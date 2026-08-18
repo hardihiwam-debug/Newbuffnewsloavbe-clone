@@ -1,0 +1,13 @@
+-- Iran Desk Bot — operator-controlled translation model order.
+--
+-- settings.translation_model_order (jsonb array) lets the operator reorder
+-- the translation chain from Settings → Translation → "Translation model
+-- order" (drag & drop). The pipeline tries entries top-to-bottom; each entry
+-- is either a Gemini model id (run against every configured GEMINI_API_KEY_N)
+-- or the MiniMax gateway id "minimax/minimax-m3".
+--
+-- NULL / empty = legacy behaviour (settings.translation_mode chain):
+--   gemini_first  → gemini-3.7-flash → … → gemini-3.5-flash-lite → MiniMax
+--   minimax_first → MiniMax → Gemini models
+--   gemini_only / minimax_only → single provider
+alter table public.settings add column if not exists translation_model_order jsonb;

@@ -1,8 +1,20 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { toast } from "sonner";
-import { Inbox as InboxIcon, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { Inbox as InboxIcon, AlertTriangle, CheckCircle2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { adminApi } from "@/lib/adminApi";
 import { readStoredPin } from "@/routes/index";
 import { useNewsroomData } from "@/components/AppShell";
@@ -36,6 +48,11 @@ function Inbox() {
   const [editing, setEditing] = useState<any | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [removedIds, setRemovedIds] = useState<Set<string>>(new Set());
+  const [clearOpen, setClearOpen] = useState(false);
+  const [clearMode, setClearMode] = useState<"all" | "x">("x");
+  const [clearCount, setClearCount] = useState("50");
+  const [clearBreaking, setClearBreaking] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   const queue = ((data?.queueAll ?? []) as any[]).filter(
     (i) =>
@@ -116,6 +133,41 @@ function Inbox() {
     }
   };
 
+  const clearQueue = async () => {
+    if (!pin || clearing) return;
+    setClearing(true);
+    const t = toast.loading(
+      clearMode === "all" ? "Clearing the whole queue…" : `Clearing ${clearCount || 0} lowest-score items…`,
+    );
+    try {
+      const n = clearMode === "x" ? Math.max(1, Math.floor(Number(clearCount) || 0)) : undefined;
+      const r = (await adminApi.clearQueue({
+        pin,
+        ...(n ? { limit: n, includeBreaking: clearBreaking } : {}),
+      })) as any;
+      toast.dismiss(t);
+      if (clearMode === "all") toast.success("Queue cleared — fresh ingest triggered");
+      else if (r?.count)
+        toast.success(
+          clearBreaking
+            ? `Cleared ${r.count} lowest-score item(s) (incl. breaking)`
+            : `Cleared ${r.count} lowest-score item(s)`,
+        );
+      else if (!clearBreaking)
+        toast.info(
+          `No non-breaking items to clear — all ${queue.length} queued item(s) are breaking and protected. Tick \"Include breaking\" to clear them.`,
+        );
+      else toast.info("Nothing to clear — queue is empty");
+      setClearOpen(false);
+      // The dashboard re-polls every 5s, so the list refreshes on its own.
+    } catch (e) {
+      toast.dismiss(t);
+      onError(e);
+    } finally {
+      setClearing(false);
+    }
+  };
+
   const publishNow = async (item: any) => {
     if (!pin) return;
     const id = String(item.id ?? item._id);
@@ -146,9 +198,24 @@ function Inbox() {
         title="Inbox"
         hint="What the bot has surfaced — decide, edit, hold or publish."
         action={
-          <Button size="sm" variant="outline" className="h-8 gap-1.5 text-[11px]" onClick={() => setTab("ALL")}>
-            <InboxIcon className="h-3.5 w-3.5" /> Refresh list
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="destructive"
+              className="h-8 gap-1.5 text-[11px]"
+              disabled={queue.length === 0}
+              onClick={() => {
+                setClearMode("x");
+                setClearCount(String(Math.min(50, queue.length || 50)));
+                setClearOpen(true);
+              }}
+            >
+              <Trash2 className="h-3.5 w-3.5" /> Clear
+            </Button>
+            <Button size="sm" variant="outline" className="h-8 gap-1.5 text-[11px]" onClick={() => setTab("ALL")}>
+              <InboxIcon className="h-3.5 w-3.5" /> Refresh list
+            </Button>
+          </div>
         }
       />
 
@@ -251,6 +318,92 @@ function Inbox() {
       ) : null}
 
       <EditQueueItemDialog item={editing} pin={pin} onClose={() => setEditing(null)} />
+
+      {/* Clear queue: all vs. N lowest-score */}
+      <AlertDialog open={clearOpen} onOpenChange={setClearOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Clear queue</AlertDialogTitle>
+            <AlertDialogDescription>
+              {queue.length} item(s) queued ({queue.filter((q) => q.breaking).length} breaking).
+              Clear everything, or drop only the N lowest-scored items — breaking stories are
+              protected unless you opt in below.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-3">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setClearMode("x")}
+                className={`flex-1 rounded-md border px-3 py-2 text-left text-xs font-medium transition-colors ${
+                  clearMode === "x"
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-border text-muted-foreground hover:bg-muted/50"
+                }`}
+              >
+                Clear N lowest-score
+              </button>
+              <button
+                type="button"
+                onClick={() => setClearMode("all")}
+                className={`flex-1 rounded-md border px-3 py-2 text-left text-xs font-medium transition-colors ${
+                  clearMode === "all"
+                    ? "border-destructive bg-destructive/10 text-destructive"
+                    : "border-border text-muted-foreground hover:bg-muted/50"
+                }`}
+              >
+                Clear all
+              </button>
+            </div>
+            {clearMode === "x" ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={queue.length || 1}
+                    value={clearCount}
+                    onChange={(e) => setClearCount(e.target.value)}
+                    className="h-8 w-28 text-xs"
+                  />
+                  <span className="text-[11px] text-muted-foreground">lowest-scored items to drop</span>
+                </div>
+                <div className="flex items-center justify-between gap-2 rounded-md border border-border px-3 py-2">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-foreground">Include breaking items</p>
+                    <p className="text-[10px] text-muted-foreground">
+                      Off: only non-breaking items can be dropped. On: clears across the whole
+                      queue, urgent stories included.
+                    </p>
+                  </div>
+                  <Switch checked={clearBreaking} onCheckedChange={setClearBreaking} className="shrink-0" />
+                </div>
+              </div>
+            ) : (
+              <p className="text-[11px] text-destructive">
+                This wipes every queued item and triggers a fresh fetch. This cannot be undone.
+              </p>
+            )}
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={clearing}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={clearing || (clearMode === "x" && (!clearCount || Number(clearCount) < 1))}
+              onClick={(e) => {
+                e.preventDefault();
+                clearQueue();
+              }}
+            >
+              {clearing
+                ? "Clearing…"
+                : clearMode === "all"
+                  ? "Clear all"
+                  : `Clear ${Math.max(1, Math.floor(Number(clearCount) || 0))}`}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

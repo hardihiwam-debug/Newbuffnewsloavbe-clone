@@ -72,8 +72,8 @@ export const adminApi = {
     paused: boolean;
     reason?: string | null;
   }) => callAdmin<{ ok: true }>("setPauseState", args),
-  clearQueue: (args: { pin?: string }) =>
-    callAdmin<{ ok: boolean; cleared: boolean; ingest: unknown }>("clearQueue", args),
+  clearQueue: (args: { pin?: string; limit?: number; includeBreaking?: boolean }) =>
+    callAdmin<{ ok: boolean; cleared: boolean; count?: number | null; ingest?: unknown }>("clearQueue", args),
   editQueueItem: (args: {
     pin: string;
     id: string;
@@ -99,8 +99,19 @@ export const adminApi = {
     active?: boolean;
     language?: string | null;
     pollsEnabled?: boolean | null;
+    botId?: string | null;
     remove?: boolean;
   }) => callAdmin<{ ok: true }>("updateChat", args),
+  saveBot: (args: {
+    pin: string;
+    id?: string;
+    name?: string;
+    token?: string | null;
+    categories?: string[] | null;
+    enabled?: boolean;
+  }) => callAdmin<{ ok: true }>("saveBot", args),
+  deleteBot: (args: { pin: string; id: string }) =>
+    callAdmin<{ ok: true }>("deleteBot", args),
   addChat: (args: {
     pin: string;
     chatId: number;

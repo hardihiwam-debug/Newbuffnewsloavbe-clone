@@ -33,13 +33,17 @@ const MINIMAX_API_KEY =
 const PIPELINE_INTERNAL_SECRET = Deno.env.get("INTERNAL_SECRET") ?? "";
 const PIPELINE_URL = `${SUPABASE_URL}/functions/v1/pipeline`;
 
-// Supported direct-REST Gemini model chain (kept in sync with the pipeline).
-// Mirrors SUPPORTED_GEMINI_MODELS in src/convex/secrets.ts.
+// Supported translation model chain (kept in sync with the pipeline: the
+// bare ids route through the direct Gemini key pool, google/* and minimax/*
+// through the Vercel AI Gateway).
 const SUPPORTED_GEMINI_MODELS = [
-  "google/gemini-1.5-flash-latest",
-  "google/gemini-1.5-flash-002",
-  "google/gemini-2.0-flash-exp",
-  "minimax/MiniMax-M2",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-flash-lite",
+  "minimax/minimax-m3",
 ];
 
 // ── Errors ──────────────────────────────────────────────────────────────────
@@ -141,6 +145,23 @@ async function logActivity(entry: { type: string; level: string; message: string
 // ── Defaults ────────────────────────────────────────────────────────────────
 // In-memory mirror of the Convex defaults so the dashboard renders even when
 // the settings row is missing (fresh DB right after a wipe).
+// The category set the pipeline's keywordCategory() can assign. Exposed via
+// getDashboard so the bots feature derives its category options from the
+// system instead of hard-coding them in the UI (mirrors CATEGORY_PRIORITY in
+// pipeline/_shared.ts).
+const BOT_CATEGORIES = [
+  "iraq",
+  "war",
+  "iran",
+  "proxies",
+  "middle-east",
+  "analysis",
+  "gold",
+  "usa",
+  "oil",
+  "economic-impact",
+];
+
 const DEFAULT_SETTINGS: Record<string, unknown> = {
   defaultLanguage: "en",
   botPaused: false,
@@ -161,9 +182,6 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   eventCooldownHours: 8,
   eventSimilarityThreshold: 0.52,
   sendDelayMs: 3000,
-  bulletinEnabled: false,
-  bulletinTime: "08:00",
-  bulletinHours: 24,
   translationMode: "gemini_first",
   translationModel: "google/gemini-1.5-flash-latest",
   pollsEnabled: true,
@@ -175,7 +193,6 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   ingestIntervalMinutes: 15,
   publishIntervalMinutes: 10,
   minPostGapMinutes: 1,
-  bulletinIntervalMinutes: 15,
   telegramSignalsIntervalMinutes: 5,
   aiDedupEnabled: true,
   aiDedupMode: "both",
@@ -212,14 +229,31 @@ async function settingsId(): Promise<string | null> {
 // ── Action: getDashboard ────────────────────────────────────────────────────
 async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
   const settings = await getSettings();
-  const [chatsRaw, sourcesRaw, topicsRaw, queueRaw, queueAllRaw, historyRaw] = await Promise.all([
+  const [chatsRaw, sourcesRaw, topicsRaw, queueRaw, queueAllRaw, historyRaw, botsRaw] = await Promise.all([
     rest<unknown[]>("chats", { query: "limit=500" }),
     rest<unknown[]>("sources", { query: "limit=500" }),
     rest<unknown[]>("topic_queries", { query: "limit=500" }),
     rest<unknown[]>("queue", { query: "status=eq.queued&limit=200" }),
     rest<unknown[]>("queue", { query: "order=created_at.desc&limit=300" }),
     rest<unknown[]>("published_history", { query: "order=published_at.desc&limit=200" }),
+    rest<unknown[]>("bots", { query: "limit=50" }),
   ]);
+  // Bot tokens are secrets: the SPA only needs to know whether one is set
+  // (and a masked preview). The raw token must never cross the admin API to
+  // the browser bundle — only the pipeline (service role) reads bots.token.
+  const bots = (snakeArray(botsRaw) as Array<Record<string, unknown>>)
+    .sort((a: any, b: any) =>
+      String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")),
+    )
+    .map((b) => {
+      const rawToken = String(b.token ?? "");
+      const { token: _omit, ...rest } = b;
+      return {
+        ...rest,
+        tokenConfigured: rawToken.length > 0,
+        tokenMasked: rawToken ? `••••${rawToken.slice(-4)}` : null,
+      };
+    });
 
   const chats = snakeArray(chatsRaw).sort((a: any, b: any) =>
     String(b.lastSeenAt ?? "").localeCompare(String(a.lastSeenAt ?? "")),
@@ -391,6 +425,8 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     settings,
     isOwner: true,
     chats,
+    bots,
+    categories: BOT_CATEGORIES,
     sources,
     topics,
     queue: queue.slice(0, 50),
@@ -504,6 +540,7 @@ async function updateChat(p: {
   active?: boolean;
   language?: string | null;
   pollsEnabled?: boolean | null;
+  botId?: string | null;
   remove?: boolean;
 }): Promise<unknown> {
   if (p.remove) {
@@ -515,6 +552,7 @@ async function updateChat(p: {
   if (p.active !== undefined) patch.active = p.active;
   if (p.language !== undefined) patch.language = p.language || null;
   if (p.pollsEnabled !== undefined) patch.polls_enabled = p.pollsEnabled ?? null;
+  if (p.botId !== undefined) patch.bot_id = p.botId || null;
   await rest(`chats?id=eq.${encodeURIComponent(p.id)}`, { method: "PATCH", body: patch, prefer: "return=minimal" });
   await logActivity({
     type: "chat",
@@ -522,6 +560,74 @@ async function updateChat(p: {
     message: "Chat updated",
     detail: Object.keys(patch).map((k) => `${k}=${String(patch[k])}`).join(", ") || undefined,
   });
+  return { ok: true };
+}
+
+// ── Action: bots (N-bot delivery) ─────────────────────────────────────────
+// The operator registers any number of Telegram bots from Settings. Each bot
+// has a name, a token (stored in the DB — the operator explicitly chose
+// Settings-editable over env secrets for additional bots), an optional
+// category whitelist (null/[] = all categories) and an enabled switch.
+async function saveBot(p: {
+  id?: string;
+  name?: string;
+  token?: string | null;
+  categories?: string[] | null;
+  enabled?: boolean;
+}): Promise<unknown> {
+  const name = String(p.name ?? "").trim();
+  const token = String(p.token ?? "").trim();
+  const categories = Array.isArray(p.categories) ? p.categories.filter(Boolean).map(String) : null;
+  if (p.id) {
+    // Update path: only the fields the UI actually sent change. The category
+    // toggle sends { id, categories } with NO name — it must not be rejected
+    // or wipe the stored name.
+    const patch: Record<string, unknown> = {};
+    if (name) patch.name = name;
+    // Token is explicitly clearable: the UI sends token: "" to remove it, so
+    // distinguish "not sent" (undefined → leave unchanged) from "cleared".
+    if (p.token !== undefined) patch.token = token || null;
+    if (p.categories !== undefined) patch.categories = categories;
+    if (p.enabled !== undefined) patch.enabled = Boolean(p.enabled);
+    await rest(`bots?id=eq.${encodeURIComponent(p.id)}`, { method: "PATCH", body: patch, prefer: "return=minimal" });
+    await logActivity({ type: "chat", level: "info", message: `Bot "${name || p.id}" updated` });
+  } else {
+    if (!name) throw new HttpError(400, "Bot name is required");
+    const inserted = await rest<Array<{ id: string }>>("bots", {
+      method: "POST",
+      body: {
+        name,
+        token: token || null,
+        categories,
+        enabled: p.enabled !== false,
+        created_at: new Date().toISOString(),
+      },
+      prefer: "return=representation",
+    });
+    const botId = (inserted as Array<{ id: string }> | null)?.[0]?.id;
+    await logActivity({ type: "chat", level: "info", message: `Bot "${name}" registered` });
+    // The whole point of an additional bot is delivering to chats where it
+    // (not the primary bot) is a member/admin. Auto-discover those chats
+    // right away so the operator's "add token → pick categories" flow starts
+    // delivering without a separate manual sync step. Best-effort: a bot with
+    // no chats yet just contributes zero rows.
+    if (botId && token) {
+      try {
+        await scanBotChats(token, botId, name);
+      } catch (e) {
+        await logActivity({ type: "chat", level: "warning", message: `Chat discovery for bot "${name}" failed: ${e instanceof Error ? e.message : String(e)}` });
+      }
+    }
+  }
+  return { ok: true };
+}
+
+async function deleteBot(p: { id: string }): Promise<unknown> {
+  if (!p.id) throw new HttpError(400, "Bot id is required");
+  await rest(`bots?id=eq.${encodeURIComponent(p.id)}`, { method: "DELETE", prefer: "return=minimal" });
+  // chats.bot_id is ON DELETE SET NULL, so chats assigned to this bot revert to
+  // the primary bot automatically — nothing else to clean up.
+  await logActivity({ type: "chat", level: "info", message: "Bot deleted", detail: p.id });
   return { ok: true };
 }
 
@@ -847,15 +953,82 @@ async function listTranslationModels(_p: Record<string, unknown>): Promise<unkno
 }
 
 // ── Action: telegram helpers ────────────────────────────────────────────────
-async function tgApi(method: string, body?: Record<string, unknown>): Promise<{ ok: boolean; result?: unknown; description?: string }> {
-  if (!TELEGRAM_BOT_TOKEN) throw new HttpError(503, "TELEGRAM_BOT_TOKEN not configured");
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+// `token` defaults to the primary env bot so existing callers are unchanged;
+// the multi-bot sync passes an additional bot's stored token to reach chats
+// where only that bot is a member/admin.
+async function tgApi(method: string, body?: Record<string, unknown>, token = TELEGRAM_BOT_TOKEN): Promise<{ ok: boolean; result?: unknown; description?: string }> {
+  if (!token) throw new HttpError(503, "Telegram bot token not configured");
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(20_000),
   });
   return (await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }))) as any;
+}
+
+// Register every chat visible in one Telegram bot's getUpdates stream. When
+// `botId` is set the new rows carry bot_id so the pipeline routes them through
+// that bot's token + category whitelist; `botId` null = the primary env bot.
+// Existing rows are never stolen or re-pointed — the operator's assignment in
+// Settings wins.
+async function scanBotChats(token: string, botId: string | null, label: string): Promise<{ added: number; scanned: number; error?: string }> {
+  // my_chat_member fires when the bot is added to/removed from a group or
+  // channel — without it, "bot was just made admin" events are missed.
+  const ALLOWED = ["message", "channel_post", "my_chat_member"];
+  let r = await tgApi("getUpdates", { timeout: 0, limit: 100, allowed_updates: ALLOWED }, token);
+  // A bot with an active webhook can't use getUpdates (Telegram rejects the
+  // call). Some bots carry a leftover webhook from an older deployment, which
+  // silently made discovery impossible. Temporarily remove the webhook, poll
+  // once, then restore it exactly as it was (url + allowed_updates + limits).
+  if (!r.ok && /webhook/i.test(String(r.description ?? ""))) {
+    const info = await tgApi("getWebhookInfo", undefined, token);
+    const wh = info?.ok ? (info.result as Record<string, unknown> | null) : null;
+    await tgApi("deleteWebhook", { drop_pending_updates: false }, token).catch(() => {});
+    r = await tgApi("getUpdates", { timeout: 0, limit: 100, allowed_updates: ALLOWED }, token);
+    const url = String(wh?.url ?? "").trim();
+    if (wh && url) {
+      const restore: Record<string, unknown> = { url };
+      if (Array.isArray(wh.allowed_updates)) restore.allowed_updates = wh.allowed_updates;
+      if (Number(wh.max_connections ?? 0) > 0) restore.max_connections = Number(wh.max_connections);
+      await tgApi("setWebhook", restore, token).catch(() => {});
+    }
+  }
+  if (!r.ok) return { added: 0, scanned: 0, error: r.description ?? "getUpdates failed" };
+  const updates = (r.result as any[]) ?? [];
+  let added = 0;
+  for (const u of updates) {
+    const msg = u.message ?? u.channel_post ?? u.edited_channel_post;
+    const mcm = u.my_chat_member as any;
+    const chat = msg?.chat ?? mcm?.chat;
+    if (!chat?.id) continue;
+    // my_chat_member also fires when the bot is REMOVED from a group/channel
+    // — a kicked/left bot cannot post there, so never register it.
+    const mcmStatus = mcm?.new_chat_member?.status;
+    if (mcmStatus === "left" || mcmStatus === "kicked") continue;
+    const cid = Number(chat.id);
+    const exists = await rest<unknown[]>("chats", { query: `chat_id=eq.${cid}&limit=1` });
+    if (Array.isArray(exists) && exists.length > 0) continue;
+    await rest("chats", {
+      method: "POST",
+      body: {
+        chat_id: cid,
+        title: chat.title ?? chat.username ?? null,
+        username: chat.username ?? null,
+        type: chat.type ?? "private",
+        active: true,
+        bot_id: botId,
+        last_seen_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+      prefer: "return=minimal",
+    });
+    added += 1;
+  }
+  if (added > 0) {
+    await logActivity({ type: "chat", level: "info", message: `Discovered ${added} chat(s) for bot "${label}"`, detail: `updates scanned: ${updates.length}` });
+  }
+  return { added, scanned: updates.length };
 }
 
 async function refreshBotInfo(_p: Record<string, unknown>): Promise<unknown> {
@@ -870,37 +1043,45 @@ async function setWebhook(p: { baseUrl: string }): Promise<unknown> {
 }
 
 async function syncBotChats(_p: Record<string, unknown>): Promise<unknown> {
-  const r = await tgApi("getUpdates", { timeout: 0, limit: 100, allowed_updates: ["message", "channel_post"] });
-  if (!r.ok) return { chats: 0, error: r.description ?? "getUpdates failed" };
-  const updates = (r.result as any[]) ?? [];
-  const seen = new Set<number>();
-  let added = 0;
-  for (const u of updates) {
-    const msg = u.message ?? u.channel_post ?? u.edited_channel_post;
-    const chat = msg?.chat;
-    if (!chat?.id) continue;
-    const cid = Number(chat.id);
-    if (seen.has(cid)) continue;
-    seen.add(cid);
-    const exists = await rest<unknown[]>("chats", { query: `chat_id=eq.${cid}&limit=1` });
-    if (Array.isArray(exists) && exists.length > 0) continue;
-    await rest("chats", {
-      method: "POST",
-      body: {
-        chat_id: cid,
-        title: chat.title ?? chat.username ?? null,
-        username: chat.username ?? null,
-        type: chat.type ?? "private",
-        active: true,
-        last_seen_at: new Date().toISOString(),
-        created_at: new Date().toISOString(),
-      },
-      prefer: "return=minimal",
-    });
-    added += 1;
+  // Scan the PRIMARY bot AND every enabled additional bot. A channel where
+  // only an additional bot is admin (e.g. @lodevnewsbo with the "Lodev"
+  // bot) never appears in the primary bot's getUpdates stream, so the old
+  // primary-only sync could never discover it — which is exactly why a
+  // second bot registered with categories still delivered nothing. Chats
+  // found under an additional bot are registered with bot_id so the
+  // pipeline sends them with that bot's token and category whitelist.
+  const botRows = await rest<Array<{ id: string; name?: string | null; token?: string | null; enabled?: boolean | null }>>(
+    "bots",
+    { query: "select=id,name,token,enabled&limit=100" },
+  ).catch(() => []);
+  const targets: Array<{ label: string; token: string; botId: string | null }> = [];
+  if (TELEGRAM_BOT_TOKEN) targets.push({ label: "primary bot", token: TELEGRAM_BOT_TOKEN, botId: null });
+  for (const b of botRows ?? []) {
+    const tok = String(b.token ?? "").trim();
+    if (!tok || b.enabled === false) continue;
+    targets.push({ label: b.name ?? "bot", token: tok, botId: String(b.id) });
   }
-  await logActivity({ type: "system", level: "info", message: `Synced ${added} new chat(s) from Telegram`, detail: `total updates: ${updates.length}` });
-  return { chats: added, scanned: updates.length };
+
+  const errors: string[] = [];
+  let added = 0;
+  let scanned = 0;
+  for (const t of targets) {
+    try {
+      const r = await scanBotChats(t.token, t.botId, t.label);
+      added += r.added;
+      scanned += r.scanned;
+      if (r.error) errors.push(`${t.label}: ${r.error}`);
+    } catch (e) {
+      errors.push(`${t.label}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  await logActivity({
+    type: "system",
+    level: "info",
+    message: `Synced ${added} new chat(s) across ${targets.length} bot(s)`,
+    detail: targets.map((t) => t.label).join(", "),
+  });
+  return { chats: added, scanned, errors };
 }
 
 async function sendTestMessage(p: { chatId: number; message?: string }): Promise<unknown> {
@@ -1175,10 +1356,35 @@ async function runPipeline(p: { action?: string; mode?: string }): Promise<unkno
 }
 
 // ── Action: clearQueue ───────────────────────────────────────────────────────
-// Deletes every queued item, then immediately triggers a fresh ingest so the
-// queue repopulates from current news instead of a stale backlog. Used by the
-// dashboard "Clear queue" button (queue can balloon past 900 items).
-async function clearQueue(_p: Record<string, unknown>): Promise<unknown> {
+// Two modes:
+//   - limit > 0: clear-N — delete only the N lowest-scored queued items (the
+//     mirror image of publish's "breaking first, then highest score" sort).
+//     Breaking items are excluded so urgent stories are never wiped.
+//   - no limit: clear-all — wipe every queued item, then immediately trigger
+//     a fresh ingest so the queue repopulates from current news.
+async function clearQueue(p: { limit?: number | string | null; includeBreaking?: boolean }): Promise<unknown> {
+  const limit = Math.max(0, Math.floor(Number(p?.limit ?? 0) || 0));
+  if (limit > 0) {
+    const breakingFilter = p?.includeBreaking ? "" : "&breaking=eq.false";
+    const victims = await rest<Array<{ id: string }>>("queue", {
+      query: `select=id&status=eq.queued${breakingFilter}&order=score.asc&limit=${Math.min(limit, 500)}`,
+    }).catch(() => []);
+    const ids = (victims ?? []).map((v) => String(v.id)).filter(Boolean);
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      await rest("queue", {
+        method: "DELETE",
+        query: `id=in.(${batch.join(",")})`,
+        prefer: "return=minimal",
+      }).catch(() => {});
+    }
+    await logActivity({
+      type: "admin",
+      level: "warning",
+      message: `Queue trimmed from console: dropped ${ids.length} lowest-score item(s)`,
+    });
+    return { ok: true, cleared: ids.length > 0, count: ids.length };
+  }
   await rest("queue", {
     method: "DELETE",
     query: "status=eq.queued",
@@ -1212,7 +1418,7 @@ async function clearQueue(_p: Record<string, unknown>): Promise<unknown> {
     level: "warning",
     message: "Queue cleared from console (auto-fetch triggered)",
   });
-  return { ok: true, cleared: true, ingest };
+  return { ok: true, cleared: true, count: null, ingest };
 }
 
 // `previewNextBatch` forwards to the pipeline's dry-run preview mode so the
@@ -1362,6 +1568,8 @@ const handlers: Record<string, (p: any) => Promise<unknown>> = {
   setTranslationModel,
   updateChat,
   addChat,
+  saveBot,
+  deleteBot,
   upsertTopic,
   upsertSource,
   listTranslationKeys,

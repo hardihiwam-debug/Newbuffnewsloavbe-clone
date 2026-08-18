@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { RouterProvider } from "@tanstack/react-router";
 import { router } from "./router";
+import { Toaster } from "@/components/ui/sonner";
 import "./styles.css";
 
 // The admin console is fully on Supabase now — no Convex runtime needed.
@@ -10,5 +11,6 @@ import "./styles.css";
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <RouterProvider router={router} />
+    <Toaster position="top-right" richColors closeButton />
   </StrictMode>,
 );

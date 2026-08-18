@@ -1,7 +1,7 @@
 // One-shot: bundle edge function(s) with esbuild, deploy via Management API.
 //   SUPABASE_ACCESS_TOKEN=... SUPABASE_PROJECT_REF=... node scripts/_deploy_fn.mjs <slug...>
-//   e.g. node scripts/_deploy_fn.mjs pipeline admin bulletin
-//   (npm/bun: `bun run deploy:all` deploys pipeline + admin + bulletin)
+//   e.g. node scripts/_deploy_fn.mjs pipeline admin
+//   (npm/bun: `bun run deploy:all` deploys pipeline + admin)
 //
 // Secrets are read from the environment ONLY — never hardcode a token here.
 // Set SUPABASE_ACCESS_TOKEN / SUPABASE_PROJECT_REF via the Freebuff Keys UI

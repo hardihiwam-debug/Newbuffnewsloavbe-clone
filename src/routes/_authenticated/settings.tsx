@@ -8,6 +8,7 @@ import {
   useAdminAction,
 } from "@/lib/supabaseAdminHooks";
 import { AddChat } from "@/components/AddChat";
+import { BotsCard } from "@/components/BotsCard";
 import { AddTelegramChannel, TelegramChannelRow } from "@/components/TelegramChannels";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -51,15 +52,20 @@ import {
   CheckCircle,
   Gauge,
   FileText,
-  BookOpen,
   CalendarClock,
   Package,
+  Bot,
   Vote,
   SlidersHorizontal,
   Send,
   RadioTower,
   Server,
   ShieldCheck,
+  GripVertical,
+  ChevronUp,
+  ChevronDown,
+  ListOrdered,
+  RotateCcw,
 } from "lucide-react";
 import { clearStoredPin, readStoredPin } from "@/routes/index";
 
@@ -309,6 +315,8 @@ function SettingsPage() {
   const saveSettings = useAdminMutation(api.admin.saveSettings);
   const updateChat = useAdminMutation(api.admin.updateChat);
   const addChat = useAdminMutation(api.admin.addChat);
+  const saveBot = useAdminMutation(api.admin.saveBot);
+  const deleteBot = useAdminMutation(api.admin.deleteBot);
   const upsertTopic = useAdminMutation(api.admin.upsertTopic);
   const upsertSource = useAdminMutation(api.admin.upsertSource);
   const upsertTranslationKey = useAdminMutation(api.admin.upsertTranslationKey);
@@ -376,6 +384,42 @@ function SettingsPage() {
     setPostLinks(next);
     save({ postLinks: next });
   };
+  // Translation model order (drag-to-reorder chain). Seeded once from the
+  // server, then kept in local state so the 5s poll can't clobber a drag in
+  // flight. NULL/empty on the server = the default Gemini-first chain.
+  const DEFAULT_MODEL_ORDER = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "google/gemini-2.5-flash", "google/gemini-2.5-flash-lite", "minimax/minimax-m3"];
+  const [modelOrder, setModelOrder] = useState<string[] | null>(null);
+  const [modelOrderSeeded, setModelOrderSeeded] = useState(false);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  useEffect(() => {
+    if (modelOrderSeeded || !data?.settings) return;
+    setModelOrderSeeded(true);
+    const raw = (data.settings as Record<string, any>)?.translationModelOrder;
+    if (Array.isArray(raw) && raw.length > 0) setModelOrder(raw.map((x: unknown) => String(x)));
+  }, [data?.settings, modelOrderSeeded]);
+  const order = modelOrder ?? DEFAULT_MODEL_ORDER;
+  const commitOrder = (next: string[]) => {
+    setModelOrder(next);
+    save({ translationModelOrder: next });
+  };
+  const moveModel = (idx: number, dir: -1 | 1) => {
+    const next = [...order];
+    const target = idx + dir;
+    if (target < 0 || target >= next.length) return;
+    [next[idx], next[target]] = [next[target], next[idx]];
+    commitOrder(next);
+  };
+  const dropModel = (targetIdx: number) => {
+    if (dragIdx === null || dragIdx === targetIdx) {
+      setDragIdx(null);
+      return;
+    }
+    const next = [...order];
+    const [moved] = next.splice(dragIdx, 1);
+    next.splice(targetIdx, 0, moved);
+    setDragIdx(null);
+    commitOrder(next);
+  };
   useEffect(() => {
     if (!pin) return;
     listTranslationModels({ pin }).then((r) => {
@@ -414,6 +458,7 @@ function SettingsPage() {
 
   const s = { ...(data.settings as Record<string, any>), ...optimisticSettings };
   const chats = (data.chats ?? []) as any[];
+  const bots = ((data as any).bots ?? []) as any[];
   const sources = (data.sources ?? []) as any[];
   const topics = (data.topics ?? []) as any[];
   const polls = ((data as any).polls ?? []) as any[];
@@ -462,7 +507,7 @@ function SettingsPage() {
   };
 
   const breakingCats = (s["breakingCategories"] ?? []) as string[];
-  const allCats = ["iran", "oil", "war", "proxies", "usa", "middle-east", "gulf", "nuclear", "sanctions", "gaza", "iraq"];
+  const allCats = ["iran", "oil", "war", "proxies", "usa", "middle-east", "iraq", "analysis", "gold", "economic-impact"];
 
   const toggleBreakingCat = (cat: string) => {
     const next = breakingCats.includes(cat)
@@ -502,7 +547,7 @@ function SettingsPage() {
       </header>
 
       {/* ── Green persistence banner ───────────────── */}
-      <div className="mb-5 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-4 py-2.5 text-[11px] font-medium text-emerald-400">
+      <div className="mb-5 rounded-lg border border-healthy/25 bg-healthy/10 px-4 py-2.5 text-[11px] font-medium text-healthy">
         Every setting saves automatically. Nothing resets on login, refresh, or redeploy.
       </div>
 
@@ -586,6 +631,18 @@ function SettingsPage() {
                 label="Show timestamp"
                 checked={s["postShowTimestamp"] !== false}
                 onChange={(v) => save({ postShowTimestamp: v })}
+              />
+              <CompactToggle
+                label="Show Telegram source names"
+                checked={s["postShowTelegramSource"] !== false}
+                onChange={(v) => save({ postShowTelegramSource: v })}
+                hint="e.g. @ajanews — the channel name under the post"
+              />
+              <CompactToggle
+                label="Show website source names"
+                checked={s["postShowWebSource"] !== false}
+                onChange={(v) => save({ postShowWebSource: v })}
+                hint="e.g. Mehr News — for RSS / NewsData / website sources"
               />
               <CompactToggle
                 label="Telegram link previews"
@@ -682,13 +739,41 @@ function SettingsPage() {
                 min={0}
                 max={120}
               />
+              <Separator className="!my-2" />
+              <p className="text-[11px] font-medium text-muted-foreground">Fetch sources</p>
+              <CompactToggle
+                label="Telegram channels"
+                checked={s["fetchTelegramEnabled"] !== false}
+                onChange={(v) => save({ fetchTelegramEnabled: v })}
+                hint="7 channels — t.me snapshots, the fast lane (~5 min)"
+              />
+              <CompactToggle
+                label="NewsData.io"
+                checked={s["fetchNewsdataEnabled"] !== false}
+                onChange={(v) => save({ fetchNewsdataEnabled: v })}
+                hint="1 source — up to 8 query groups per cycle (200 calls/day)"
+              />
+              <CompactToggle
+                label="Google News RSS"
+                checked={s["fetchGoogleNewsEnabled"] !== false}
+                onChange={(v) => save({ fetchGoogleNewsEnabled: v })}
+                hint="1 source — up to 12 topic queries, last 24h each"
+              />
+              <CompactToggle
+                label="Publisher RSS feeds"
+                checked={s["fetchPublisherFeedsEnabled"] !== false}
+                onChange={(v) => save({ fetchPublisherFeedsEnabled: v })}
+                hint="28 built-in sites — Al Jazeera, BBC, Mehr News, Rudaw, …"
+              />
+              <Separator className="!my-2" />
               <CompactInput
-                label="Daily bulletin check (minutes)"
-                value={s["bulletinIntervalMinutes"] ?? 15}
-                onChange={(v) => save({ bulletinIntervalMinutes: Math.max(1, Number(v) || 15) })}
+                label="Max queue size"
+                value={s["maxQueueSize"] != null ? String(Number(s["maxQueueSize"])) : "150"}
+                onChange={(v) => save({ maxQueueSize: Math.max(0, Math.floor(Number(v) || 0)) })}
+                hint="0 = off · when the backlog exceeds this, the lowest-score non-breaking items are dropped automatically"
                 type="number"
-                min={1}
-                max={1440}
+                min={0}
+                max={2000}
               />
             </div>
           </Card>
@@ -791,33 +876,6 @@ function SettingsPage() {
                 type="number"
                 min={1}
                 max={10}
-              />
-            </div>
-          </Card>
-          )}
-
-          {/* Daily Bulletin */}
-                    {activeTab === "publishing" && (
-<Card icon={BookOpen} title="Daily Bulletin" hint="Auto-generated morning summary">
-            <div className="space-y-3">
-              <CompactInput
-                label="Bulletin time"
-                value={s["bulletinTime"] ?? "00:00"}
-                onChange={(v) => save({ bulletinTime: v })}
-                type="time"
-              />
-              <CompactInput
-                label="Lookback (hours)"
-                value={s["bulletinHours"] ?? 24}
-                onChange={(v) => save({ bulletinHours: Number(v) || 24 })}
-                type="number"
-                min={1}
-                max={72}
-              />
-              <CompactToggle
-                label="Enabled"
-                checked={s["bulletinEnabled"] !== false}
-                onChange={(v) => save({ bulletinEnabled: v })}
               />
             </div>
           </Card>
@@ -1164,6 +1222,64 @@ function SettingsPage() {
           </Card>
           )}
 
+          {/* Translation Model Order */}
+          {activeTab === "translation" && (
+            <Card icon={ListOrdered} title="Translation model order" hint="Tried top to bottom — drag to reorder" className="lg:col-span-3">
+              <div className="space-y-2">
+                <p className="text-[11px] text-muted-foreground">
+                  The first model that answers is used. Gemini models run against every configured Gemini key; MiniMax is the fallback
+                  unless you move it higher. Drag to reorder, or use the arrows — saved instantly.
+                </p>
+                <div className="space-y-1.5">
+                  {order.map((model, i) => (
+                    <div
+                      key={model}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.effectAllowed = "move";
+                        setDragIdx(i);
+                      }}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={() => dropModel(i)}
+                      className={`flex items-center gap-2 rounded-md border px-3 py-2 transition-colors ${
+                        dragIdx === i ? "border-primary/60 bg-primary/5" : "border-border bg-muted/40"
+                      }`}
+                    >
+                      <GripVertical className="h-3.5 w-3.5 shrink-0 cursor-grab text-muted-foreground" />
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-card-foreground">{model}</span>
+                      <span className="shrink-0 text-[10px] text-muted-foreground">#{i + 1}</span>
+                      <button
+                        type="button"
+                        disabled={i === 0}
+                        onClick={() => moveModel(i, -1)}
+                        className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-30"
+                        title="Move up"
+                      >
+                        <ChevronUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={i === order.length - 1}
+                        onClick={() => moveModel(i, 1)}
+                        className="rounded p-1 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-30"
+                        title="Move down"
+                      >
+                        <ChevronDown className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => commitOrder(DEFAULT_MODEL_ORDER)}
+                  className="inline-flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset to default order
+                </button>
+              </div>
+            </Card>
+          )}
+
           {/* Translation API Keys */}
                     {activeTab === "translation" && (
 <Card
@@ -1197,7 +1313,7 @@ function SettingsPage() {
                     </div>
                     <Badge
                       variant="secondary"
-                      className={`text-[10px] shrink-0 ${k.consecutiveFailures > 0 ? "bg-destructive/10 text-destructive" : "bg-emerald-500/10 text-emerald-400"}`}
+                      className={`text-[10px] shrink-0 ${k.consecutiveFailures > 0 ? "bg-destructive/10 text-destructive" : "bg-healthy/10 text-healthy"}`}
                     >
                       {k.consecutiveFailures > 0 ? `${k.consecutiveFailures} fails` : "active"}
                     </Badge>
@@ -1385,9 +1501,9 @@ function SettingsPage() {
                           variant="secondary"
                           className={`text-[10px] ${
                             mm.status === "ok"
-                              ? "bg-emerald-500/10 text-emerald-400"
+                              ? "bg-healthy/10 text-healthy"
                               : mm.status === "rate_limited"
-                                ? "bg-amber-500/10 text-amber-400"
+                                ? "bg-review/10 text-review"
                                 : "bg-destructive/10 text-destructive"
                           }`}
                           title={mm.detail}
@@ -1474,7 +1590,7 @@ function SettingsPage() {
             <div className="space-y-1 max-h-[16rem] overflow-y-auto">
               {translationFailures.length === 0 ? (
                 <p className="text-[11px] text-muted-foreground py-2">
-                  <CheckCircle className="h-3 w-3 inline mr-1 text-emerald-400" />
+                  <CheckCircle className="h-3 w-3 inline mr-1 text-healthy" />
                   All translations passing
                 </p>
               ) : (
@@ -1520,7 +1636,7 @@ function SettingsPage() {
               <div className="flex items-center gap-2">
                 <span
                   className={`inline-flex h-2 w-2 rounded-full ${
-                    botTokenConfigured ? "bg-emerald-500" : "bg-destructive"
+                    botTokenConfigured ? "bg-healthy" : "bg-destructive"
                   }`}
                 />
                 <span className="text-xs font-medium text-foreground">
@@ -1580,12 +1696,29 @@ function SettingsPage() {
           </Card>
           )}
 
+          {/* Bots (N-bot delivery) */}
+                    {activeTab === "telegram" && (
+<Card
+            icon={Bot}
+            title="Bots"
+            hint="Extra bots for category-specific delivery"
+            className="lg:col-span-3"
+          >
+            <BotsCard
+              bots={bots}
+              categories={(data as any).categories ?? []}
+              saveBot={saveBot}
+              deleteBot={deleteBot}
+            />
+          </Card>
+          )}
+
           {/* Chats */}
                     {activeTab === "telegram" && (
 <Card
             icon={MessageCircle}
             title="Chats"
-            hint={`${chats.length} chat${chats.length !== 1 ? "s" : ""}`}
+            hint={`${chats.length} chat${chats.length !== 1 ? "s" : ""} — each chat routes to one bot (Primary bot = env token, all categories)`}
             className="lg:col-span-3"
           >
             <div className="space-y-2">
@@ -1596,7 +1729,11 @@ function SettingsPage() {
                   className="h-8 text-[11px] gap-1"
                   onClick={() =>
                     syncBotChats({ pin })
-                      .then((r: any) => toast.success(`Synced — found ${r?.total ?? 0} chat(s)`))
+                      .then((r: any) =>
+                        toast.success(
+                          `Synced — ${r?.chats ?? 0} new chat(s)${r?.scanned ? ` from ${r.scanned} update(s)` : ""}${r?.errors?.length ? ` · ${r.errors.length} bot error(s)` : ""}`,
+                        ),
+                      )
                       .catch(onError)
                   }
                 >
@@ -1610,7 +1747,7 @@ function SettingsPage() {
               </div>
               <div className="space-y-1 max-h-[20rem] overflow-y-auto">
                 {chats.length === 0 ? (
-                  <p className="text-[11px] text-muted-foreground py-2">No chats registered.</p>
+                  <p className="text-[11px] text-muted-foreground py-2">No chats registered yet — add a chat, or press Sync chats above to auto-discover every bot's channels.</p>
                 ) : (
                   chats.map((c: any) => (
                     <Row key={c._id}>
@@ -1622,6 +1759,22 @@ function SettingsPage() {
                           {c.chatId} · {c.type ?? "private"}
                         </SubText>
                       </div>
+                      <CompactSelect
+                        label=""
+                        value={c.botId ?? ""}
+                        onChange={(v) =>
+                          updateChat({
+                            ...pinArgs,
+                            id: c._id,
+                            botId: v || null,
+                          }).catch(onError)
+                        }
+                        options={[
+                          { value: "", label: "Primary bot" },
+                          ...bots.map((b: any) => ({ value: b._id, label: b.name ?? "Bot" })),
+                        ]}
+                        className="!flex-row items-center gap-1"
+                      />
                       <CompactSelect
                         label=""
                         value={c.language ?? "inherit"}
@@ -1709,7 +1862,7 @@ function SettingsPage() {
                         {p.createdAt ? new Date(p.createdAt).toLocaleString() : ""}
                       </span>
                       <Badge
-                        className={`text-[10px] ${p.closed ? "bg-muted text-muted-foreground" : "bg-emerald-500/10 text-emerald-400"}`}
+                        className={`text-[10px] ${p.closed ? "bg-muted text-muted-foreground" : "bg-healthy/10 text-healthy"}`}
                       >
                         {p.closed ? "Closed" : "Open"}
                       </Badge>
@@ -1759,19 +1912,19 @@ function SettingsPage() {
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Schema</p>
-                <p className={`mt-0.5 text-xs font-medium ${(data as any).schemaMigrations?.ok ? "text-emerald-400" : "text-destructive"}`}>
-                  {(data as any).schemaMigrations?.ok ? "migrations 0001–0011 applied" : "migrations missing — pipeline cannot queue"}
+                <p className={`mt-0.5 text-xs font-medium ${(data as any).schemaMigrations?.ok ? "text-healthy" : "text-destructive"}`}>
+                  {(data as any).schemaMigrations?.ok ? "migrations 0001–0018 applied" : "migrations missing — pipeline cannot queue"}
                 </p>
               </div>
               <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Telegram bot</p>
-                <p className={`mt-0.5 text-xs font-medium ${(data as any).botConfigured ? "text-emerald-400" : "text-destructive"}`}>
+                <p className={`mt-0.5 text-xs font-medium ${(data as any).botConfigured ? "text-healthy" : "text-destructive"}`}>
                   {(data as any).botConfigured ? "token configured" : "no token"}
                 </p>
               </div>
               <div className="rounded-lg border border-border bg-muted/40 px-3 py-2.5">
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground">NewsData</p>
-                <p className={`mt-0.5 text-xs font-medium ${(data as any).newsdataConfigured ? "text-emerald-400" : "text-muted-foreground"}`}>
+                <p className={`mt-0.5 text-xs font-medium ${(data as any).newsdataConfigured ? "text-healthy" : "text-muted-foreground"}`}>
                   {(data as any).newsdataConfigured ? "API key set" : "no key"}
                 </p>
               </div>
@@ -1791,7 +1944,7 @@ function SettingsPage() {
               </div>
             </div>
           </Card>
-          <Card icon={Clock} title="Scheduler (pg_cron)" hint="Automatic pipeline + bulletin ticker" className="lg:col-span-3">
+          <Card icon={Clock} title="Scheduler (pg_cron)" hint="Automatic pipeline ticker" className="lg:col-span-3">
             {(() => {
               const jobs = ((data as any).cronHealth ?? []) as any[];
               if (!jobs.length) {
@@ -1808,7 +1961,7 @@ function SettingsPage() {
                     const failed = status === "failed";
                     const ok = ["succeeded", "running", "starting", "sending", "connecting"].includes(status);
                     const stateLabel = !j.active ? "inactive" : status || "no runs yet";
-                    const stateClass = !j.active || failed ? "text-destructive" : ok ? "text-emerald-400" : "text-muted-foreground";
+                    const stateClass = !j.active || failed ? "text-destructive" : ok ? "text-healthy" : "text-muted-foreground";
                     return (
                       <div key={j.jobname} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-muted/40 px-3 py-2.5">
                         <div className="min-w-0">
@@ -1836,7 +1989,7 @@ function SettingsPage() {
           <Card icon={ShieldCheck} title="Security" hint="How this console is protected" className="lg:col-span-2">
             <div className="space-y-3">
               <div className="flex items-center gap-2">
-                <span className="inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+                <span className="inline-flex h-2 w-2 rounded-full bg-healthy" />
                 <span className="text-xs font-medium text-foreground">PIN-secured session active</span>
               </div>
               <p className="text-[11px] text-muted-foreground">
@@ -1965,7 +2118,9 @@ function AddTopicButton({
               "war",
               "oil",
               "middle-east",
-              "nuclear",
+              "analysis",
+              "gold",
+              "economic-impact",
             ].map((c) => ({ value: c, label: c }))}
           />
         </div>
