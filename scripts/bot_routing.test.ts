@@ -36,3 +36,14 @@ test("no overlap → false (bot skips the article)", () => {
 test("partial overlap of a multi-category whitelist → true", () => {
   expect(botMatchesCategories(["iraq", "oil"], "iran", "Tehran hits a refinery near Basra")).toBe(true);
 });
+
+test("a gaza-whitelisted bot receives Gaza items (EN and Arabic)", () => {
+  expect(botMatchesCategories(["gaza"], "gaza", "Israeli airstrike on Gaza school kills 12")).toBe(true);
+  expect(botMatchesCategories(["gaza"], "war", "شهداء وجرحى في قصف إسرائيلي على مخيم جباليا")).toBe(true);
+  expect(botMatchesCategories(["gaza"], "lebanon", "Hezbollah fires rockets at northern Israel")).toBe(false);
+});
+
+test("a syria-whitelisted bot receives Syria items, not Gaza", () => {
+  expect(botMatchesCategories(["syria"], "syria", "Turkish airstrike hits Kurdish positions in northern Syria")).toBe(true);
+  expect(botMatchesCategories(["syria"], "gaza", "Israeli airstrike on Gaza school kills 12")).toBe(false);
+});

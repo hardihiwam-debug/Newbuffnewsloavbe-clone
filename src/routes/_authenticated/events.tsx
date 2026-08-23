@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
-import { GitBranch, Radio } from "lucide-react";
+import { ChevronDown, GitBranch, Radio } from "lucide-react";
 import { useNewsroomData } from "@/components/AppShell";
 import { CategoryPill, SectionTitle, StatusPill, EmptyState, clockTime, relTime } from "@/components/newsroom";
 
@@ -15,12 +15,19 @@ export const Route = createFileRoute("/_authenticated/events")({
   component: Events,
 });
 
+// Visible cluster cards before the "show all" toggle — keeps the column from
+// turning into an endless feed on busy days.
+const CLUSTERS_AT_A_GLANCE = 12;
+// Timeline rows rendered before the "+N older" collapse.
+const TIMELINE_LIMIT = 30;
+
 function Events() {
   const data = useNewsroomData();
   const clusters = (data?.clusters ?? []) as any[];
   const queueAll = (data?.queueAll ?? []) as any[];
   const history = (data?.history ?? []) as any[];
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
 
   // Timeline = queue + published rows that share the cluster's event_id.
   const timeline = (eventId: string) => {
@@ -35,6 +42,7 @@ function Events() {
   };
 
   const selected = clusters.find((c) => String(c.id ?? c._id) === selectedId) ?? null;
+  const visibleClusters = showAll ? clusters.slice(0, 40) : clusters.slice(0, CLUSTERS_AT_A_GLANCE);
 
   if (clusters.length === 0) {
     return (
@@ -51,11 +59,13 @@ function Events() {
       <div className="grid gap-4 lg:grid-cols-2">
         {/* ── Event list ────────────────────────────── */}
         <div className="space-y-2">
-          {clusters.slice(0, 40).map((c: any) => {
+          {visibleClusters.map((c: any) => {
             const active = String(c.id ?? c._id) === selectedId;
             const posts = Number(c.postCount ?? 1);
             const t = timeline(String(c.eventId ?? c.event_id ?? ""));
             const hours = c.lastSeenAt ? Math.max(0, Math.round((Date.now() - Date.parse(c.lastSeenAt)) / 3_600_000)) : null;
+            const title = c.label ?? c.lastHeadline ?? "Untitled event";
+            const last = c.lastHeadline && c.lastHeadline !== title ? c.lastHeadline : null;
             return (
               <button
                 key={c.id ?? c._id}
@@ -65,18 +75,37 @@ function Events() {
               >
                 <div className="flex items-center gap-2">
                   <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${hours !== null && hours <= 6 ? "bg-healthy" : "bg-review"}`} />
-                  <p className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">{c.label ?? c.lastHeadline ?? "Untitled event"}</p>
+                  <p className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground" title={title}>{title}</p>
                   {c.category ? <CategoryPill category={c.category} /> : null}
                 </div>
                 <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
                   <span>{posts} post{posts === 1 ? "" : "s"}</span>
                   <span>{t.length} timeline item{t.length === 1 ? "" : "s"}</span>
                   {hours !== null ? <span>{hours}h ago</span> : null}
-                  {c.lastHeadline ? <span className="truncate text-muted-foreground/70">last: {c.lastHeadline}</span> : null}
                 </div>
+                {/* "last:" lives on its own truncating line — a span with
+                    truncate inside a flex-wrap row cannot shrink, so a long
+                    headline used to blow the card out horizontally. */}
+                {last ? (
+                  <p className="mt-1 truncate text-[11px] text-muted-foreground/70" title={last}>
+                    last: {last}
+                  </p>
+                ) : null}
               </button>
             );
           })}
+          {clusters.length > CLUSTERS_AT_A_GLANCE ? (
+            <button
+              type="button"
+              onClick={() => setShowAll((v) => !v)}
+              className="flex w-full items-center justify-center gap-1.5 rounded-[6px] border border-dashed border-border px-4 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+            >
+              <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showAll ? "rotate-180" : ""}`} />
+              {showAll
+                ? `Show fewer`
+                : `Show all ${clusters.length} cluster${clusters.length === 1 ? "" : "s"}`}
+            </button>
+          ) : null}
         </div>
 
         {/* ── Timeline ──────────────────────────────── */}
@@ -84,28 +113,42 @@ function Events() {
           {selected ? (
             <div className="panel px-4 py-3">
               <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Timeline</p>
-              <h2 className="mt-1 text-[15px] font-bold leading-snug text-foreground">{selected.label ?? selected.lastHeadline ?? "Event"}</h2>
+              <h2 className="mt-1 font-display text-[15px] font-bold leading-snug text-foreground">{selected.label ?? selected.lastHeadline ?? "Event"}</h2>
               <p className="mt-0.5 text-[11px] text-muted-foreground">
                 {String(selected.eventId ?? selected.event_id ?? "").slice(0, 48)}
                 {selected.firstSeenAt ? ` · first seen ${relTime(selected.firstSeenAt)}` : ""}
               </p>
               <div className="mt-3 space-y-0">
-                {timeline(String(selected.eventId ?? selected.event_id ?? "")).map((row, idx) => {
-                  const it = row.item;
+                {(() => {
+                  const rows = timeline(String(selected.eventId ?? selected.event_id ?? ""));
+                  const shown = rows.slice(0, TIMELINE_LIMIT);
+                  const hidden = rows.length - shown.length;
                   return (
-                    <div key={`${row.kind}-${it.id ?? it._id ?? idx}`} className="relative flex gap-3 pb-3 pl-4">
-                      <span className={`absolute left-0 top-1.5 h-1.5 w-1.5 rounded-full ${row.kind === "published" ? "bg-healthy" : "bg-info"}`} />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <StatusPill status={row.kind === "published" ? "published" : it.breaking ? "breaking" : it.isUpdate ? "update" : "queued"} />
-                          <span className="text-[10px] tabular-nums text-muted-foreground">{clockTime(row.at)}</span>
-                        </div>
-                        <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">{it.headline ?? it.englishHeadline ?? ""}</p>
-                        <p className="text-[11px] text-muted-foreground">{it.sourceName ?? "--"}</p>
-                      </div>
-                    </div>
+                    <>
+                      {shown.map((row, idx) => {
+                        const it = row.item;
+                        return (
+                          <div key={`${row.kind}-${it.id ?? it._id ?? idx}`} className="relative flex gap-3 pb-3 pl-4">
+                            <span className={`absolute left-0 top-1.5 h-1.5 w-1.5 rounded-full ${row.kind === "published" ? "bg-healthy" : "bg-info"}`} />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <StatusPill status={row.kind === "published" ? "published" : it.breaking ? "breaking" : it.isUpdate ? "update" : "queued"} />
+                                <span className="text-[10px] tabular-nums text-muted-foreground">{clockTime(row.at)}</span>
+                              </div>
+                              <p className="mt-1 text-[13px] font-medium leading-snug text-foreground">{it.headline ?? it.englishHeadline ?? ""}</p>
+                              <p className="text-[11px] text-muted-foreground">{it.sourceName ?? "--"}</p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {hidden > 0 ? (
+                        <p className="pb-3 text-[11px] text-muted-foreground">
+                          +{hidden} older timeline item{hidden === 1 ? "" : "s"} (collapsed)
+                        </p>
+                      ) : null}
+                    </>
                   );
-                })}
+                })()}
                 {timeline(String(selected.eventId ?? selected.event_id ?? "")).length === 0 ? (
                   <p className="flex items-center gap-2 py-6 text-xs text-muted-foreground">
                     <Radio className="h-3.5 w-3.5" /> No queue/published rows carry this event id yet — the cluster was created by the pipeline's event matcher.

@@ -132,6 +132,91 @@ test("media with a non-image content-type is rejected (no store)", async () => {
   expect(stored.length).toBe(0);
 });
 
+test("/fetch requires auth (401 without key)", async () => {
+  const res = await worker.fetch(
+    new Request("https://worker.test/fetch?url=https%3A%2F%2Fexample.com%2Ffeed.xml"),
+    makeEnv(),
+  );
+  expect(res.status).toBe(401);
+});
+
+test("/fetch relays a feed URL with cache-control and content-type", async () => {
+  let called: string | null = null;
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    called = String(input);
+    return new Response("<rss><channel><title>t</title></channel></rss>", {
+      status: 200,
+      headers: { "content-type": "application/rss+xml; charset=utf-8" },
+    });
+  };
+  const res = await worker.fetch(
+    new Request("https://worker.test/fetch?url=https%3A%2F%2Fexample.com%2Ffeed.xml&ttl=600", {
+      headers: { "x-relay-key": RELAY_KEY },
+    }),
+    makeEnv(),
+  );
+  expect(res.status).toBe(200);
+  expect(await res.text()).toBe("<rss><channel><title>t</title></channel></rss>");
+  expect(called).toBe("https://example.com/feed.xml");
+  expect(res.headers.get("cache-control")).toBe("public, max-age=600");
+  expect(res.headers.get("x-relay")).toBe("cloudflare");
+  expect(String(res.headers.get("content-type"))).toContain("application/rss+xml");
+});
+
+test("/fetch caches a miss and serves a hit without touching upstream", async () => {
+  let upstreamCalled = 0;
+  let putKey: string | null = null;
+  const cacheStore = new Map<string, Response>();
+  (globalThis as unknown as { caches: unknown }).caches = {
+    default: {
+      match: async (req: Request) => cacheStore.get(req.url) ?? null,
+      put: async (req: Request, res: Response) => {
+        putKey = req.url;
+        cacheStore.set(req.url, res);
+      },
+    },
+  };
+  globalThis.fetch = async () => {
+    upstreamCalled += 1;
+    return new Response("<rss>fresh</rss>", { status: 200, headers: { "content-type": "application/rss+xml" } });
+  };
+
+  const url = "https://worker.test/fetch?url=https%3A%2F%2Fexample.com%2Ffeed.xml&ttl=600";
+  const first = await worker.fetch(new Request(url, { headers: { "x-relay-key": RELAY_KEY } }), makeEnv());
+  expect(first.status).toBe(200);
+  expect(await first.text()).toBe("<rss>fresh</rss>");
+  expect(upstreamCalled).toBe(1);
+  expect(putKey).toBe("https://example.com/feed.xml");
+
+  const second = await worker.fetch(new Request(url, { headers: { "x-relay-key": RELAY_KEY } }), makeEnv());
+  expect(second.status).toBe(200);
+  expect(second.headers.get("x-cache")).toBe("hit");
+  expect(await second.text()).toBe("<rss>fresh</rss>");
+  expect(upstreamCalled).toBe(1); // still 1 — served from cache
+
+  delete (globalThis as unknown as { caches: unknown }).caches;
+});
+
+test("/fetch rejects non-http URLs", async () => {
+  const res = await worker.fetch(
+    new Request("https://worker.test/fetch?url=ftp%3A%2F%2Fexample.com%2Fx", { headers: { "x-relay-key": RELAY_KEY } }),
+    makeEnv(),
+  );
+  expect(res.status).toBe(400);
+  expect((await json(res)).error).toBe("bad url");
+});
+
+test("/fetch clamps ttl to a sane range", async () => {
+  globalThis.fetch = async () => new Response("x", { status: 200, headers: { "content-type": "text/plain" } });
+  const clamped = await worker.fetch(
+    new Request("https://worker.test/fetch?url=https%3A%2F%2Fexample.com%2Ff&ttl=99999999", {
+      headers: { "x-relay-key": RELAY_KEY },
+    }),
+    makeEnv(),
+  );
+  expect(clamped.headers.get("cache-control")).toBe("public, max-age=86400");
+});
+
 test("oversized media is rejected (10MB image cap)", async () => {
   const bucket: Bucket = { get: async () => null, put: async () => {} };
   const big = new Uint8Array(11 * 1024 * 1024);

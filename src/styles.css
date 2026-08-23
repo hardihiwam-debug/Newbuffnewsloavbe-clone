@@ -63,11 +63,17 @@
   --color-review: var(--review);
   --color-healthy: var(--healthy);
   --color-info: var(--info);
+  --font-display: var(--font-display);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
 }
 
 :root {
   /* Radius: 6-10px band, not heavy rounding */
   --radius: 0.375rem;
+  /* Editorial serif for brand moments (wordmark, page headlines) — system
+     stack, no network dependency. Body stays the app sans. */
+  --font-display: "Georgia", "Times New Roman", ui-serif, serif;
   /* Light newsroom desk — near-white, cool-neutral, flat surfaces */
   --background: oklch(0.975 0.004 262);
   --foreground: oklch(0.21 0.02 262);
@@ -107,6 +113,11 @@
   --review: oklch(0.68 0.13 80);
   --healthy: oklch(0.56 0.13 155);
   --info: oklch(0.55 0.12 245);
+  /* Brand accent — deep editorial oxblood, reserved for the logo mark and
+     identity moments only. Deliberately deeper than the breaking status red
+     so the two never read as the same color. */
+  --brand: oklch(0.42 0.13 25);
+  --brand-foreground: oklch(0.98 0.01 25);
 }
 
 .dark {
@@ -146,6 +157,8 @@
   --review: oklch(0.72 0.14 80);
   --healthy: oklch(0.68 0.14 155);
   --info: oklch(0.62 0.12 245);
+  --brand: oklch(0.68 0.14 25);
+  --brand-foreground: oklch(0.16 0.014 262);
 }
 
 @layer base {

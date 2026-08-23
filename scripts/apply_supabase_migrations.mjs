@@ -125,9 +125,41 @@ const files = [
   "supabase/migrations/0021_post_source_toggles.sql",
   "supabase/migrations/0022_fetch_source_toggles.sql",
   "supabase/migrations/0023_queue_trim.sql",
+  "supabase/migrations/0024_dashboard_aggregates.sql",
+  "supabase/migrations/0025_primary_bot_exclusions.sql",
+  "supabase/migrations/0026_rewrite_log.sql",
+  "supabase/migrations/0027_admin_pin_lockout.sql",
+  "supabase/migrations/0028_state_fingerprints.sql",
+  "supabase/migrations/0029_rewrite_preview_analytics.sql",
+  "supabase/migrations/0030_state_fingerprint_coverage.sql",
+  "supabase/migrations/0031_scheduled_posts.sql",
+  "supabase/migrations/0032_conflict_categories.sql",
+  "supabase/migrations/0033_auto_hashtag.sql",
+  "supabase/migrations/0034_analysis_followups_source_tiers.sql",
+  "supabase/migrations/0035_queue_dedup_and_campaign_status.sql",
+  "supabase/migrations/0036_writing_styles.sql",
+  "supabase/migrations/0037_hashtag_rules.sql",
+  "supabase/migrations/0038_lock_ownership.sql",
+  "supabase/migrations/0039_auto_style_and_source_tier.sql",
+  "supabase/migrations/0040_disable_why_it_matters_by_default.sql",
+  "supabase/migrations/0041_category_policies.sql",
+  "supabase/migrations/0042_category_priority_parity.sql",
+  "supabase/migrations/0043_publish_delete.sql",
+  "supabase/migrations/0044_age_limits.sql",
+  "supabase/migrations/0045_cron_1min.sql",
+  "supabase/migrations/0046_cron_customizable.sql",
+  "supabase/migrations/0047_english_summary.sql",
+  "supabase/migrations/0048_summary_source_routing.sql",
+  "supabase/migrations/0049_ai_control_plane.sql",
 ];
+// Optional positional filter: `node scripts/apply_supabase_migrations.mjs 0034`
+// applies only the migration(s) whose path contains the argument (e.g. a
+// single new migration), instead of re-running the whole idempotent-but-slow
+// sequence from 0001.
+const filter = process.argv[2];
+const targets = filter ? files.filter((f) => f.includes(filter)) : files;
 let failed = 0;
-for (const file of files) {
+for (const file of targets) {
   const sql = readFileSync(file, "utf8");
   const statements = splitStatements(sql);
   for (const stmt of statements) {
@@ -145,6 +177,16 @@ for (const file of files) {
       console.error(`ERR ${file}: ${stmt.replace(/\s+/g, " ").slice(0, 120)}\n    -> ${res.status} ${err.slice(0, 400)}`);
     }
   }
+}
+// PostgREST caches the schema and does not observe DDL run through the
+// Management API — without this, a migration that creates an RPC function is
+// invisible to PostgREST (PGRST202) until something else reloads the cache.
+if (failed === 0) {
+  await fetch(`https://api.supabase.com/v1/projects/${REF}/database/query`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "notify pgrst, 'reload schema';" }),
+  }).catch(() => {});
 }
 console.log(failed === 0 ? "ALL MIGRATIONS APPLIED" : `DONE WITH ${failed} ERROR(S)`);
 process.exit(failed === 0 ? 0 : 1);

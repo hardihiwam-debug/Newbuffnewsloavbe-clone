@@ -11,6 +11,13 @@
 //                                          returns { ok, url } = public R2 URL;
 //                                          Telegram then pulls the bytes from
 //                                          Cloudflare instead of Supabase
+//   GET /fetch?url=<https://...>&ttl=N   → fetches any URL (RSS/XML feeds)
+//                                          and serves it from the worker's
+//                                          Cache API for ttl seconds, so the
+//                                          pipeline's repeated feed polls
+//                                          (Google News RSS, publisher feeds)
+//                                          are served by Cloudflare instead
+//                                          of Supabase egress
 //   GET /health                          → { ok: true } (no auth)
 //
 // Parsing of the relayed HTML happens in the pipeline (unchanged), so moving
@@ -25,7 +32,7 @@ const HTML_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q
 // Public R2 dev URL for the "newsbuff" bucket (Telegram fetches media from here).
 const PUBLIC_R2_BASE = "https://pub-3c710d357ec24002b36e40f443b4394f.r2.dev";
 
-const counters = { channel: 0, post: 0, article: 0, media: 0, mediaCacheHit: 0, rejected: 0 };
+const counters = { channel: 0, post: 0, article: 0, media: 0, mediaCacheHit: 0, fetch: 0, fetchCacheHit: 0, rejected: 0 };
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -58,6 +65,54 @@ async function relayHtml(targetUrl) {
       "x-relay": "cloudflare",
     },
   });
+}
+
+// Generic TTL fetch for the pipeline's RSS/feed polls. The worker's Cache
+// API stores the response with `Cache-Control: max-age=<ttl>` (which the
+// default cache honors for expiry), so repeated polls of the same URL are
+// served from Cloudflare's cache — the Supabase edge function never sees the
+// bytes again until the TTL lapses. Falls back to a plain fetch when the
+// Cache API is unavailable (e.g. unit tests).
+async function fetchWithTtl(targetUrl, ttlSeconds) {
+  const ttl = Math.max(1, Math.min(Number.isFinite(ttlSeconds) && ttlSeconds > 0 ? ttlSeconds : 300, 86400));
+  const cacheKey = new Request(targetUrl, { method: "GET" });
+  try {
+    if (typeof caches !== "undefined") {
+      const hit = await caches.default.match(cacheKey);
+      if (hit) {
+        counters.fetchCacheHit += 1;
+        return new Response(hit.body, {
+          status: hit.status,
+          headers: { "content-type": hit.headers.get("content-type") || "text/plain; charset=utf-8", "x-relay": "cloudflare", "x-cache": "hit" },
+        });
+      }
+    }
+  } catch {
+    /* cache unavailable — fetch through */
+  }
+  const res = await fetch(targetUrl, {
+    headers: {
+      "user-agent": UA,
+      accept: "application/rss+xml, application/xml;q=0.9, text/html;q=0.8, */*;q=0.7",
+      "accept-language": "en-US,en;q=0.9",
+    },
+    redirect: "follow",
+  });
+  if (!res.ok) return new Response(`upstream ${res.status}`, { status: res.status });
+  const body = await res.text();
+  const out = new Response(body, {
+    headers: {
+      "content-type": res.headers.get("content-type") || "text/plain; charset=utf-8",
+      "cache-control": `public, max-age=${ttl}`,
+      "x-relay": "cloudflare",
+    },
+  });
+  try {
+    if (typeof caches !== "undefined") await caches.default.put(cacheKey, out.clone());
+  } catch {
+    /* cache unavailable */
+  }
+  return out;
 }
 
 async function cacheMedia(bucket, mediaUrl, kind) {
@@ -122,6 +177,13 @@ export default {
         }
         counters.article += 1;
         return await relayHtml(articleUrl);
+      }
+      if (path === "/fetch") {
+        const targetUrl = url.searchParams.get("url") || "";
+        const ttl = Number(url.searchParams.get("ttl") || "300");
+        if (!/^https?:\/\//i.test(targetUrl)) return json({ ok: false, error: "bad url" }, 400);
+        counters.fetch += 1;
+        return await fetchWithTtl(targetUrl, ttl);
       }
       if (path === "/tg/media") {
         const mediaUrl = url.searchParams.get("url") || "";

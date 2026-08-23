@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { Eye, Pause, Play, RefreshCw, AlertTriangle, Radio, SendHorizonal, CheckCircle2, GitBranch, Inbox } from "lucide-react";
+import { Eye, Pause, Play, RefreshCw, AlertTriangle, Radio, SendHorizonal, CheckCircle2, GitBranch, Inbox, Activity, Cpu, Database, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { api, useAdminAction, useAdminMutation, useAdminQuery } from "@/lib/supabaseAdminHooks";
 import { adminApi } from "@/lib/adminApi";
@@ -280,6 +280,10 @@ function Overview() {
         <Kpi value={sourceFailures} label="Source failures" tone={sourceFailures > 0 ? "danger" : "neutral"} />
       </div>
 
+      <ControlCenter data={data} paused={paused} queued={Number(data.queuedTotal ?? queuedItems.length)} />
+
+      <SourceTrustPanel sources={(data as any).sourceTrust ?? []} note={(data as any).sourceTrustNote} />
+
       {/* ── Newsroom feed ───────────────────────────── */}
       <div className="mt-6">
         <SectionTitle
@@ -339,6 +343,130 @@ function Overview() {
 
       {/* Preview dialog */}
       <PreviewDialog open={previewOpen} onOpenChange={setPreviewOpen} preview={preview} />
+    </div>
+  );
+}
+
+function stageLabel(value: string): { label: string; tone: "healthy" | "review" | "danger" | "neutral" } {
+  if (value === "running") return { label: "Running", tone: "healthy" };
+  if (value === "stopped" || value === "paused") return { label: value === "paused" ? "Paused" : "Stopped", tone: "danger" };
+  if (value === "quota-limited") return { label: "Quota limited", tone: "review" };
+  return { label: "Waiting", tone: "neutral" };
+}
+
+function ControlCenter({ data, paused, queued }: { data: any; paused: boolean; queued: number }) {
+  const control = (data?.controlCenter ?? {}) as any;
+  const stages = (control.stages ?? {}) as Record<string, string>;
+  const usage = (data?.usage ?? {}) as any;
+  const ai = (usage.ai ?? data?.aiUsage24h ?? {}) as any;
+  const supabase = usage.supabase as { tracked?: boolean; note?: string } | undefined;
+  const provider = String(data?.currentProvider ?? data?.settings?.translationMode ?? "unknown").replace(/_/g, " ");
+  const model = String(data?.currentModel ?? data?.settings?.translationModel ?? "unknown");
+  const lastCycle = control.lastSuccessfulCycle ? new Date(control.lastSuccessfulCycle) : null;
+  const lastCycleLabel = lastCycle && !Number.isNaN(lastCycle.getTime()) ? relTime(control.lastSuccessfulCycle) + " ago" : "No completed cycle";
+  const stageRows = [
+    { key: "ingest", label: "Ingest", icon: Radio },
+    { key: "rewrite", label: "Rewrite", icon: Activity },
+    { key: "translation", label: "Translation", icon: Cpu },
+    { key: "publish", label: "Publish", icon: SendHorizonal },
+  ];
+  return (
+    <div className="mt-6 panel px-4 py-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Operations</p>
+          <h2 className="mt-1 text-[16px] font-bold text-foreground">Pipeline control center</h2>
+        </div>
+        <span className={`flex items-center gap-1.5 text-[11px] font-medium ${paused ? "text-destructive" : "text-healthy"}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${paused ? "bg-destructive" : "bg-healthy"}`} />
+          {paused ? "Automation stopped" : "Automation available"}
+        </span>
+      </div>
+      <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {stageRows.map(({ key, label, icon: Icon }) => {
+          const status = stageLabel(String(stages[key] ?? "waiting"));
+          const tone = status.tone === "healthy" ? "text-healthy" : status.tone === "danger" ? "text-destructive" : status.tone === "review" ? "text-review" : "text-muted-foreground";
+          return (
+            <div key={key} className="flex items-center gap-2 rounded-[6px] border border-border bg-muted/20 px-3 py-2.5">
+              <Icon className={`h-3.5 w-3.5 shrink-0 ${tone}`} />
+              <span className="min-w-0 flex-1 text-xs font-medium text-foreground">{label}</span>
+              <span className={`text-[10px] font-medium ${tone}`}>{status.label}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-4 grid gap-3 border-t border-border pt-3 sm:grid-cols-2 lg:grid-cols-5">
+        <ControlMetric icon={Inbox} label="Queue" value={String(queued)} />
+        <ControlMetric icon={CheckCircle2} label="Last successful cycle" value={lastCycleLabel} />
+        <ControlMetric icon={Cpu} label="Provider / model" value={`${provider} · ${model}`} />
+        <ControlMetric icon={Activity} label="AI usage today" value={`${Number(ai.calls ?? 0).toLocaleString()} calls · ${(Number(ai.promptTokens ?? 0) + Number(ai.completionTokens ?? 0)).toLocaleString()} tokens`} />
+        <ControlMetric icon={Database} label="Supabase usage" value={supabase?.tracked ? "Tracked" : "Not available"} hint={supabase?.note} />
+      </div>
+    </div>
+  );
+}
+
+function ControlMetric({ icon: Icon, label, value, hint }: { icon: typeof Inbox; label: string; value: string; hint?: string }) {
+  return (
+    <div className="min-w-0" title={hint}>
+      <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground"><Icon className="h-3 w-3" />{label}</p>
+      <p className="mt-1 truncate text-xs font-medium text-foreground">{value}</p>
+    </div>
+  );
+}
+
+function SourceTrustPanel({ sources, note }: { sources: any[]; note?: string }) {
+  const statusMeta: Record<string, { label: string; cls: string }> = {
+    trusted: { label: "Trusted", cls: "border-healthy/40 bg-healthy/10 text-healthy" },
+    normal: { label: "Normal", cls: "border-border bg-muted/40 text-muted-foreground" },
+    degraded: { label: "Degraded", cls: "border-review/40 bg-review/10 text-review" },
+    temporarily_muted: { label: "Temporarily muted", cls: "border-destructive/40 bg-destructive/10 text-destructive" },
+  };
+  return (
+    <div className="mt-4 panel px-4 py-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">Source intelligence</p>
+          <h2 className="mt-1 text-[16px] font-bold text-foreground">Adaptive source trust</h2>
+        </div>
+        <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+      </div>
+      {sources.length === 0 ? (
+        <p className="mt-3 text-xs text-muted-foreground">No source trust data yet.</p>
+      ) : (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full min-w-[680px] text-left text-[11px]">
+            <thead className="border-b border-border text-[10px] uppercase tracking-wider text-muted-foreground">
+              <tr>
+                <th className="pb-2 pr-3 font-medium">Source</th>
+                <th className="pb-2 pr-3 font-medium">Trust</th>
+                <th className="pb-2 pr-3 font-medium">Useful</th>
+                <th className="pb-2 pr-3 font-medium">Rejected</th>
+                <th className="pb-2 pr-3 font-medium">Acceptance</th>
+                <th className="pb-2 pr-3 font-medium">Fetch failures</th>
+                <th className="pb-2 font-medium">Other rates</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sources.map((source: any) => {
+                const meta = statusMeta[String(source.status)] ?? statusMeta.normal;
+                return (
+                  <tr key={String(source.id ?? source.name)} className="border-b border-border/60 last:border-0">
+                    <td className="max-w-[180px] truncate py-2.5 pr-3 font-medium text-foreground">{source.name}</td>
+                    <td className="py-2.5 pr-3"><span className={`inline-flex whitespace-nowrap rounded-[4px] border px-1.5 py-0.5 text-[10px] font-medium ${meta.cls}`}>{meta.label}</span></td>
+                    <td className="py-2.5 pr-3 tabular-nums text-foreground">{source.usefulArticles ?? 0}</td>
+                    <td className="py-2.5 pr-3 tabular-nums text-foreground">{source.rejectedArticles ?? 0}</td>
+                    <td className="py-2.5 pr-3 tabular-nums text-foreground">{source.acceptanceRate === null ? "—" : `${source.acceptanceRate}%`}</td>
+                    <td className={`py-2.5 pr-3 tabular-nums ${Number(source.fetchFailures ?? 0) > 0 ? "text-destructive" : "text-foreground"}`}>{source.fetchFailures ?? 0}</td>
+                    <td className="py-2.5 text-muted-foreground" title="Not tracked per source in the current schema">Not tracked</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="mt-3 flex items-start gap-1.5 text-[10px] text-muted-foreground"><ShieldCheck className="mt-0.5 h-3 w-3 shrink-0" />{note ?? "Trust uses persisted source health and accepted/rejected counts. Detailed outcome rates are not tracked per source yet."}</p>
     </div>
   );
 }

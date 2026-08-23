@@ -1,8 +1,11 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
-import { Send } from "lucide-react";
+import { AlertTriangle, Check, RotateCcw, Send } from "lucide-react";
+import { toast } from "sonner";
 import { useNewsroomData } from "@/components/AppShell";
 import { CategoryPill, StatusPill, SectionTitle, EmptyState, clockTime, relTime } from "@/components/newsroom";
+import { adminActionsApi } from "@/lib/adminApi";
+import { readStoredPin } from "@/lib/pinStorage";
 
 export const Route = createFileRoute("/_authenticated/published")({
   head: () => ({
@@ -21,7 +24,25 @@ type Filter = (typeof FILTERS)[number];
 function Published() {
   const data = useNewsroomData();
   const history = (data?.history ?? []) as any[];
+  // Stuck deliveries (status 'sending' — Telegram outcome unknown).
+  const [sending, setSending] = useState<any[]>((data?.sending ?? []) as any[]);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>("TODAY");
+
+  const pin = readStoredPin();
+  const resolve = async (id: string, action: "sent" | "retry") => {
+    if (!pin) return;
+    setBusyId(id);
+    try {
+      await adminActionsApi.resolveSending({ pin, id, resolve: action });
+      setSending((prev) => prev.filter((r) => String(r.id ?? r._id) !== id));
+      toast.success(action === "sent" ? "Marked as delivered" : "Reservation deleted — will retry next cycle if still queued");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Reconcile failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   const items = history.filter((h) => {
     if (filter === "TODAY") {
@@ -59,6 +80,48 @@ function Published() {
           </button>
         ))}
       </div>
+
+      {sending.length > 0 ? (
+        <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+          <div className="flex items-center gap-2 text-amber-300">
+            <AlertTriangle className="h-4 w-4" />
+            <p className="text-xs font-semibold">
+              {sending.length} delivery{sending.length === 1 ? "" : "s"} with unknown outcome — Telegram may or may not have received the message
+            </p>
+          </div>
+          <p className="mt-1 text-[11px] text-amber-200/70">
+            Check Telegram for the post. If it arrived, choose <b>Mark sent</b>. If it did not arrive and the item is still queued, choose <b>Retry</b> to let the pipeline re-send it.
+          </p>
+          <div className="mt-2 space-y-1.5">
+            {sending.map((r: any) => (
+              <div key={String(r.id ?? r._id)} className="flex items-center gap-2 rounded-md border border-amber-500/20 bg-background/60 px-2.5 py-1.5">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-xs font-medium text-foreground">{String(r.headline ?? r.englishHeadline ?? "(untitled)")}</p>
+                  <p className="text-[10px] text-muted-foreground">
+                    → {String(r.chatTitle ?? r.chatId ?? "?")} · {clockTime(r.publishedAt ?? r.createdAt)}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={busyId === String(r.id ?? r._id)}
+                  onClick={() => resolve(String(r.id ?? r._id), "sent")}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md border border-healthy/40 bg-healthy/10 px-2 py-1 text-[10px] font-semibold text-healthy transition-colors hover:bg-healthy/20 disabled:opacity-50"
+                >
+                  <Check className="h-3 w-3" /> Mark sent
+                </button>
+                <button
+                  type="button"
+                  disabled={busyId === String(r.id ?? r._id)}
+                  onClick={() => resolve(String(r.id ?? r._id), "retry")}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-300 transition-colors hover:bg-amber-500/20 disabled:opacity-50"
+                >
+                  <RotateCcw className="h-3 w-3" /> Retry
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="space-y-2">
         {items.length === 0 ? (
@@ -100,3 +163,5 @@ function Published() {
     </div>
   );
 }
+// touch: re-trigger the route generator after a transient transform error
+

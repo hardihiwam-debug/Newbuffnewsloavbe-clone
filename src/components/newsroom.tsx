@@ -56,6 +56,9 @@ const CATEGORY_COLORS: Record<string, string> = {
   "middle-east": "text-[color:oklch(0.68_0.14_305)] border-[color:oklch(0.68_0.14_305)]/40 bg-[color:oklch(0.68_0.14_305)]/10",
   analysis: "text-muted-foreground border-border bg-muted/40",
   iraq: "text-healthy border-healthy/40 bg-healthy/10",
+  gaza: "text-[color:oklch(0.66_0.24_28)] border-[color:oklch(0.66_0.24_28)]/40 bg-[color:oklch(0.66_0.24_28)]/10",
+  syria: "text-[color:oklch(0.66_0.14_75)] border-[color:oklch(0.66_0.14_75)]/40 bg-[color:oklch(0.66_0.14_75)]/10",
+  lebanon: "text-[color:oklch(0.6_0.13_195)] border-[color:oklch(0.6_0.13_195)]/40 bg-[color:oklch(0.6_0.13_195)]/10",
 };
 
 export function CategoryPill({ category }: { category?: string | null }) {
@@ -284,7 +287,7 @@ export function ConfirmAction({
 // ── Edit & publish dialog ───────────────────────────────────────────────────
 export const EDIT_CATEGORIES = [
   "war", "iran", "proxies", "usa", "oil", "gold", "economic-impact",
-  "middle-east", "analysis", "iraq",
+  "middle-east", "analysis", "iraq", "gaza", "syria", "lebanon",
 ];
 
 export function EditQueueItemDialog({
@@ -389,7 +392,7 @@ export function SectionTitle({ eyebrow, title, hint, action }: {
     <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
       <div>
         {eyebrow ? <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-muted-foreground">{eyebrow}</p> : null}
-        <h1 className="text-[22px] font-bold leading-tight text-foreground">{title}</h1>
+        <h1 className="font-display text-[22px] font-bold leading-tight text-foreground">{title}</h1>
         {hint ? <p className="mt-0.5 text-xs text-muted-foreground">{hint}</p> : null}
       </div>
       {action ? <div className="flex items-center gap-2">{action}</div> : null}

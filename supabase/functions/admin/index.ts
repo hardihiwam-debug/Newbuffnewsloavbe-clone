@@ -17,11 +17,47 @@
 // All DB access goes through PostgREST with the service-role key auto-injected
 // by Supabase as SUPABASE_SERVICE_ROLE_KEY. The browser never sends the
 // service key; it only sends the PIN, which the function validates against
-// ADMIN_PIN env (default "200006" to match the existing Convex fallback).
+// the ADMIN_PIN secret. Fail-closed: when ADMIN_PIN is not set, every
+// PIN-gated action is denied (there is NO hardcoded default), so the console
+// stays locked until the operator configures the secret in the Supabase
+// dashboard. Failed guesses are rate-limited per IP through the
+// admin_auth_attempts table (5 wrong attempts per 15 minutes → 429 lockout).
+
+import {
+  LOCKOUT_WINDOW_MS,
+  MAX_FAILED_ATTEMPTS,
+  aggregateRewriteAnalytics,
+  fingerprintsMatch,
+  lockoutSecondsFor,
+  serializeStateFingerprint,
+  classifySourceTrust,
+  derivePipelineControlCenter,
+} from "./_shared.ts";
+import { TEXT_STYLE_DEFINITIONS } from "../pipeline/_shared.ts";
+import { createAiControlHandlers } from "./ai_control_handlers.ts";
+
+// Register additive AI control actions after this module has initialized its
+// existing handler table and shared PostgREST helpers.
+queueMicrotask(() => {
+  Object.assign(handlers, createAiControlHandlers(rest, logActivity));
+});
+
+import {
+  deleteScheduledCampaign,
+  deleteScheduledItem,
+  listScheduled,
+  saveScheduledCampaign,
+  saveScheduledItem,
+  scheduledResetItem,
+  scheduledSendItem,
+  scheduledSendNext,
+  scheduledSkipNext,
+  setScheduledCampaignStatus,
+} from "./scheduled.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const ADMIN_PIN = Deno.env.get("ADMIN_PIN") ?? "200006";
+const ADMIN_PIN = Deno.env.get("ADMIN_PIN") ?? "";
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const NEWSDATA_API_KEY = Deno.env.get("NEWSDATA_API_KEY") ?? "";
 const GROQ_API_KEY = Deno.env.get("GROQ_API_KEY") ?? "";
@@ -32,6 +68,19 @@ const MINIMAX_API_KEY =
   "";
 const PIPELINE_INTERNAL_SECRET = Deno.env.get("INTERNAL_SECRET") ?? "";
 const PIPELINE_URL = `${SUPABASE_URL}/functions/v1/pipeline`;
+// Real-time chat-discovery webhook: this function is publicly reachable at
+// /functions/v1/admin, so the dispatcher can serve a /telegram-webhook path
+// and register chats the moment a bot is added to a channel — instead of
+// relying on Telegram's 24h getUpdates retention window.
+const TG_WEBHOOK_BASE = `${SUPABASE_URL}/functions/v1/telegram-webhook`;
+
+async function webhookSecretFor(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`telegram-webhook:${token}`));
+  const bytes = new Uint8Array(digest);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
 
 // Supported translation model chain (kept in sync with the pipeline: the
 // bare ids route through the direct Gemini key pool, google/* and minimax/*
@@ -56,9 +105,11 @@ class HttpError extends Error {
 
 // ── PIN check ───────────────────────────────────────────────────────────────
 // Constant-time-style comparison so an attacker can't time a brute-force pin
-// guess off the response latency.
+// guess off the response latency. Fail-closed: an unset ADMIN_PIN never
+// matches, not even the empty string.
 function pinMatches(provided: unknown): boolean {
   if (typeof provided !== "string") return false;
+  if (!ADMIN_PIN) return false;
   const a = provided.trim();
   const b = ADMIN_PIN.trim();
   if (!a || a.length !== b.length) return false;
@@ -67,6 +118,77 @@ function pinMatches(provided: unknown): boolean {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
+}
+
+// ── PIN brute-force lockout (per IP) ────────────────────────────────────────
+// The admin function is publicly reachable with the anon key, so "never
+// reveal whether the guess was right" is not enough — an attacker can guess
+// forever. Each wrong PIN is recorded per client IP in admin_auth_attempts;
+// the MAX_FAILED_ATTEMPTS-th failure within LOCKOUT_WINDOW_MS locks that IP
+// (HTTP 429) until the window expires. All three helpers fail open on DB
+// errors: a hiccup must never lock the operator out, and the PIN check itself
+// remains the security boundary.
+function clientIp(req: Request): string {
+  const fwd = req.headers.get("x-forwarded-for");
+  return (fwd?.split(",")[0]?.trim() || "unknown").slice(0, 64);
+}
+
+async function lockoutSeconds(ip: string): Promise<number> {
+  try {
+    const rows = await rest<Array<{ failed_count: number; first_failed_at: string }>>(
+      "admin_auth_attempts",
+      { query: `ip=eq.${encodeURIComponent(ip)}&limit=1` },
+    );
+    if (!Array.isArray(rows) || rows.length === 0) return 0;
+    return lockoutSecondsFor(rows[0]!.failed_count, rows[0]!.first_failed_at);
+  } catch (err) {
+    console.error("[admin] lockout check failed (failing open):", err instanceof Error ? err.message : err);
+    return 0;
+  }
+}
+
+async function recordPinFailure(ip: string): Promise<void> {
+  try {
+    // Lazy prune: drop expired rows while we're here so the table never
+    // grows beyond a handful of currently-locked IPs.
+    await rest("admin_auth_attempts", {
+      method: "DELETE",
+      query: `first_failed_at.lt.${new Date(Date.now() - LOCKOUT_WINDOW_MS).toISOString()}`,
+    }).catch(() => {});
+    const rows = await rest<Array<{ failed_count: number }>>(
+      "admin_auth_attempts",
+      { query: `ip=eq.${encodeURIComponent(ip)}&limit=1` },
+    );
+    if (Array.isArray(rows) && rows.length > 0) {
+      const count = (rows[0]!.failed_count ?? 0) + 1;
+      await rest("admin_auth_attempts", {
+        method: "PATCH",
+        query: `ip=eq.${encodeURIComponent(ip)}`,
+        body: { failed_count: count, updated_at: new Date().toISOString() },
+        prefer: "return=minimal",
+      });
+    } else {
+      await rest("admin_auth_attempts", {
+        method: "POST",
+        body: { ip, failed_count: 1 },
+        prefer: "return=minimal",
+      });
+    }
+  } catch (err) {
+    console.error("[admin] recordPinFailure failed (failing open):", err instanceof Error ? err.message : err);
+  }
+}
+
+async function clearPinFailures(ip: string): Promise<void> {
+  try {
+    await rest("admin_auth_attempts", {
+      method: "DELETE",
+      query: `ip=eq.${encodeURIComponent(ip)}`,
+    });
+  } catch {
+    // Failing open here is harmless: the next wrong guess just re-creates
+    // the row.
+  }
 }
 
 // ── PostgREST helpers ───────────────────────────────────────────────────────
@@ -160,7 +282,17 @@ const BOT_CATEGORIES = [
   "usa",
   "oil",
   "economic-impact",
+  "gaza",
+  "syria",
+  "lebanon",
 ];
+
+const DEFAULT_TEXT_STYLE_RULES = Object.fromEntries(
+  Object.entries(TEXT_STYLE_DEFINITIONS).map(([id, definition]) => [id, {
+    rule: definition.rule,
+    example: definition.example,
+  }]),
+);
 
 const DEFAULT_SETTINGS: Record<string, unknown> = {
   defaultLanguage: "en",
@@ -175,7 +307,20 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   nightMinMinutes: 10,
   nightMaxMinutes: 20,
   breakingInterruptsNight: true,
-  breakingCategories: ["war", "iran", "proxies", "usa"],
+  breakingCategories: ["war", "iran", "proxies", "usa", "gaza", "syria", "lebanon"],
+  autoHashtag: true,
+  whyItMattersEnabled: false,
+  whyItMattersCategories: ["war", "iran", "proxies", "gaza", "syria", "lebanon", "iraq", "usa"],
+  whyItMattersMaxPerDay: 4,
+  whyItMattersPrefix: "WHY IT MATTERS — ",
+  sourceTierEnabled: true,
+  textStyle: "auto",
+  textLength: "auto",
+  textStyleAuto: true,
+  textStyleAiAssist: false,
+  styleByCategory: {},
+  textStyleRules: DEFAULT_TEXT_STYLE_RULES,
+  hashtagRules: {},
   oilMoveThreshold: 3,
   goldMoveThreshold: 2,
   timezone: "Asia/Baghdad",
@@ -226,52 +371,19 @@ async function settingsId(): Promise<string | null> {
   return first?.id ?? null;
 }
 
-// ── Action: getDashboard ────────────────────────────────────────────────────
-async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
-  const settings = await getSettings();
-  const [chatsRaw, sourcesRaw, topicsRaw, queueRaw, queueAllRaw, historyRaw, botsRaw] = await Promise.all([
-    rest<unknown[]>("chats", { query: "limit=500" }),
-    rest<unknown[]>("sources", { query: "limit=500" }),
-    rest<unknown[]>("topic_queries", { query: "limit=500" }),
-    rest<unknown[]>("queue", { query: "status=eq.queued&limit=200" }),
-    rest<unknown[]>("queue", { query: "order=created_at.desc&limit=300" }),
-    rest<unknown[]>("published_history", { query: "order=published_at.desc&limit=200" }),
-    rest<unknown[]>("bots", { query: "limit=50" }),
-  ]);
-  // Bot tokens are secrets: the SPA only needs to know whether one is set
-  // (and a masked preview). The raw token must never cross the admin API to
-  // the browser bundle — only the pipeline (service role) reads bots.token.
-  const bots = (snakeArray(botsRaw) as Array<Record<string, unknown>>)
-    .sort((a: any, b: any) =>
-      String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")),
-    )
-    .map((b) => {
-      const rawToken = String(b.token ?? "");
-      const { token: _omit, ...rest } = b;
-      return {
-        ...rest,
-        tokenConfigured: rawToken.length > 0,
-        tokenMasked: rawToken ? `••••${rawToken.slice(-4)}` : null,
-      };
-    });
+// ── Dashboard data: split into focused resources ────────────────────────────
+// Egress fast-win: the old single getDashboard pulled ~17 datasets (including
+// 2,000–5,000-row scans just to count rows) on every poll. The SPA now
+// fetches each resource below on its own cadence (feed 5s, summary 10s,
+// queue 15s, sources/events/AI/published 30s, analytics 60s) through a shared
+// store, so nothing is fetched more than once per interval. getDashboard
+// remains as a composition of every resource so the smoke script and any
+// older caller keep working unchanged.
 
-  const chats = snakeArray(chatsRaw).sort((a: any, b: any) =>
-    String(b.lastSeenAt ?? "").localeCompare(String(a.lastSeenAt ?? "")),
-  );
-  const sources = snakeArray(sourcesRaw).sort((a: any, b: any) =>
-    (a.priority ?? 0) - (b.priority ?? 0),
-  );
-  const topics = snakeArray(topicsRaw).sort((a: any, b: any) =>
-    String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")),
-  );
-  const queue = snakeArray(queueRaw).sort((a: any, b: any) => {
-    if (Boolean(a.breaking) !== Boolean(b.breaking)) return a.breaking ? -1 : 1;
-    return (b.score ?? 0) - (a.score ?? 0);
-  });
-  const queueAll = snakeArray(queueAllRaw);
-
-  // Dedup published history by dedupKey keeping the most recent + the full
-  // list of chat titles each story went to.
+function dedupePublishedHistory(
+  historyRaw: unknown,
+  chats: Array<Record<string, unknown>>,
+): any[] {
   const chatsById = new Map<number, string>(
     (chats as any[]).map((c) => [Number(c.chatId), c.title ?? String(c.chatId)]),
   );
@@ -294,92 +406,10 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     });
     if (history.length >= 100) break;
   }
+  return history;
+}
 
-  const transFailRaw = await rest<unknown[]>("translation_failures", { query: "order=created_at.desc&limit=50" });
-  const pollsRaw = await rest<unknown[]>("polls", { query: "order=created_at.desc&limit=100" });
-  const activityRaw = await rest<unknown[]>("activity_log", { query: "order=created_at.desc&limit=100" });
-  const transHistRaw = await rest<unknown[]>("translation_history", { query: "order=created_at.desc&limit=50" });
-  // Event clusters (the backend's cross-outlet event grouping). The Events
-  // page renders these as the newsroom's developing-story board.
-  const clustersRaw = await rest<unknown[]>("clusters", {
-    query: "order=last_seen_at.desc.nullslast&limit=100",
-  });
-
-  // 14-day analytics series (real counts from retained history/polls).
-  const since14 = new Date(Date.now() - 14 * 86_400_000).toISOString();
-  const hist14Raw = await rest<unknown[]>("published_history", {
-    query: `published_at=gte.${encodeURIComponent(since14)}&limit=2000`,
-  });
-  const polls14Raw = await rest<unknown[]>("polls", {
-    query: `created_at=gte.${encodeURIComponent(since14)}&limit=2000`,
-  });
-  const hist14 = Array.isArray(hist14Raw) ? hist14Raw : [];
-  const polls14 = Array.isArray(polls14Raw) ? polls14Raw : [];
-
-  const days: { date: string; published: number; breaking: number; polls: number }[] = [];
-  for (let i = 13; i >= 0; i--) {
-    days.push({
-      date: new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10),
-      published: 0,
-      breaking: 0,
-      polls: 0,
-    });
-  }
-  const slots = new Map(days.map((d) => [d.date, d]));
-  const daySlice = (iso: string) => iso.slice(0, 10);
-  const seenStory = new Set<string>();
-  for (const h of hist14 as any[]) {
-    const slot = slots.get(daySlice(h.published_at));
-    if (!slot) continue;
-    if (seenStory.has(h.dedup_key)) continue;
-    seenStory.add(h.dedup_key);
-    slot.published += 1;
-    if (h.breaking) slot.breaking += 1;
-  }
-  for (const p of polls14 as any[]) {
-    const slot = slots.get(daySlice(p.created_at));
-    if (slot) slot.polls += 1;
-  }
-
-  // Live 24h counts.
-  const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
-  const queuedAllRaw = await rest<unknown[]>("queue", { query: "status=eq.queued&limit=5000&select=id" });
-  const published24hRaw = await rest<unknown[]>("published_history", { query: `published_at=gte.${encodeURIComponent(dayAgo)}&limit=5000` });
-  const polls24hRaw = await rest<unknown[]>("polls", { query: `created_at=gte.${encodeURIComponent(dayAgo)}&limit=5000` });
-  const tfail24hRaw = await rest<unknown[]>("translation_failures", { query: `created_at=gte.${encodeURIComponent(dayAgo)}&limit=5000` });
-  const queuedTotal = Array.isArray(queuedAllRaw) ? queuedAllRaw.length : 0;
-  const seen24h = new Set<string>();
-  let published24h = 0;
-  for (const r of (Array.isArray(published24hRaw) ? published24hRaw : []) as any[]) {
-    if (seen24h.has(r.dedup_key)) continue;
-    seen24h.add(r.dedup_key);
-    published24h += 1;
-  }
-  const polls24h = Array.isArray(polls24hRaw) ? polls24hRaw.length : 0;
-  const translationFails24h = Array.isArray(tfail24hRaw) ? tfail24hRaw.length : 0;
-
-  // AI-decision-path usage today (Groq/OpenRouter/Cloudflare).
-  const aiUsageToday = new Date().toISOString().slice(0, 10);
-  const aiUsageRaw = await rest<unknown[]>("ai_usage", {
-    query: `day=gte.${encodeURIComponent(aiUsageToday)}&limit=5000`,
-  });
-  const aiUsage24h = (() => {
-    let calls = 0;
-    let promptTokens = 0;
-    let completionTokens = 0;
-    const byProvider: Record<string, { calls: number; promptTokens: number; completionTokens: number }> = {};
-    for (const r of (Array.isArray(aiUsageRaw) ? aiUsageRaw : []) as any[]) {
-      calls += Number(r.calls ?? 0);
-      promptTokens += Number(r.prompt_tokens ?? 0);
-      completionTokens += Number(r.completion_tokens ?? 0);
-      const p = (byProvider[r.provider] ??= { calls: 0, promptTokens: 0, completionTokens: 0 });
-      p.calls += Number(r.calls ?? 0);
-      p.promptTokens += Number(r.prompt_tokens ?? 0);
-      p.completionTokens += Number(r.completion_tokens ?? 0);
-    }
-    return { calls, promptTokens, completionTokens, byProvider };
-  })();
-
+async function probeSchemaMigrations(): Promise<{ ok: boolean; missing?: Record<string, string[]> }> {
   // Schema-drift probe (migrations 0005–0009). The pipeline writes columns
   // that only exist in these migrations. If the deployed function outruns the
   // schema (functions and migrations deploy independently), every queue
@@ -397,6 +427,13 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
     { table: "queue", column: "facts", migration: "0009_news_quality.sql" },
     { table: "queue", column: "is_update", migration: "0009_news_quality.sql" },
     { table: "settings", column: "breaking_max_age_hours", migration: "0009_news_quality.sql" },
+    { table: "queue", column: "analysis_kind", migration: "0034_analysis_followups_source_tiers.sql" },
+    { table: "settings", column: "why_it_matters_enabled", migration: "0034_analysis_followups_source_tiers.sql" },
+    { table: "settings", column: "source_tier_enabled", migration: "0034_analysis_followups_source_tiers.sql" },
+    { table: "settings", column: "text_style", migration: "0036_writing_styles.sql" },
+    { table: "settings", column: "text_length", migration: "0036_writing_styles.sql" },
+    { table: "settings", column: "style_by_category", migration: "0036_writing_styles.sql" },
+    { table: "settings", column: "hashtag_rules", migration: "0037_hashtag_rules.sql" },
   ];
   const schemaMissing: Record<string, string[]> = {};
   const probeResults = await Promise.all(
@@ -412,41 +449,314 @@ async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
   for (const probe of probeResults) {
     if (probe) (schemaMissing[probe.migration] ??= []).push(`${probe.table}.${probe.column}`);
   }
-  const schemaMigrations = { ok: Object.keys(schemaMissing).length === 0, missing: schemaMissing };
+  return { ok: Object.keys(schemaMissing).length === 0, missing: schemaMissing };
+}
 
+async function fetchDashboardSummary(): Promise<Record<string, unknown>> {
+  const settings = await getSettings();
+  const botsRaw = await rest<unknown[]>("bots", { query: "limit=50" }).catch(() => []);
+  // Bot tokens are secrets: the SPA only needs to know whether one is set
+  // (and a masked preview). The raw token must never cross the admin API to
+  // the browser bundle — only the pipeline (service role) reads bots.token.
+  const bots = (snakeArray(botsRaw) as Array<Record<string, unknown>>)
+    .sort((a: any, b: any) =>
+      String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")),
+    )
+    .map((b) => {
+      const rawToken = String(b.token ?? "");
+      const { token: _omit, ...rest0 } = b;
+      return {
+        ...rest0,
+        tokenConfigured: rawToken.length > 0,
+        tokenMasked: rawToken ? `••••${rawToken.slice(-4)}` : null,
+      };
+    });
+  // Single-row DB aggregate (migration 0024) instead of fetching thousands of
+  // rows and counting them in JavaScript. Degrades to zeros if the migration
+  // hasn't been applied yet so the dashboard never breaks on it.
+  let counts: Record<string, unknown> = {};
+  try {
+    const rows = await rest<Array<Record<string, unknown>>>("rpc/dashboard_counts", {
+      method: "POST",
+      prefer: "return=representation",
+    });
+    counts = (Array.isArray(rows) ? rows[0] : rows) ?? {};
+  } catch (e) {
+    console.warn("[admin] dashboard_counts failed (migration 0024 missing?):", e instanceof Error ? e.message : e);
+  }
+  const schemaMigrations = await probeSchemaMigrations();
   // Cron scheduler health (migration 0014 exposes cron.job / cron.job_run_details
   // as public.cron_job_health because pg_cron lives in a schema PostgREST does
   // not expose). Degrades to [] if the view is missing or the query fails, so a
   // not-yet-applied migration can never break the dashboard.
   const cronHealthRaw = await rest<unknown[]>("cron_job_health", { query: "limit=50" }).catch(() => []);
-  const cronHealth = snakeArray(cronHealthRaw);
-
+  const recentActivityRaw = await rest<unknown[]>("activity_log", { query: "order=created_at.desc&limit=100" }).catch(() => []);
+  const recentActivity = snakeArray(recentActivityRaw) as Array<Record<string, unknown>>;
+  const quotaLimited = recentActivity.some((row) => {
+    const createdAt = Date.parse(String(row.createdAt ?? ""));
+    const recentEnough = Number.isFinite(createdAt) && Date.now() - createdAt <= 24 * 60 * 60_000;
+    const text = `${String(row.message ?? "")} ${String(row.detail ?? "")}`.toLowerCase();
+    return recentEnough && /quota|rate.?limit|429|exhausted/.test(text) && /translation|gemini|model|ai/.test(text);
+  });
+  const pipelineRun = (settings.pipelineRun as Record<string, unknown> | null | undefined) ?? null;
+  const controlCenter = derivePipelineControlCenter({
+    paused: Boolean(settings.botPaused),
+    pipelineRun,
+    lastIngestAt: settings.lastIngestAt as string | null | undefined,
+    lastPublishAt: settings.lastPublishAt as string | null | undefined,
+    translationQuotaLimited: quotaLimited,
+  });
+  const currentProvider = String(settings.translationMode ?? "unknown");
+  const currentModel = String(settings.translationModel ?? "unknown");
+  // AI counters are real database counters. Supabase resource consumption is
+  // not exposed by this schema, so do not turn row counts into a fake billing
+  // estimate; expose the limitation explicitly for the UI.
+  const usage = {
+    ai: {
+      calls: Number(counts.ai_calls ?? 0),
+      promptTokens: Number(counts.ai_prompt_tokens ?? 0),
+      completionTokens: Number(counts.ai_completion_tokens ?? 0),
+    },
+    supabase: {
+      tracked: false,
+      note: "Supabase compute, bandwidth, and quota usage are not available through the current application schema.",
+    },
+  };
+  // Stuck deliveries: published_history rows reserved with status 'sending'
+  // that were never flipped to 'sent' (worker killed between Telegram accept
+  // and the DB PATCH). They block re-delivery by design (no duplicates) but
+  // can strand a post forever — the KPI + Published-page reconcile panel
+  // surface them so the operator can mark-sent or delete-and-retry.
+  const sendingRaw = await rest<Array<Record<string, unknown>>>("published_history", {
+    query: "status=eq.sending&select=id&limit=1000",
+  }).catch(() => []);
   return {
     settings,
-    isOwner: true,
-    chats,
     bots,
     categories: BOT_CATEGORIES,
-    sources,
-    topics,
-    queue: queue.slice(0, 50),
-    queueAll,
-    history,
-    translationFailures: snakeArray(transFailRaw),
-    translationHistory: snakeArray(transHistRaw),
-    polls: snakeArray(pollsRaw),
-    clusters: snakeArray(clustersRaw),
-    recentActivity: snakeArray(activityRaw),
-    analytics: days,
-    queuedTotal,
-    published24h,
-    polls24h,
-    translationFails24h,
-    aiUsage24h,
+    queuedTotal: Number(counts.queued_total ?? 0),
+    published24h: Number(counts.published_24h ?? 0),
+    polls24h: Number(counts.polls_24h ?? 0),
+    translationFails24h: Number(counts.translation_fails_24h ?? 0),
+    stuckSending: sendingRaw?.length ?? 0,
+    aiUsage24h: {
+      calls: Number(counts.ai_calls ?? 0),
+      promptTokens: Number(counts.ai_prompt_tokens ?? 0),
+      completionTokens: Number(counts.ai_completion_tokens ?? 0),
+      byProvider: (counts.ai_by_provider as Record<string, unknown>) ?? {},
+    },
+    controlCenter,
+    currentProvider,
+    currentModel,
+    usage,
     schemaMigrations,
-    cronHealth,
+    cronHealth: snakeArray(cronHealthRaw),
     botConfigured: Boolean(TELEGRAM_BOT_TOKEN),
     newsdataConfigured: Boolean(NEWSDATA_API_KEY),
+  };
+}
+
+async function fetchDashboardFeed(): Promise<Record<string, unknown>> {
+  const [queueRaw, activityRaw] = await Promise.all([
+    rest<unknown[]>("queue", { query: "status=eq.queued&limit=100" }),
+    rest<unknown[]>("activity_log", { query: "order=created_at.desc&limit=30" }),
+  ]);
+  const queue = snakeArray(queueRaw).sort((a: any, b: any) => {
+    if (Boolean(a.breaking) !== Boolean(b.breaking)) return a.breaking ? -1 : 1;
+    return (b.score ?? 0) - (a.score ?? 0);
+  });
+  return { queue: queue.slice(0, 50), recentActivity: snakeArray(activityRaw) };
+}
+
+async function fetchDashboardQueue(): Promise<Record<string, unknown>> {
+  // Chats are deliberately NOT shipped in full here anymore: the full list
+  // lives in dashboardChats (Settings-only, mount-on-demand). History dedup
+  // only needs chat titles for its `chats: [...]` join, so fetch just the two
+  // columns — a couple KB instead of the old 500-row full payload.
+  const [queueAllRaw, historyRaw, sendingRaw, chatsLightRaw] = await Promise.all([
+    rest<unknown[]>("queue", { query: "order=created_at.desc&limit=100" }),
+    rest<unknown[]>("published_history", { query: "order=published_at.desc&limit=100" }),
+    rest<unknown[]>("published_history", { query: "status=eq.sending&order=published_at.desc&limit=50" }),
+    rest<unknown[]>("chats", { query: "select=chat_id,title&limit=200" }),
+  ]);
+  const chatsById = new Map<number, string>(
+    ((chatsLightRaw as unknown[]) ?? []).map((c) => [Number((c as Record<string, unknown>).chat_id), String((c as Record<string, unknown>).title ?? Number((c as Record<string, unknown>).chat_id))]),
+  );
+  // Stuck 'sending' rows, per-chat, with the chat title resolved so the
+  // reconcile panel can name the destination. Kept separate from `history`
+  // (which is the dedup-merged delivered archive).
+  const sending = snakeArray(sendingRaw).map((r: Record<string, unknown>) => ({
+    ...r,
+    chatTitle: chatsById.get(Number(r.chatId)) ?? String(r.chatId ?? ""),
+  }));
+  return {
+    queueAll: snakeArray(queueAllRaw),
+    history: dedupePublishedHistory(historyRaw, chatsLightRaw),
+    sending,
+  };
+}
+
+async function fetchDashboardChats(): Promise<Record<string, unknown>> {
+  const chatsRaw = await rest<unknown[]>("chats", { query: "limit=200" });
+  const chats = snakeArray(chatsRaw).sort((a: any, b: any) =>
+    String(b.lastSeenAt ?? "").localeCompare(String(a.lastSeenAt ?? "")),
+  );
+  return { chats };
+}
+
+async function fetchDashboardSources(): Promise<Record<string, unknown>> {
+  const [sourcesRaw, topicsRaw] = await Promise.all([
+    rest<unknown[]>("sources", { query: "limit=200" }),
+    rest<unknown[]>("topic_queries", { query: "limit=200" }),
+  ]);
+  const sources = snakeArray(sourcesRaw) as Array<Record<string, unknown>>;
+  const trust = sources.map((source) => classifySourceTrust(source as any));
+  return {
+    sources: sources.sort((a: any, b: any) =>
+      (a.priority ?? 0) - (b.priority ?? 0),
+    ),
+    sourceTrust: trust,
+    sourceTrustNote: "Trust is derived from source health and the stored accepted/rejected counters when populated. Duplicate, thin-body, date, translation, and quality rates are not source-linked yet.",
+    topics: snakeArray(topicsRaw).sort((a: any, b: any) =>
+      String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")),
+    ),
+  };
+}
+
+async function fetchDashboardAnalytics(): Promise<Record<string, unknown>> {
+  // 14-day series computed in SQL (migration 0024) — the old path fetched up
+  // to 2,000 published_history + 2,000 polls rows per poll to build this.
+  let days: Array<{ date: string; published: number; breaking: number; polls: number }> = [];
+  try {
+    const rows = await rest<Array<Record<string, unknown>>>("rpc/dashboard_analytics", {
+      method: "POST",
+      prefer: "return=representation",
+    });
+    days = (Array.isArray(rows) ? rows : []).map((r) => ({
+      date: String(r.date ?? ""),
+      published: Number(r.published ?? 0),
+      breaking: Number(r.breaking ?? 0),
+      polls: Number(r.polls ?? 0),
+    }));
+  } catch (e) {
+    console.warn("[admin] dashboard_analytics failed (migration 0024 missing?):", e instanceof Error ? e.message : e);
+  }
+  return { analytics: days };
+}
+
+async function fetchDashboardAi(): Promise<Record<string, unknown>> {
+  const [failsRaw, histRaw] = await Promise.all([
+    rest<unknown[]>("translation_failures", { query: "order=created_at.desc&limit=50" }),
+    rest<unknown[]>("translation_history", { query: "order=created_at.desc&limit=50" }),
+  ]);
+  return {
+    translationFailures: snakeArray(failsRaw),
+    translationHistory: snakeArray(histRaw),
+  };
+}
+
+async function fetchDashboardEvents(): Promise<Record<string, unknown>> {
+  const clustersRaw = await rest<unknown[]>("clusters", {
+    query: "order=last_seen_at.desc.nullslast&limit=100",
+  });
+  return { clusters: snakeArray(clustersRaw) };
+}
+
+async function fetchDashboardPublished(): Promise<Record<string, unknown>> {
+  const pollsRaw = await rest<unknown[]>("polls", { query: "order=created_at.desc&limit=100" });
+  return { polls: snakeArray(pollsRaw) };
+}
+
+// ── State-hash conditional polling (egress fast-win) ───────────────────────
+// The SPA polls the 9 dashboard resources on cadences of 10s–5min. Most polls
+// find nothing changed, yet each used to ship the full payload (queue rows,
+// history, chats, usage). Each resource now answers from
+// admin_fingerprints() (migration 0028): the client sends
+// `ifState[action]` = the fingerprint it last saw; if it still matches, the
+// function answers `{ __unchanged: true, __fingerprint }` (~100 bytes) and
+// the SPA keeps its copy. Real responses carry the fresh fingerprint so the
+// client can store it. If the RPC is missing (migration not applied) the
+// map is empty and every poll falls through to the full payload (fail open).
+const FINGERPRINT_CACHE_MS = 2_000;
+let fpCache: Record<string, unknown> | null = null;
+let fpCacheAt = 0;
+
+async function fingerprints(): Promise<Record<string, unknown>> {
+  if (fpCache && Date.now() - fpCacheAt < FINGERPRINT_CACHE_MS) return fpCache;
+  try {
+    const rows = await rest<unknown>("rpc/admin_fingerprints", {
+      method: "POST",
+      prefer: "return=representation",
+    });
+    let obj: Record<string, unknown> = {};
+    if (Array.isArray(rows)) {
+      const first = (rows[0] ?? {}) as Record<string, unknown>;
+      const nested = first.admin_fingerprints;
+      obj =
+        nested && typeof nested === "object"
+          ? (nested as Record<string, unknown>)
+          : first;
+    } else if (rows && typeof rows === "object") {
+      obj = rows as Record<string, unknown>;
+    }
+    fpCache = obj;
+    fpCacheAt = Date.now();
+    return obj;
+  } catch (e) {
+    console.warn(
+      "[admin] admin_fingerprints failed (migration 0028 missing?):",
+      e instanceof Error ? e.message : e,
+    );
+    return {};
+  }
+}
+
+async function statefulDashboard<T extends Record<string, unknown>>(
+  action: string,
+  p: Record<string, unknown>,
+  fetchFn: () => Promise<T>,
+): Promise<unknown> {
+  const current = await fingerprints();
+  const cur = current[action];
+  // admin_fingerprints() emits a nested OBJECT per resource; serialize it to a
+  // stable string so the client can round-trip it verbatim (jsonb key order is
+  // deterministic for identical data). null when the RPC/migration is missing
+  // → never matches → full payload (fail open).
+  const fpStr = serializeStateFingerprint(cur);
+  const sent = (p.ifState as Record<string, unknown> | undefined)?.[action];
+  if (fpStr !== null && fingerprintsMatch(sent, fpStr)) {
+    return { __unchanged: true, __fingerprint: fpStr };
+  }
+  const data = await fetchFn();
+  return { ...data, __fingerprint: fpStr };
+}
+
+// ── Action: getDashboard ────────────────────────────────────────────────────
+// Backward-compatible composition of every focused resource (the smoke script
+// and any older caller still use this single action).
+async function getDashboard(_p: Record<string, unknown>): Promise<unknown> {
+  const [summary, feed, queueRes, chatsRes, sources, analytics, ai, events, published] = await Promise.all([
+    fetchDashboardSummary(),
+    fetchDashboardFeed(),
+    fetchDashboardQueue(),
+    fetchDashboardChats(),
+    fetchDashboardSources(),
+    fetchDashboardAnalytics(),
+    fetchDashboardAi(),
+    fetchDashboardEvents(),
+    fetchDashboardPublished(),
+  ]);
+  return {
+    ...summary,
+    ...feed,
+    ...queueRes,
+    ...chatsRes,
+    ...sources,
+    ...analytics,
+    ...ai,
+    ...events,
+    ...published,
+    isOwner: true,
   };
 }
 
@@ -507,6 +817,39 @@ async function setPauseState(p: { paused: boolean; reason?: string | null }): Pr
       : "Bot services resumed",
   });
   return { ok: true };
+}
+
+const ALLOWED_CRON_SCHEDULES = ["* * * * *", "*/2 * * * *", "*/5 * * * *", "*/10 * * * *", "*/15 * * * *"];
+
+// Operator picks the pipeline ticker cadence (Settings → Scheduler). The
+// whitelist lives inside the SQL function too — this check just gives a
+// friendly 400 instead of a raw SQL error.
+async function setCronSchedule(p: { schedule?: string }): Promise<unknown> {
+  const schedule = String(p.schedule ?? "").trim();
+  if (!ALLOWED_CRON_SCHEDULES.includes(schedule)) {
+    throw new HttpError(400, `schedule must be one of: ${ALLOWED_CRON_SCHEDULES.join(", ")}`);
+  }
+  const r = await rest<Array<Record<string, unknown>>>("rpc/set_pipeline_cron_schedule", {
+    method: "POST",
+    body: { p_schedule: schedule },
+  });
+  // Persist the operator's choice for display (the RPC deliberately does not
+  // touch tables - PostgREST guard). Best-effort.
+  const sid = await settingsId();
+  if (sid) {
+    await rest(`settings?id=eq.${sid}`, {
+      method: "PATCH",
+      body: { cron_schedule: schedule, updated_at: new Date().toISOString() },
+      prefer: "return=minimal",
+    }).catch(() => {});
+  }
+  const applied = Array.isArray(r) ? String((r[0]?.set_pipeline_cron_schedule as string) ?? schedule) : schedule;
+  await logActivity({
+    type: "admin",
+    level: "info",
+    message: `Pipeline ticker schedule set to "${applied}"`,
+  });
+  return { ok: true, schedule: applied };
 }
 
 async function setTranslationModel(p: { model: string }): Promise<unknown> {
@@ -796,8 +1139,8 @@ async function listTranslationKeys(_p: Record<string, unknown>): Promise<unknown
   }
 
   // Per-key × per-model usage (from gemini_key_usage + recent gemini_call_log).
-  const usageRows = await rest<unknown[]>("gemini_key_usage", { query: "limit=5000" });
-  const logRows = await rest<unknown[]>("gemini_call_log", { query: "order=at.desc&limit=800" });
+  const usageRows = await rest<unknown[]>("gemini_key_usage", { query: "limit=2000" });
+  const logRows = await rest<unknown[]>("gemini_call_log", { query: "order=at.desc&limit=400" });
   const todayStr = new Date().toISOString().slice(0, 10);
   const empty = () => ({ calls: 0, ok: 0, rateLimited: 0, otherErrors: 0 });
   const geminiUsage: Array<{
@@ -984,14 +1327,48 @@ async function scanBotChats(token: string, botId: string | null, label: string):
   if (!r.ok && /webhook/i.test(String(r.description ?? ""))) {
     const info = await tgApi("getWebhookInfo", undefined, token);
     const wh = info?.ok ? (info.result as Record<string, unknown> | null) : null;
-    await tgApi("deleteWebhook", { drop_pending_updates: false }, token).catch(() => {});
-    r = await tgApi("getUpdates", { timeout: 0, limit: 100, allowed_updates: ALLOWED }, token);
     const url = String(wh?.url ?? "").trim();
-    if (wh && url) {
-      const restore: Record<string, unknown> = { url };
-      if (Array.isArray(wh.allowed_updates)) restore.allowed_updates = wh.allowed_updates;
-      if (Number(wh.max_connections ?? 0) > 0) restore.max_connections = Number(wh.max_connections);
-      await tgApi("setWebhook", restore, token).catch(() => {});
+    // Telegram rejects getUpdates while ANY webhook is active. For this app's
+    // own discovery webhook, temporarily switch to polling so the manual
+    // Sync chats button can also drain pending updates for additional bots.
+    // Always restore the webhook in finally: discovery must not be disabled by
+    // a failed or timed-out sync.
+    if (url.startsWith(TG_WEBHOOK_BASE)) {
+      await tgApi("deleteWebhook", { drop_pending_updates: false }, token).catch(() => {});
+      try {
+        r = await tgApi("getUpdates", { timeout: 0, limit: 100, allowed_updates: ALLOWED }, token);
+      } finally {
+        await tgApi(
+          "setWebhook",
+          {
+            url,
+            secret_token: await webhookSecretFor(token),
+            allowed_updates: ALLOWED,
+            drop_pending_updates: false,
+            ...(Number(wh?.max_connections ?? 0) > 0
+              ? { max_connections: Number(wh?.max_connections) }
+              : {}),
+          },
+          token,
+        ).catch(() => {});
+      }
+    } else {
+      // Anything else is a webhook this deployment cannot receive — clear it
+      // so the getUpdates scan can discover chats, then restore it afterwards.
+      await tgApi("deleteWebhook", { drop_pending_updates: false }, token).catch(() => {});
+      await logActivity({
+        type: "chat",
+        level: "warning",
+        message: `Cleared stale webhook for "${label}" so chat discovery (getUpdates) can work`,
+        detail: url ? `was: ${url}` : "no webhook URL was returned",
+      });
+      r = await tgApi("getUpdates", { timeout: 0, limit: 100, allowed_updates: ALLOWED }, token);
+      if (wh && url) {
+        const restore: Record<string, unknown> = { url };
+        if (Array.isArray(wh.allowed_updates)) restore.allowed_updates = wh.allowed_updates;
+        if (Number(wh.max_connections ?? 0) > 0) restore.max_connections = Number(wh.max_connections);
+        await tgApi("setWebhook", restore, token).catch(() => {});
+      }
     }
   }
   if (!r.ok) return { added: 0, scanned: 0, error: r.description ?? "getUpdates failed" };
@@ -1335,6 +1712,30 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
 async function runPipeline(p: { action?: string; mode?: string }): Promise<unknown> {
   const raw = String(p.mode ?? p.action ?? "").toLowerCase();
   const mode = raw === "ingest" ? "ingest" : raw === "publish" ? "publish" : "cycle";
+  // Seed the live progress record BEFORE the blocking pipeline call so the
+  // dashboard's progress bar appears instantly (the pipeline itself updates
+  // settings.pipeline_run as the run advances; this seed closes the gap
+  // between click and first pipeline write).
+  const runId = await settingsId();
+  const seededAt = new Date().toISOString();
+  if (runId) {
+    await rest("settings", {
+      method: "PATCH",
+      query: `id=eq.${runId}`,
+      body: {
+        pipeline_run: {
+          action: mode,
+          message: mode === "ingest" ? "Fetching sources…" : mode === "publish" ? "Publishing…" : "Running cycle…",
+          item: 0,
+          total: 0,
+          startedAt: seededAt,
+          at: seededAt,
+          done: false,
+        },
+      },
+      prefer: "return=minimal",
+    }).catch(() => {});
+  }
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (PIPELINE_INTERNAL_SECRET) headers["x-internal-secret"] = PIPELINE_INTERNAL_SECRET;
   const res = await fetch(`${PIPELINE_URL}?mode=${mode}${mode === "publish" ? "&force=1" : ""}`, {
@@ -1346,6 +1747,27 @@ async function runPipeline(p: { action?: string; mode?: string }): Promise<unkno
   const text = await res.text();
   let parsed: unknown;
   try { parsed = JSON.parse(text); } catch { parsed = text; }
+  // If the pipeline never reported (e.g. it crashed before the done write),
+  // mark the run finished so the bar doesn't hang for 10 minutes.
+  if (runId) {
+    const done = !res.ok || (parsed && typeof parsed === "object" && !("skipped" in (parsed as Record<string, unknown>)));
+    await rest("settings", {
+      method: "PATCH",
+      query: `id=eq.${runId}`,
+      body: {
+        pipeline_run: {
+          action: mode,
+          message: done ? (mode === "ingest" ? "Ingest complete" : mode === "publish" ? "Publish complete" : "Cycle complete") : "Skipped — another run in progress",
+          item: 0,
+          total: 0,
+          startedAt: seededAt,
+          at: new Date().toISOString(),
+          done: true,
+        },
+      },
+      prefer: "return=minimal",
+    }).catch(() => {});
+  }
   await logActivity({
     type: "system",
     level: "info",
@@ -1559,11 +1981,117 @@ async function publishQueueItem(p: { id: string }): Promise<unknown> {
   return { ok: res.ok, status: res.status, result: parsed };
 }
 
-// ── Handler table ───────────────────────────────────────────────────────────
+// ── Action: deletePublishedPost ────────────────────────────────────────────
+// Delete a delivered post from every chat (Telegram deleteMessage) so a bad
+// post can be removed from the channel from the console. Forwards to the
+// pipeline's mode=delete with the published_history row id — the bot tokens
+// live in the pipeline function, not here. The history row carries the
+// per-chat Telegram message ids recorded since migration 0043.
+async function deletePublishedPost(p: { id: string }): Promise<unknown> {
+  if (!p.id) throw new HttpError(400, "id is required");
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (PIPELINE_INTERNAL_SECRET) headers["x-internal-secret"] = PIPELINE_INTERNAL_SECRET;
+  const res = await fetch(`${PIPELINE_URL}?mode=delete&id=${encodeURIComponent(p.id)}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ trigger: "admin" }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const text = await res.text();
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { parsed = text; }
+  await logActivity({
+    type: "admin",
+    level: "info",
+    message: "Delete published post",
+    detail: p.id.slice(0, 8),
+  });
+  return { ok: res.ok, status: res.status, result: parsed };
+}
+
+
+// ── Action: getRewriteLog ──────────────────────────────────────────────────
+// Recent AI-rewrite attempts (Settings → AI & Translation → Rewrite log):
+// one row per rewrite chunk, success or failure, with provider/model and
+// headline previews. Pure read; the pipeline writes the rows.
+async function getRewriteLog(): Promise<{ entries: Array<Record<string, unknown>> }> {
+  const rows = await rest<Array<Record<string, unknown>>>("rewrite_log", {
+    query: "order=created_at.desc&limit=50",
+  });
+  return { entries: snakeArray(rows) };
+}
+
+// ── Action: resolveSending ─────────────────────────────────────────────────
+// Reconcile a stuck 'sending' published_history row. These rows are ambiguous
+// by design: Telegram may or may not have delivered. The operator decides:
+//   action "sent"  → the message was delivered (or is acceptable as lost);
+//                    mark the row 'sent' so it stops blocking and the archive
+//                    is honest.
+//   action "retry" → delete the row; if the queue item is still queued the
+//                    next publish cycle re-delivers to that chat.
+async function resolveSending(p: { id?: string; resolve?: string }): Promise<unknown> {
+  // `resolve` (not `action`): the router dispatches on the payload's `action`
+  // field, so naming this choice `action` would collide and override the RPC.
+  const id = String(p.id ?? "");
+  const action = String(p.resolve ?? "");
+  if (!id || (action !== "sent" && action !== "retry")) {
+    throw new HttpError(400, "id and resolve ('sent'|'retry') required");
+  }
+  if (action === "sent") {
+    await rest(`published_history?id=eq.${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { status: "sent", updated_at: new Date().toISOString() },
+      prefer: "return=minimal",
+    });
+  } else {
+    await rest(`published_history?id=eq.${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      prefer: "return=minimal",
+    });
+  }
+  await logActivity({
+    type: "admin",
+    level: "info",
+    message: `Stuck delivery ${action === "sent" ? "marked sent" : "deleted for retry"}: ${id.slice(0, 8)}`,
+  });
+  return { ok: true, id, action };
+}
+
+// ── Action: getRewriteAnalytics ────────────────────────────────────────────
+// 7-day rewrite health (Settings → AI & Translation → Rewrite Analytics):
+// success/fallback rates, per-provider success + avg latency, daily trend.
+// Pure aggregation of the last 7 days of rewrite_log (a few rows per ingest
+// cycle, so the fetch is small); the math lives in _shared.ts (unit-tested).
+async function getRewriteAnalytics(): Promise<Record<string, unknown>> {
+  const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
+  const rows = await rest<Array<Record<string, unknown>>>("rewrite_log", {
+    query: `created_at=gte.${since}&order=created_at.desc&limit=5000`,
+  }).catch(() => []);
+  return aggregateRewriteAnalytics(rows);
+}
+
 const handlers: Record<string, (p: any) => Promise<unknown>> = {
   verifyPin: async () => ({ ok: true }),
   getDashboard,
+  dashboardSummary: (p) => statefulDashboard("dashboardSummary", p, fetchDashboardSummary),
+  dashboardFeed: (p) => statefulDashboard("dashboardFeed", p, fetchDashboardFeed),
+  dashboardQueue: (p) => statefulDashboard("dashboardQueue", p, fetchDashboardQueue),
+  dashboardChats: (p) => statefulDashboard("dashboardChats", p, fetchDashboardChats),
+  dashboardSources: (p) => statefulDashboard("dashboardSources", p, fetchDashboardSources),
+  dashboardAnalytics: (p) => statefulDashboard("dashboardAnalytics", p, fetchDashboardAnalytics),
+  dashboardAi: (p) => statefulDashboard("dashboardAi", p, fetchDashboardAi),
+  dashboardEvents: (p) => statefulDashboard("dashboardEvents", p, fetchDashboardEvents),
+  dashboardPublished: (p) => statefulDashboard("dashboardPublished", p, fetchDashboardPublished),
+  // Live manual-run progress: the lightweight read the Overview page polls
+  // (every ~2.5s) while a manual fetch/publish is in flight. Single-row
+  // settings read — the pipeline writes pipeline_run (jsonb) as it advances.
+  getPipelineRun: async () => {
+    const s = await getSettings();
+    return { pipeline_run: (s as Record<string, unknown>).pipeline_run ?? null };
+  },
+  resolveSending,
   saveSettings,
+  setCronSchedule,
   setPauseState,
   setTranslationModel,
   updateChat,
@@ -1579,6 +2107,7 @@ const handlers: Record<string, (p: any) => Promise<unknown>> = {
   testSource,
   refreshBotInfo,
   setWebhook,
+  enableChatWebhooks,
   syncBotChats,
   sendTestMessage,
   testPoll,
@@ -1588,9 +2117,144 @@ const handlers: Record<string, (p: any) => Promise<unknown>> = {
   previewNextBatch,
   editQueueItem,
   publishQueueItem,
+  deletePublishedPost,
   setQueueStatus,
   deleteQueueItem,
+  getRewriteLog,
+  getRewriteAnalytics,
+  // Scheduled Posts / Campaign engine (Settings → Campaigns).
+  listScheduled,
+  saveScheduledCampaign,
+  saveScheduledItem,
+  deleteScheduledCampaign,
+  deleteScheduledItem,
+  setScheduledCampaignStatus,
+  scheduledSkipNext,
+  scheduledSendNext,
+  scheduledSendItem,
+  scheduledResetItem,
 };
+
+// ── Action: enableChatWebhooks ──────────────────────────────────────────────
+// Points every bot's Telegram webhook at this function's /telegram-webhook
+// path so chat discovery is REAL-TIME (a my_chat_member update registers the
+// chat instantly) instead of relying on the 24h getUpdates retention window.
+// Each bot carries its own secret_token; the receiver verifies + identifies it.
+async function enableChatWebhooks(_p: Record<string, unknown>): Promise<unknown> {
+  const botRows = await rest<Array<{ id: string; name?: string | null; token?: string | null; enabled?: boolean | null }>>(
+    "bots",
+    { query: "select=id,name,token,enabled&limit=100" },
+  ).catch(() => []);
+  const targets: Array<{ label: string; token: string }> = [];
+  if (TELEGRAM_BOT_TOKEN) targets.push({ label: "primary bot", token: TELEGRAM_BOT_TOKEN });
+  for (const b of botRows ?? []) {
+    const tok = String(b.token ?? "").trim();
+    if (!tok || b.enabled === false) continue;
+    targets.push({ label: b.name ?? "bot", token: tok });
+  }
+  const results: Array<{ label: string; ok: boolean; error?: string }> = [];
+  for (const t of targets) {
+    const r = await tgApi("setWebhook", {
+      url: TG_WEBHOOK_BASE,
+      secret_token: await webhookSecretFor(t.token),
+      allowed_updates: ["message", "channel_post", "edited_channel_post", "my_chat_member"],
+      drop_pending_updates: false,
+    }, t.token);
+    results.push({ label: t.label, ok: r.ok, error: r.ok ? undefined : r.description ?? "unknown" });
+  }
+  const okCount = results.filter((r) => r.ok).length;
+  await logActivity({
+    type: "chat",
+    level: okCount > 0 ? "info" : "warning",
+    message: `Enabled real-time chat webhooks for ${okCount}/${targets.length} bot(s)`,
+    detail: results.map((r) => `${r.label}: ${r.ok ? "ok" : r.error}`).join(", "),
+  });
+  return { results, ok: okCount === targets.length };
+}
+
+// Telegram update receiver (path /telegram-webhook). Verified by the
+// X-Telegram-Bot-Api-Secret-Token header, which also identifies the bot.
+// Registers/refreshes the chat row; never re-points an existing chat to a
+// different bot. Returns 200 quickly so Telegram does not retry.
+async function handleTelegramWebhook(req: Request): Promise<Response> {
+  try {
+    const text = await req.text();
+    const update = JSON.parse(text) as Record<string, unknown>;
+    const provided = req.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
+    let botId: string | null = null;
+    let label = "primary bot";
+    let verified = provided.length > 0 && (await webhookSecretFor(TELEGRAM_BOT_TOKEN)) === provided;
+    if (!verified) {
+      const botRows = await rest<Array<{ id: string; name?: string | null; token?: string | null }>>(
+        "bots",
+        { query: "select=id,name,token&limit=100" },
+      ).catch(() => []);
+      for (const b of botRows ?? []) {
+        const tok = String(b.token ?? "");
+        if (!tok) continue;
+        if ((await webhookSecretFor(tok)) === provided) {
+          verified = true;
+          botId = String(b.id);
+          label = b.name ?? "bot";
+          break;
+        }
+      }
+    }
+    if (!verified) return jsonResponse(401, { error: "Unauthorized" });
+
+    const msg = (update.message ?? update.channel_post ?? update.edited_channel_post ?? update.my_chat_member) as Record<string, unknown> | undefined;
+    const chat = (msg?.chat ?? undefined) as Record<string, unknown> | undefined;
+    const cid = Number((chat as Record<string, unknown> | undefined)?.id ?? 0);
+    if (!cid) return jsonResponse(200, { ok: true, ignored: true });
+    const mcm = update.my_chat_member as Record<string, unknown> | undefined;
+    const status = (mcm?.new_chat_member as Record<string, unknown> | undefined)?.status;
+    if (status === "left" || status === "kicked") {
+      await rest("chats", {
+        method: "PATCH",
+        body: { active: false, last_seen_at: new Date().toISOString() },
+        query: `chat_id=eq.${cid}`,
+      }).catch(() => {});
+      return jsonResponse(200, { ok: true });
+    }
+    const title = (chat as Record<string, unknown>).title ?? (chat as Record<string, unknown>).username ?? null;
+    const username = (chat as Record<string, unknown>).username ?? null;
+    const type = (chat as Record<string, unknown>).type ?? null;
+    const exists = await rest<Array<{ id: string }>>("chats", { query: `chat_id=eq.${cid}&limit=1` }).catch(() => []);
+    if (Array.isArray(exists) && exists.length > 0) {
+      // Refresh identity fields too (a renamed channel / edited post carries
+      // the new title) so webhook updates never leave stale titles behind
+      // until the next full sync.
+      const patch: Record<string, unknown> = { active: true, last_seen_at: new Date().toISOString() };
+      if (title !== null && title !== undefined) patch.title = title;
+      if (username !== null && username !== undefined) patch.username = username;
+      if (type !== null && type !== undefined) patch.type = type;
+      await rest("chats", { method: "PATCH", body: patch, query: `chat_id=eq.${cid}` }).catch(() => {});
+      return jsonResponse(200, { ok: true, refreshed: true });
+    }
+    await rest("chats", {
+      method: "POST",
+      body: {
+        chat_id: cid,
+        title,
+        username,
+        type: type ?? "private",
+        active: true,
+        bot_id: botId,
+        last_seen_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+      prefer: "return=minimal",
+    }).catch(() => {});
+    await logActivity({
+      type: "chat",
+      level: "info",
+      message: `Webhook discovered chat "${String(title ?? cid).slice(0, 40)}" (${label})`,
+    });
+    return jsonResponse(200, { ok: true });
+  } catch {
+    return jsonResponse(200, { ok: false });
+  }
+}
 
 // ── CORS helpers (so the SPA can call directly without a proxy) ─────────────
 const CORS_HEADERS: Record<string, string> = {
@@ -1611,6 +2275,12 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
+  // Telegram webhook receiver (real-time chat discovery): identified by the
+  // URL path, verified by the secret-token header — runs before the PIN gate
+  // because Telegram does not know the admin PIN.
+  if (new URL(req.url).pathname.endsWith("/telegram-webhook")) {
+    return await handleTelegramWebhook(req);
+  }
   if (req.method !== "POST" && req.method !== "GET") {
     return jsonResponse(405, { error: "method not allowed" });
   }
@@ -1627,9 +2297,24 @@ Deno.serve(async (req) => {
   if (typeof action !== "string" || !action) {
     return jsonResponse(400, { error: "missing action" });
   }
+  // Rate-limit the PIN gate before checking: an IP at the failure ceiling
+  // gets a 429 without revealing whether the guess would have been right.
+  const ip = clientIp(req);
+  const lockedFor = await lockoutSeconds(ip);
+  if (lockedFor > 0) {
+    return jsonResponse(429, { error: `Too many failed attempts — locked for ${lockedFor}s` });
+  }
   if (!pinMatches(pin)) {
+    // Only real login attempts (verifyPin) count toward the per-IP lockout.
+    // Dashboard polls from a device holding a stale stored PIN also get a
+    // 403, but counting those would let a device lock out its own IP (8
+    // parallel resource polls x 403 on mount = instant lockout). A
+    // brute-forcer gets the same throttle from the login path alone — the
+    // PIN gate is the same for every action.
+    if (action === "verifyPin") await recordPinFailure(ip);
     return jsonResponse(403, { error: "Incorrect PIN" });
   }
+  await clearPinFailures(ip);
   const handler = handlers[action];
   if (!handler) return jsonResponse(404, { error: `unknown action "${action}"` });
   try {

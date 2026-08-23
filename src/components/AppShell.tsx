@@ -15,8 +15,8 @@ import {
   Moon,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
-import { api, useAdminQuery } from "@/lib/supabaseAdminHooks";
-import { readStoredPin, clearStoredPin } from "@/routes/index";
+import { clearStoredPin } from "@/lib/pinStorage";
+import { NewsroomProvider, useNewsroomData } from "@/lib/newsroomStore";
 import { Button } from "@/components/ui/button";
 
 const NAV_ITEMS = [
@@ -37,39 +37,20 @@ const MOBILE_NAV = [
   { to: "/more", label: "More", icon: Menu },
 ] as const;
 
-// One shared data hook so the shell badge, bot status and every page read
-// the same live payload. The shell consumes only the count + pause state;
-// pages consume the rest.
-export function useNewsroomData() {
-  const pin = readStoredPin();
-  const pinArgs = pin ? { pin } : {};
-  return useAdminQuery<{
-    settings?: Record<string, unknown>;
-    chats?: any[];
-    sources?: any[];
-    topics?: any[];
-    queue?: any[];
-    queueAll?: any[];
-    history?: any[];
-    recentActivity?: any[];
-    analytics?: any[];
-    queuedTotal?: number;
-    published24h?: number;
-    polls24h?: number;
-    translationFails24h?: number;
-    aiUsage24h?: { calls?: number; promptTokens?: number; completionTokens?: number; byProvider?: Record<string, any> };
-    translationFailures?: any[];
-    translationHistory?: any[];
-    polls?: any[];
-    schemaMigrations?: { ok: boolean; missing?: Record<string, string[]> };
-    cronHealth?: any[];
-    botConfigured?: boolean;
-    newsdataConfigured?: boolean;
-    clusters?: any[];
-  }>(api.admin.getDashboard, pin ? pinArgs : "skip");
-}
+// The shell badge, bot status and every page read the same live payload from
+// the shared NewsroomProvider (one set of fetches on per-resource cadences,
+// instead of every mounted component polling the whole dashboard).
+export { useNewsroomData } from "@/lib/newsroomStore";
 
 export function AppShell({ children }: { children?: ReactNode }) {
+  return (
+    <NewsroomProvider>
+      <AppShellInner>{children}</AppShellInner>
+    </NewsroomProvider>
+  );
+}
+
+function AppShellInner({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
   const path = useRouterState({ select: (s) => s.location.pathname });
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -109,11 +90,11 @@ export function AppShell({ children }: { children?: ReactNode }) {
       {/* ── Desktop sidebar ─────────────────────────── */}
       <aside className="fixed inset-y-0 left-0 z-40 hidden w-56 flex-col border-r border-sidebar-border bg-sidebar md:flex">
         <Link to="/overview" className="flex items-center gap-2.5 border-b border-sidebar-border px-4 py-4">
-          <span className="grid h-7 w-7 place-items-center rounded-[6px] bg-primary text-[11px] font-bold tracking-wider text-primary-foreground">
+          <span className="grid h-7 w-7 place-items-center rounded-[6px] bg-brand text-[11px] font-bold tracking-wider text-brand-foreground">
             ID
           </span>
           <span className="leading-tight">
-            <span className="block text-sm font-bold tracking-[0.18em] text-sidebar-foreground">IRAN DESK</span>
+            <span className="block font-display text-sm font-bold tracking-[0.16em] text-sidebar-foreground">IRAN DESK</span>
             <span className="block text-[10px] font-medium uppercase tracking-[0.22em] text-muted-foreground">
               Newsroom
             </span>
@@ -130,11 +111,11 @@ export function AppShell({ children }: { children?: ReactNode }) {
                 to={item.to}
                 className={`flex items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium transition-colors ${
                   active
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                    ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
                 }`}
               >
-                <Icon className={`h-4 w-4 ${active ? "text-sidebar-foreground" : ""}`} />
+                <Icon className={`h-4 w-4 ${active ? "text-primary-foreground" : ""}`} />
                 <span className="flex-1">{item.label}</span>
                 {item.to === "/inbox" && queued > 0 ? (
                   <span
@@ -155,7 +136,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
             to="/settings"
             className={`flex items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium transition-colors ${
               isActive("/settings")
-                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                ? "bg-primary text-primary-foreground"
                 : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
             }`}
           >
@@ -173,22 +154,24 @@ export function AppShell({ children }: { children?: ReactNode }) {
               {lastRunAt ? ` · last run ${lastRunAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
             </span>
           </div>
-          <button
-            type="button"
-            onClick={toggleTheme}
-            className="flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
-          >
-            {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            {theme === "dark" ? "Light mode" : "Dark mode"}
-          </button>
-          <button
-            type="button"
-            onClick={lock}
-            className="flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
-          >
-            <Lock className="h-4 w-4" />
-            Lock console
-          </button>
+          <div className="mt-1 flex flex-col gap-0.5 border-t border-sidebar-border pt-1.5">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
+            >
+              {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              {theme === "dark" ? "Light mode" : "Dark mode"}
+            </button>
+            <button
+              type="button"
+              onClick={lock}
+              className="flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-foreground"
+            >
+              <Lock className="h-4 w-4" />
+              Lock console
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -202,10 +185,10 @@ export function AppShell({ children }: { children?: ReactNode }) {
           <Menu className="h-5 w-5" />
         </button>
         <Link to="/overview" className="flex items-center gap-2">
-          <span className="grid h-6 w-6 place-items-center rounded-[6px] bg-primary text-[10px] font-bold text-primary-foreground">
+          <span className="grid h-6 w-6 place-items-center rounded-[6px] bg-brand text-[10px] font-bold text-brand-foreground">
             ID
           </span>
-          <span className="text-sm font-bold tracking-[0.15em]">IRAN DESK</span>
+          <span className="font-display text-sm font-bold tracking-[0.14em]">IRAN DESK</span>
         </Link>
         <span
           className={`ml-auto flex items-center gap-1.5 text-[10px] font-medium ${
@@ -238,7 +221,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
           <div className="absolute inset-0 bg-black/60" onClick={() => setMobileOpen(false)} />
           <div className="absolute inset-y-0 left-0 flex w-64 flex-col border-r border-border bg-sidebar">
             <div className="flex items-center justify-between border-b border-sidebar-border px-4 py-3">
-              <span className="text-sm font-bold tracking-[0.15em]">IRAN DESK</span>
+              <span className="font-display text-sm font-bold tracking-[0.14em]">IRAN DESK</span>
               <button type="button" onClick={() => setMobileOpen(false)} className="rounded-md p-1 text-muted-foreground">
                 <X className="h-4 w-4" />
               </button>
@@ -253,7 +236,7 @@ export function AppShell({ children }: { children?: ReactNode }) {
                     to={item.to}
                     onClick={() => setMobileOpen(false)}
                     className={`flex items-center gap-2.5 rounded-[6px] px-3 py-2 text-[13px] font-medium ${
-                      active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "text-muted-foreground"
+                      active ? "bg-primary text-primary-foreground" : "text-muted-foreground"
                     }`}
                   >
                     <Icon className="h-4 w-4" />

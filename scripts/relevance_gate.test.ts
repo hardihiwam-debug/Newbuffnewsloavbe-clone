@@ -86,3 +86,59 @@ test("keeps official denial (deny verb)", () => {
 test("keeps Netanyahu Gaza campaign", () => {
   expect(gate("Netanyahu vows to continue Gaza campaign")).toBe(true);
 });
+
+test("keeps plural-missile strike headline (missiles)", () => {
+  expect(gate("Iran fires missiles at Tel Aviv overnight", "IRGC launched a wave of ballistic missiles toward Israeli cities")).toBe(true);
+});
+
+test("keeps plural-drone / plural-airstrike headlines", () => {
+  expect(gate("Israeli drones hit Hezbollah outpost near the border")).toBe(true);
+  expect(gate("US airstrikes target Houthi missile launchers in Yemen", "CENTCOM confirms strikes on launch sites")).toBe(true);
+});
+
+test("keeps plural-ceasefire talks headline", () => {
+  expect(gate("Hamas delegation heads to Cairo for Gaza ceasefires talks", "Parties discuss a permanent truce")).toBe(true);
+});
+
+test("keeps plural-hostage crisis headline", () => {
+  expect(gate("Talks stall over release of hostages held by Hamas", "Families demand a deal")).toBe(true);
+});
+
+test("still drops off-beat sports despite the plural fix", () => {
+  expect(gate("Iran wins senior kyorugi, Pakistan tops poomsae at World Taekwondo President's Cup")).toBe(false);
+});
+
+// ── Commodity-gate tightening: gold/oil/domestic policy false positives ───
+
+test("drops bare gold price news (no conflict context)", () => {
+  expect(gate("Gold prices in Egypt rise 5.8% in one week")).toBe(false);
+  expect(gate("Harmony Gold (NYSE:HMY): An Affordable Growth Play")).toBe(false);
+  expect(gate("Egypt gold price surge 5.8 percent")).toBe(false);
+});
+
+test("drops domestic policy news even when country name matches", () => {
+  expect(gate("Iran drafts two-phase housing plan at Transport Ministry")).toBe(false);
+  expect(gate("IEA: Southeast Asia needs grid investment to nearly quadruple by 2050")).toBe(false);
+});
+
+test("keeps gold/oil WITH conflict context", () => {
+  expect(gate("Gold sanctions imposed on Iranian proxies")).toBe(true);
+  expect(gate("Oil tanker struck in Strait of Hormuz amid tensions")).toBe(true);
+  expect(gate("How the US and Middle East allies flipped the oil script on Iran",
+    "Washington imposed new sanctions on Iranian oil exports")).toBe(true);
+});
+
+test("keeps Iran+negotiations (governance + conflict context)", () => {
+  expect(gate("US-Iran marathon negotiations resume in Oman")).toBe(true);
+  expect(gate("Iran nuclear talks reach critical stage as sanctions loom")).toBe(true);
+  expect(gate("Marathon Gaza ceasefire talks enter third day in Cairo")).toBe(true);
+});
+
+test("keeps forced displacement stories", () => {
+  expect(gate("Israeli settlers force Palestinians from homes in West Bank's Area B")).toBe(true);
+});
+
+test("keeps Iran minister WITH conflict signal", () => {
+  expect(gate("Iran's acting deputy defence minister says military remains intact")).toBe(true);
+  expect(gate("Senior Khamenei adviser warns of preemptive Iranian response to threats")).toBe(true);
+});

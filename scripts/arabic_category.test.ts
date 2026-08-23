@@ -28,8 +28,25 @@ test("Arabic Iran missile threat classifies as war", () => {
   expect(keywordCategory("طهران تهدد بصواريخ باليستية ردا على أي هجوم إسرائيلي")).toBe("war");
 });
 
-test("Arabic Israel/Gaza strike classifies as war, not middle-east", () => {
-  expect(keywordCategory("غارات إسرائيلية مكثفة على قطاع غزة فجر اليوم")).toBe("war");
+test("Arabic Gaza strike classifies as gaza (own category), not war/middle-east", () => {
+  expect(keywordCategory("غارات إسرائيلية مكثفة على قطاع غزة فجر اليوم")).toBe("gaza");
+  const cats = allCategoriesOf("غارات إسرائيلية مكثفة على قطاع غزة فجر اليوم");
+  expect(cats).toContain("gaza");
+  expect(cats).toContain("war");
+  expect(cats).toContain("middle-east");
+});
+
+test("Arabic Syria and Lebanon stories get their own categories", () => {
+  expect(keywordCategory("غارات تركية على مواقع في ريف حلب شمال سوريا")).toBe("syria");
+  expect(keywordCategory("حزب الله يعلن استهداف مواقع إسرائيلية في جنوب لبنان")).toBe("lebanon");
+  const cats = allCategoriesOf("حزب الله يستهدف مواقع إسرائيلية في الضاحية الجنوبية لبيروت");
+  expect(cats).toContain("lebanon");
+  expect(cats).not.toContain("proxies");
+});
+
+test("Arabic Gaza story routes to a gaza-whitelisted bot", () => {
+  const cats = allCategoriesOf("شهداء وجرحى في قصف إسرائيلي على مخيم جباليا");
+  expect(cats).toContain("gaza");
 });
 
 test("Arabic Hormuz tanker story matches oil + war for routing", () => {

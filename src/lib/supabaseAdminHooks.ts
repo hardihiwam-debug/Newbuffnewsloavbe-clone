@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { adminApi, adminActionsApi } from "./adminApi";
+import { applyStatefulEnvelope } from "./stateEnvelope";
 
 // Convex's `useQuery` accepts `args === "skip"` to suppress the call.
 // Match it: any "skip"-ish arg → no network call, undefined return.
@@ -46,11 +47,32 @@ export function useAdminQuery<T = any>(
   // Track the latest argsKey we've sent so a stale response can't overwrite
   // data from a newer args (mirrors Convex's behavior).
   const latestKeyRef = useRef(argsKey);
+  // Last-seen state fingerprint for state-hash conditional polling (egress
+  // fast-win): sent as ifState[action] on the next poll; when the server
+  // confirms nothing changed it answers { __unchanged: true } (~100 bytes)
+  // and this hook keeps the previous data.
+  const fpRef = useRef<string | undefined>(undefined);
+
+  // Applies a stateful response (pure helper in stateEnvelope.ts, unit-tested):
+  // stores the fresh fingerprint, keeps existing data when the server says
+  // nothing changed, and strips the envelope fields so they never leak into
+  // the shared store payload.
+  const applyResponse = useCallback((value: unknown, setter: (v: T | undefined) => void) => {
+    const res = applyStatefulEnvelope<T>(value);
+    if (res.enveloped) fpRef.current = res.fingerprint;
+    if (!res.unchanged) setter(res.data);
+  }, []);
 
   useEffect(() => {
     latestKeyRef.current = argsKey;
     if (skipped) {
       setData(undefined);
+      // Mount-on-demand: a gated resource unmounts when its page is left.
+      // Clear the last-seen fingerprint so a RETURN visit always refetches
+      // fresh — otherwise the first poll sends the stale fingerprint, the
+      // server answers { __unchanged: true }, and data stays undefined
+      // (stuck on loading) until the underlying data actually changes.
+      fpRef.current = undefined;
       return;
     }
     let cancelled = false;
@@ -58,15 +80,18 @@ export function useAdminQuery<T = any>(
 
     (async () => {
       try {
-        const fn = (adminApi as unknown as Record<string, (a: Record<string, unknown>, init?: { signal?: AbortSignal }) => Promise<unknown>>)[action];
+        const fn = (adminApi as unknown as Record<string, (a: Record<string, unknown>, init?: { signal?: AbortSignal; ifState?: Record<string, string> }) => Promise<unknown>>)[action];
         if (typeof fn !== "function") {
           if (!cancelled && process.env.NODE_ENV !== "production") {
             console.warn(`[useAdminQuery] unknown action "${action}"`);
           }
           return;
         }
-        const value = (await fn(args as Record<string, unknown>, { signal: ctrl.signal })) as T;
-        if (!cancelled && latestKeyRef.current === argsKey) setData(value);
+        const value = (await fn(args as Record<string, unknown>, {
+          signal: ctrl.signal,
+          ...(fpRef.current ? { ifState: { [action]: fpRef.current } } : {}),
+        })) as T;
+        if (!cancelled && latestKeyRef.current === argsKey) applyResponse(value, setData);
       } catch (e) {
         // Convex's `useQuery` would raise the error to the nearest boundary.
         // We mirror that by leaving `data` undefined; the UI's loading branch
@@ -86,10 +111,33 @@ export function useAdminQuery<T = any>(
 
   // Periodic poll to keep the dashboard reasonably live in the absence of
   // Convex-style reactive subscriptions. Disabled when refetchMs <= 0.
+  // Pauses while the tab is hidden (visibilitychange) so a background tab
+  // stops paying egress, and resumes the moment it's visible again.
   useEffect(() => {
     if (skipped || refetchMs <= 0) return;
-    const id = setInterval(() => setTick((t) => t + 1), refetchMs);
-    return () => clearInterval(id);
+    let id: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (id !== null) return;
+      id = setInterval(() => setTick((t) => t + 1), refetchMs);
+    };
+    const stop = () => {
+      if (id !== null) {
+        clearInterval(id);
+        id = null;
+      }
+    };
+    const onVis = () => (document.hidden ? stop() : start());
+    if (typeof document !== "undefined") {
+      if (document.hidden) stop();
+      else start();
+      document.addEventListener("visibilitychange", onVis);
+      return () => {
+        stop();
+        document.removeEventListener("visibilitychange", onVis);
+      };
+    }
+    start();
+    return stop;
   }, [skipped, refetchMs]);
 
   useEffect(() => {
@@ -98,10 +146,13 @@ export function useAdminQuery<T = any>(
     const ctrl = new AbortController();
     (async () => {
       try {
-        const fn = (adminApi as unknown as Record<string, (a: Record<string, unknown>, init?: { signal?: AbortSignal }) => Promise<unknown>>)[action];
+        const fn = (adminApi as unknown as Record<string, (a: Record<string, unknown>, init?: { signal?: AbortSignal; ifState?: Record<string, string> }) => Promise<unknown>>)[action];
         if (typeof fn !== "function") return;
-        const value = (await fn(args as Record<string, unknown>, { signal: ctrl.signal })) as T;
-        if (!cancelled && latestKeyRef.current === argsKey) setData(value);
+        const value = (await fn(args as Record<string, unknown>, {
+          signal: ctrl.signal,
+          ...(fpRef.current ? { ifState: { [action]: fpRef.current } } : {}),
+        })) as T;
+        if (!cancelled && latestKeyRef.current === argsKey) applyResponse(value, setData);
       } catch {
         // ignore — UI will retry on next tick.
       }

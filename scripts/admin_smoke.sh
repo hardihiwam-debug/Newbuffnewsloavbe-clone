@@ -2,11 +2,16 @@
 # Smoke test for the deployed Supabase `admin` Edge Function.
 # Run after each deploy to confirm PIN gate + key actions still work end-to-end.
 #
-#   sh ./scripts/admin_smoke.sh
+#   ADMIN_PIN=<pin> sh ./scripts/admin_smoke.sh
 #
-# Override the project URL or PIN via env vars:
+# ADMIN_PIN is REQUIRED — the admin function is fail-closed (no hardcoded
+# default), so without the secret the first check 403s and the run is
+# meaningless. ADMIN_URL defaults to the project's function URL:
 #   ADMIN_URL=https://<ref>.supabase.co/functions/v1/admin
-#   ADMIN_PIN=200006
+#
+# Note: check [1/7] deliberately sends a wrong PIN, which counts toward the
+# per-IP brute-force lockout (5 failures / 15 min). Running the smoke script
+# more than ~4 times in 15 minutes will trip the 429 lockout — space runs out.
 #
 # Exit code: 0 if every assertion passes, 1 if any check fails (or the
 # network call exits non-zero).
@@ -14,7 +19,12 @@
 set -u
 
 ADMIN_URL="${ADMIN_URL:-https://ljvdaajfbkqeodglghwn.supabase.co/functions/v1/admin}"
-ADMIN_PIN="${ADMIN_PIN:-200006}"
+ADMIN_PIN="${ADMIN_PIN:-}"
+if [ -z "$ADMIN_PIN" ]; then
+  echo "ADMIN_PIN is required (the admin function is fail-closed — no default PIN)." >&2
+  echo "Usage: ADMIN_PIN=<pin> sh ./scripts/admin_smoke.sh" >&2
+  exit 1
+fi
 
 pass=0
 fail=0

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Plus, Trash2 } from "lucide-react";
-import { readStoredPin } from "@/routes/index";
+import { readStoredPin } from "@/lib/pinStorage";
 
 type BotRow = {
   _id: string;
@@ -21,11 +21,15 @@ export function BotsCard({
   categories,
   saveBot,
   deleteBot,
+  primaryExcluded = [],
+  onPrimaryExcludedChange,
 }: {
   bots: BotRow[];
   categories: string[];
   saveBot: (p: Record<string, unknown>) => Promise<unknown>;
   deleteBot: (p: { id: string }) => Promise<unknown>;
+  primaryExcluded?: string[];
+  onPrimaryExcludedChange?: (next: string[]) => void;
 }) {
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
@@ -64,9 +68,68 @@ export function BotsCard({
 
   return (
     <div className="space-y-3">
+      {/* Primary bot (blocklist mode): everything except the excluded categories */}
+      <div className="rounded-lg border border-primary/25 p-3 space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <p className="text-xs font-medium truncate text-foreground">Primary bot</p>
+            <p className="text-[10px] text-muted-foreground">
+              Main bot (env token) · delivers every category except the ones excluded below
+            </p>
+          </div>
+        </div>
+        <div>
+          <Label className="text-[11px] font-medium text-foreground">
+            {primaryExcluded.length === 0
+              ? "Excludes: none — sends ALL categories"
+              : `Excludes: ${primaryExcluded.join(", ")}`}
+          </Label>
+          <p className="text-[10px] text-muted-foreground">
+            Tap a category to exclude it from the main bot; tap again to un-exclude.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            type="button"
+            onClick={() => onPrimaryExcludedChange?.([])}
+            className={`rounded-full px-3 py-1 text-[11px] font-medium transition-colors ${
+              primaryExcluded.length === 0
+                ? "bg-primary text-primary-foreground"
+                : "bg-muted text-muted-foreground hover:bg-muted/80"
+            }`}
+            title="No exclusions — the main bot receives all categories"
+          >
+            All
+          </button>
+          {categories.map((cat) => {
+            const excluded = primaryExcluded.includes(cat);
+            return (
+              <button
+                key={cat}
+                type="button"
+                onClick={() =>
+                  onPrimaryExcludedChange?.(
+                    excluded
+                      ? primaryExcluded.filter((c) => c !== cat)
+                      : [...primaryExcluded, cat],
+                  )
+                }
+                className={`rounded-full px-3 py-1 text-[11px] font-medium transition-colors ${
+                  excluded
+                    ? "bg-destructive text-white"
+                    : "bg-muted text-muted-foreground hover:bg-muted/80"
+                }`}
+              >
+                {cat}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {bots.length === 0 ? (
         <p className="text-[11px] text-muted-foreground py-1">
-          No additional bots. The primary bot (env token) delivers everything to all chats.
+          No additional bots — add one to route selected categories to another channel.
         </p>
       ) : (
         bots.map((b) => {

@@ -9,7 +9,7 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "deploy": "node scripts/_deploy_fn.mjs",
-    "deploy:all": "node scripts/_deploy_fn.mjs pipeline admin",
+    "deploy:all": "node scripts/_deploy_fn.mjs pipeline admin scheduled telegram-webhook",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

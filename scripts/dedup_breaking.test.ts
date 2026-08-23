@@ -57,8 +57,8 @@ test("severity levels escalate", () => {
   expect(severityLevel("routine market update")).toBe(0);
 });
 
-test("keywordCategory classifies a non-Iran Gaza strike as war", () => {
-  expect(keywordCategory("Israeli airstrike on Gaza kills 12")).toBe("war");
+test("keywordCategory classifies a Gaza strike as gaza (own category)", () => {
+  expect(keywordCategory("Israeli airstrike on Gaza kills 12")).toBe("gaza");
 });
 
 test("keywordCategory classifies Hormuz tanker story as oil", () => {
