@@ -13,8 +13,10 @@ import {
   X,
   Sun,
   Moon,
+  ChevronUp,
+  Clock,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useState, type ReactNode, useRef, useEffect, useCallback } from "react";
 import { clearStoredPin } from "@/lib/pinStorage";
 import { NewsroomProvider, useNewsroomData } from "@/lib/newsroomStore";
 import { Button } from "@/components/ui/button";
@@ -29,12 +31,18 @@ const NAV_ITEMS = [
   { to: "/analytics", label: "Analytics", icon: BarChart3 },
 ] as const;
 
-const MOBILE_NAV = [
+const MOBILE_PRIMARY = [
   { to: "/overview", label: "Overview", icon: LayoutDashboard },
   { to: "/inbox", label: "Inbox", icon: Inbox },
   { to: "/events", label: "Events", icon: GitBranch },
+  { to: "/published", label: "Published", icon: Send },
+] as const;
+
+const MORE_ITEMS = [
   { to: "/sources", label: "Sources", icon: RadioTower },
-  { to: "/more", label: "More", icon: Menu },
+  { to: "/aidesk", label: "AI Desk", icon: Sparkles },
+  { to: "/analytics", label: "Analytics", icon: BarChart3 },
+  { to: "/settings", label: "Settings", icon: Settings },
 ] as const;
 
 // The shell badge, bot status and every page read the same live payload from
@@ -54,6 +62,8 @@ function AppShellInner({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
   const path = useRouterState({ select: (s) => s.location.pathname });
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const sheetRef = useRef<HTMLDivElement>(null);
   const [theme, setTheme] = useState<"dark" | "light">(() =>
     typeof document !== "undefined" && document.documentElement.classList.contains("dark")
       ? "dark"
@@ -84,6 +94,31 @@ function AppShellInner({ children }: { children?: ReactNode }) {
   }
 
   const isActive = (to: string) => path.startsWith(to);
+
+  // Close More sheet on outside click
+  useEffect(() => {
+    if (!moreOpen) return;
+    const onPointer = (e: PointerEvent) => {
+      if (sheetRef.current && !sheetRef.current.contains(e.target as Node)) {
+        setMoreOpen(false);
+      }
+    };
+    // Delay listeners to avoid the click that opened the sheet
+    const t = setTimeout(() => {
+      document.addEventListener("pointerdown", onPointer);
+    }, 100);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener("pointerdown", onPointer);
+    };
+  }, [moreOpen]);
+
+  // Close on navigation
+  useEffect(() => { setMoreOpen(false); setMobileOpen(false); }, [path]);
+
+  const lastRunLabel = lastRunAt
+    ? `${Math.round((Date.now() - lastRunAt.getTime()) / 60_000)}m ago`
+    : null;
 
   return (
     <div className="flex min-h-screen">
@@ -176,7 +211,7 @@ function AppShellInner({ children }: { children?: ReactNode }) {
       </aside>
 
       {/* ── Mobile top bar ──────────────────────────── */}
-      <div className="fixed inset-x-0 top-0 z-40 flex items-center gap-2 border-b border-border bg-background/95 px-3 py-2.5 md:hidden">
+      <div className="fixed inset-x-0 top-0 z-40 flex items-center gap-2 border-b border-border bg-background/95 px-3 py-2 md:hidden">
         <button
           type="button"
           className="rounded-md p-1.5 text-muted-foreground hover:text-foreground"
@@ -188,31 +223,40 @@ function AppShellInner({ children }: { children?: ReactNode }) {
           <span className="grid h-6 w-6 place-items-center rounded-[6px] bg-brand text-[10px] font-bold text-brand-foreground">
             ID
           </span>
-          <span className="font-display text-sm font-bold tracking-[0.14em]">IRAN DESK</span>
+          <span className="font-display text-xs font-bold tracking-[0.12em]">IRAN DESK</span>
         </Link>
-        <span
-          className={`ml-auto flex items-center gap-1.5 text-[10px] font-medium ${
-            paused ? "text-destructive" : "text-healthy"
-          }`}
-        >
-          <span className={`h-1.5 w-1.5 rounded-full ${paused ? "bg-destructive" : "bg-healthy"}`} />
-          {paused ? "PAUSED" : "OPERATIONAL"}
-        </span>
-        <button
-          type="button"
-          onClick={toggleTheme}
-          className="rounded-md p-1.5 text-muted-foreground hover:text-foreground"
-          aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        >
-          {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-        </button>
-        <button
-          type="button"
-          onClick={lock}
-          className="rounded-md p-1.5 text-muted-foreground hover:text-foreground"
-        >
-          <Lock className="h-4 w-4" />
-        </button>
+        <div className="ml-auto flex items-center gap-2">
+          {/* Last-run timestamp */}
+          {lastRunLabel ? (
+            <span className="flex items-center gap-1 text-[10px] text-muted-foreground/70">
+              <Clock className="h-3 w-3" />
+              {lastRunLabel}
+            </span>
+          ) : null}
+          <span
+            className={`flex items-center gap-1.5 text-[10px] font-medium ${
+              paused ? "text-destructive" : "text-healthy"
+            }`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${paused ? "bg-destructive" : "bg-healthy"}`} />
+            {paused ? "PAUSED" : "LIVE"}
+          </span>
+          <button
+            type="button"
+            onClick={toggleTheme}
+            className="rounded-md p-1 text-muted-foreground hover:text-foreground"
+            aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+          >
+            {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+          </button>
+          <button
+            type="button"
+            onClick={lock}
+            className="rounded-md p-1 text-muted-foreground hover:text-foreground"
+          >
+            <Lock className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* ── Mobile drawer ───────────────────────────── */}
@@ -254,8 +298,53 @@ function AppShellInner({ children }: { children?: ReactNode }) {
               <span className={`flex items-center gap-1.5 ${paused ? "text-destructive" : "text-healthy"}`}>
                 <span className={`h-1.5 w-1.5 rounded-full ${paused ? "bg-destructive" : "bg-healthy"}`} />
                 {paused ? "Bot paused" : "Bot operational"}
+                {lastRunAt ? ` · ${lastRunAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
               </span>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* ── More bottom sheet ───────────────────────── */}
+      {moreOpen ? (
+        <div className="fixed inset-0 z-50 md:hidden">
+          <div className="absolute inset-0 bg-black/60" onClick={() => setMoreOpen(false)} />
+          <div
+            ref={sheetRef}
+            className="absolute inset-x-0 bottom-0 animate-in slide-in-from-bottom rounded-t-2xl border-t border-border bg-sidebar pb-safe"
+          >
+            <div className="flex items-center justify-center pt-2 pb-1">
+              <div className="h-1 w-10 rounded-full bg-border" />
+            </div>
+            <div className="flex items-center justify-between px-4 pb-2">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">More</span>
+              <button
+                type="button"
+                onClick={() => setMoreOpen(false)}
+                className="rounded-full p-1 text-muted-foreground hover:text-foreground"
+              >
+                <ChevronUp className="h-4 w-4" />
+              </button>
+            </div>
+            <nav className="px-2 pb-4 space-y-0.5">
+              {MORE_ITEMS.map((item) => {
+                const active = isActive(item.to);
+                const Icon = item.icon;
+                return (
+                  <Link
+                    key={item.to}
+                    to={item.to}
+                    onClick={() => setMoreOpen(false)}
+                    className={`flex items-center gap-3 rounded-xl px-4 py-3 text-[14px] font-medium ${
+                      active ? "bg-primary text-primary-foreground" : "text-foreground hover:bg-sidebar-accent/60"
+                    }`}
+                  >
+                    <Icon className="h-4 w-4" />
+                    {item.label}
+                  </Link>
+                );
+              })}
+            </nav>
           </div>
         </div>
       ) : null}
@@ -268,15 +357,14 @@ function AppShellInner({ children }: { children?: ReactNode }) {
       </div>
 
       {/* ── Mobile bottom nav ───────────────────────── */}
-      <nav className="fixed inset-x-0 bottom-0 z-40 flex border-t border-border bg-background/95 md:hidden">
-        {MOBILE_NAV.map((item) => {
+      <nav className="fixed inset-x-0 bottom-0 z-40 flex border-t border-border bg-background/95 pb-safe md:hidden">
+        {MOBILE_PRIMARY.map((item) => {
           const active = isActive(item.to);
           const Icon = item.icon;
-          const target = item.to === "/more" ? "/settings" : item.to;
           return (
             <Link
               key={item.to}
-              to={target}
+              to={item.to}
               className={`flex flex-1 flex-col items-center gap-0.5 py-2 text-[9px] font-medium ${
                 active ? "text-primary" : "text-muted-foreground"
               }`}
@@ -291,6 +379,19 @@ function AppShellInner({ children }: { children?: ReactNode }) {
             </Link>
           );
         })}
+        {/* "More" button opens bottom sheet instead of routing to /settings */}
+        <button
+          type="button"
+          onClick={() => setMoreOpen(true)}
+          className={`flex flex-1 flex-col items-center gap-0.5 py-2 text-[9px] font-medium ${
+            MORE_ITEMS.some((m) => isActive(m.to))
+              ? "text-primary"
+              : "text-muted-foreground"
+          }`}
+        >
+          <Menu className="h-4 w-4" />
+          More
+        </button>
       </nav>
     </div>
   );

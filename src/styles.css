@@ -202,3 +202,8 @@
     flex: 1 1 auto;
   }
 }
+
+/* Safe-area bottom padding for mobile bottom nav / sheets */
+@utility pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0.5rem);
+}

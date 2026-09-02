@@ -379,14 +379,27 @@ export function SettingsShell() {
             onClick={() => navigate({ to: "/overview" })}
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Overview
+            <span className="hidden sm:inline">Overview</span>
           </Button>
           <div>
-            <h1 className="text-xl font-semibold text-card-foreground">Settings</h1>
-            <p className="text-xs text-muted-foreground">Channels, content, scheduling &amp; system</p>
+            <h1 className="text-xl font-semibold text-card-foreground">
+              Settings
+              {/* Save indicator moved into subtitle on mobile */}
+              <span className={`ml-2 hidden text-[11px] font-normal sm:inline ${saving ? "text-muted-foreground" : "text-healthy"}`}>
+                · {saving ? "Saving…" : "All changes saved"}
+              </span>
+            </h1>
+            <p className="text-xs text-muted-foreground">
+              Channels, content, scheduling &amp; system
+              {/* Save status visible only on mobile as part of subtitle */}
+              <span className={`ml-1 sm:hidden ${saving ? "text-muted-foreground" : "text-healthy"}`}>
+                · {saving ? "Saving…" : "All changes saved"}
+              </span>
+            </p>
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Keyboard shortcut hidden on mobile */}
           <Button
             variant="outline"
             size="sm"
@@ -395,18 +408,9 @@ export function SettingsShell() {
             title="Search settings (⌘K / Ctrl+K)"
           >
             <Search className="h-3.5 w-3.5" />
-            Search settings…
-            <kbd className="ml-1 rounded border border-border bg-muted px-1 text-[9px]">⌘K</kbd>
+            <span className="hidden sm:inline">Search settings…</span>
+            <kbd className="hidden sm:inline ml-1 rounded border border-border bg-muted px-1 text-[9px]">⌘K</kbd>
           </Button>
-          <span
-            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-medium ${
-              saving
-                ? "bg-muted text-muted-foreground"
-                : "border border-healthy/25 bg-healthy/10 text-healthy"
-            }`}
-          >
-            {saving ? "Saving…" : "All changes saved"}
-          </span>
           <Button
             variant="outline"
             size="sm"
@@ -414,18 +418,18 @@ export function SettingsShell() {
             onClick={lock}
           >
             <Lock className="h-3.5 w-3.5" />
-            Lock console
+            <span className="hidden sm:inline">Lock console</span>
           </Button>
         </div>
       </header>
 
       {/* ── Settings navigation ───────────────────────────────── */}
-      <div className="mb-6 grid gap-4 lg:grid-cols-[180px_1fr]">
-        <nav className="flex gap-1 overflow-x-auto pb-1 lg:flex-col lg:overflow-visible lg:pb-0">
+      <div className="mb-6 grid gap-4 md:grid-cols-[180px_1fr]">
+        <nav className="relative flex gap-1 overflow-x-auto scroll-snap-x-mandatory pb-1 md:flex-col md:overflow-visible md:pb-0">
           {TAB_GROUPS.map((group) => (
-            <div key={group.label} className="flex shrink-0 gap-1 lg:flex-col">
+            <div key={group.label} className="flex shrink-0 snap-start gap-1 md:flex-col">
               {/* Group header — desktop only; on mobile tabs scroll flat. */}
-              <p className="hidden px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/70 lg:block">
+              <p className="hidden px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/70 md:block">
                 {group.label}
               </p>
               {group.tabs.map((t) => {
@@ -435,8 +439,14 @@ export function SettingsShell() {
                   <button
                     key={t.id}
                     type="button"
-                    onClick={() => selectTab(t.id)}
-                    className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors lg:w-full lg:pl-6 ${
+                    onClick={() => {
+                      selectTab(t.id);
+                      // Scroll active tab into center view on mobile
+                      const el = document.querySelector(`[data-tab-id="${t.id}"]`);
+                      if (el) el.scrollIntoView({ inline: "center", behavior: "smooth", block: "nearest" });
+                    }}
+                    data-tab-id={t.id}
+                    className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-[13px] font-medium transition-colors md:w-full md:pl-6 ${
                       activeTab === t.id
                         ? "bg-primary text-primary-foreground"
                         : "text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -452,6 +462,8 @@ export function SettingsShell() {
               })}
             </div>
           ))}
+          {/* Gradient fade hint on mobile — more scrollable content to the right */}
+          <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-8 bg-gradient-to-l from-card to-transparent md:hidden" />
         </nav>
         <div className="min-w-0">
           <SettingsProvider value={ctxValue}>

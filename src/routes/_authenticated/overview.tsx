@@ -273,7 +273,8 @@ function Overview() {
       })()}
 
       {/* ── KPI strip ───────────────────────────────── */}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      {/* On mobile: single horizontal-scroll row of chips. On desktop: 4-column grid. */}
+      <div className="flex gap-2 overflow-x-auto pb-1 md:grid md:grid-cols-3 md:gap-3 lg:grid-cols-4">
         <Kpi value={data.published24h ?? 0} label="Published today" tone="healthy" delta={publishedDelta !== null && publishedDelta !== 0 ? `${publishedDelta > 0 ? "▲ +" : "▼ "}${publishedDelta} vs yesterday` : null} />
         <Kpi value={Number(data.queuedTotal ?? queuedItems.length)} label="In queue" tone="neutral" />
         <Kpi value={heldForReview} label="Held for review" tone="review" hint={heldForReview > 0 ? "Follow-up updates awaiting a decision" : undefined} />

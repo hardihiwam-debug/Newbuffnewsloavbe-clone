@@ -120,7 +120,13 @@ export async function computePublishPreview(settings: SettingsRow, limit = 5): P
 }
 
 
-const STALE_LOCK_MS = 120_000;
+// Stale window must exceed the WORST legitimate cycle, not just the budget:
+// a cycle stops STARTING new work at 100s but its last in-flight AI chunk
+// (~15s) plus publish can push total wall time past 120s. If the lock went
+// stale mid-cycle, the next cron tick would claim it and run concurrently.
+// 150s matches the Supabase worker kill ceiling — anything still holding the
+// lock by then is genuinely dead (killed workers never reach the finally).
+const STALE_LOCK_MS = 150_000;
 
 export async function acquireLock(settings: SettingsRow): Promise<string | null> {
   // Conditional UPDATE prevents two fresh callers from claiming the lock.

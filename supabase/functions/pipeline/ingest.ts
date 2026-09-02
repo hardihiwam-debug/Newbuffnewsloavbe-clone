@@ -441,16 +441,20 @@ export async function runIngest(settings: SettingsRow, mode: "all" | "telegram" 
   // Pre-queue in-cycle dedup: check fresh items against each other so multiple
   // outlets publishing the exact same story in the same 15m window don't all get queued.
   const uniqueFresh: typeof fresh = [];
+  // Precomputed concatenated text per accepted item — rebuilding title+body
+  // strings inside the comparison loop made this O(n²) over multi-KB enriched
+  // bodies (seconds added to heavy cycles).
+  const acceptedTexts: string[] = [];
   const inCycleThreshold = Number(settings.event_similarity_threshold ?? 0.52);
   for (const item of fresh) {
     const rawText = `${item.article.title} ${item.article.description ?? ""}`;
-    const isDupe = uniqueFresh.some((u) => {
-      const uText = `${u.article.title} ${u.article.description ?? ""}`;
+    const isDupe = acceptedTexts.some((uText) => {
       // Use the same event detection logic the cluster/publish paths use
-      return sameEvent(rawText, uText, inCycleThreshold) || eventSimilarity(rawText, uText) >= inCycleThreshold;
+      return sameEvent(uText, rawText, inCycleThreshold) || eventSimilarity(uText, rawText) >= inCycleThreshold;
     });
     if (!isDupe) {
       uniqueFresh.push(item);
+      acceptedTexts.push(rawText);
     } else {
       stats.duplicate = Number(stats.duplicate) + 1;
     }
@@ -1005,7 +1009,12 @@ export async function runIngest(settings: SettingsRow, mode: "all" | "telegram" 
             last_seen_at: new Date().toISOString(),
           },
           prefer: "return=minimal",
-        }).catch(() => {});
+        }).catch((err) => {
+          // A failed PATCH leaves the cluster stale — the next cycle's
+          // matchEventCluster may then miss a follow-up and queue it as new.
+          // Surface it; do not change control flow.
+          void logActivity("ingest", "warning", `Cluster update failed for ${c.event_id.slice(0, 24)}: ${err instanceof Error ? err.message : String(err)}`);
+        });
       } else {
         await rest("clusters", {
           method: "POST",
@@ -1017,7 +1026,12 @@ export async function runIngest(settings: SettingsRow, mode: "all" | "telegram" 
             last_seen_at: new Date().toISOString(),
           },
           prefer: "return=minimal",
-        }).catch(() => {});
+        }).catch((err) => {
+          // A failed POST means this event has no cluster row, so follow-up
+          // coverage of it cannot be detected as related until the next
+          // successful cycle re-creates it.
+          void logActivity("ingest", "warning", `Cluster create failed for ${c.event_id.slice(0, 24)}: ${err instanceof Error ? err.message : String(err)}`);
+        });
       }
     }
   }

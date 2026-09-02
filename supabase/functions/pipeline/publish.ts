@@ -1138,7 +1138,12 @@ export async function runPublish(
         // have delivered. Definitive 4xx validation/auth failures are safe to
         // remove and retry after the underlying content/config is corrected.
         if (historyId && isDefinitiveTelegramFailure(err)) {
-          await rest(`published_history?id=eq.${enc(String(historyId))}`, { method: "DELETE", prefer: "return=minimal" }).catch(() => {});
+          // If this delete fails, the 'sending' reservation survives: it is
+          // invisible to the dedup snapshot AND skipped on retry, so the
+          // story can never be sent again until an operator reconciles it.
+          await rest(`published_history?id=eq.${enc(String(historyId))}`, { method: "DELETE", prefer: "return=minimal" }).catch((delErr: unknown) => {
+            void logActivity("publish", "error", `Failed to clear failed-send reservation ${String(historyId).slice(0, 8)}: ${delErr instanceof Error ? delErr.message : String(delErr)}`);
+          });
         }
         await logActivity("publish", "warning", `Send failed to chat ${chat.chat_id}: ${err instanceof Error ? err.message : String(err)}`);
       }
