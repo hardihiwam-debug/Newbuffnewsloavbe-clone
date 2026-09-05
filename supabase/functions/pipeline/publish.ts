@@ -7,21 +7,7 @@ import { Article, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, GROQ_API_KEY, INS
 import { BotRow, countCategoryPublishedToday, deleteQueueRow, enc, getTranslationCache, hostname, insertQueueItem, listActiveChats, listBots, listQueued, listRecentPublished, logActivity, patchSettings, rest, saveTranslationCache, setQueueStatus } from "./db.ts";
 import { cachedMediaUrl, fetchArticleMeta, fetchTelegramPostImage, fetchTelegramPostVideo, isValidStoryImage } from "./fetch.ts";
 import { neutralityGate, normalizeEditorial, respectGate, sectarianGate, stripLinks, stripSourceName } from "./gates.ts";
-import { telegramCall } from "./telegram.ts";
-
-class DeliveryUnknownError extends Error {
-  constructor(cause: unknown) {
-    super(`Telegram delivery outcome is unknown: ${cause instanceof Error ? cause.message : String(cause)}`);
-    this.name = "DeliveryUnknownError";
-  }
-}
-
-function isDefinitiveTelegramFailure(err: unknown): boolean {
-  // Telegram rejects malformed content/media before delivery with a 4xx. A
-  // timeout, 5xx, or rate-limit response is ambiguous: the API may have
-  // accepted the message even when this function did not receive confirmation.
-  return /Telegram .* \[(400|401|403|404|413)\]/i.test(err instanceof Error ? err.message : String(err));
-}
+import { DeliveryUnknownError, isDefinitiveTelegramFailure, isRateLimitFailure, telegramCall } from "./telegram.ts";
 
 // ── Bot-API video recovery ─────────────────────────────────────────────────
 // The public `t.me/s/<channel>` SSR HTML only ships the JPEG poster frame for
@@ -159,7 +145,7 @@ export async function sendPhotoFile(chatId: number, image: Downloaded, caption: 
   form.append("photo", new Blob([image.bytes], { type: image.contentType }), image.filename);
   const res = await fetch(`https://api.telegram.org/bot${token}/sendPhoto`, { method: "POST", body: form, signal: AbortSignal.timeout(20_000) });
   const json = (await res.json()) as { ok?: boolean; description?: string; result?: { message_id?: unknown } };
-  if (!res.ok || !json.ok) throw new Error(`Telegram sendPhoto upload: ${json.description ?? "failed"}`);
+  if (!res.ok || !json.ok) throw new Error(`Telegram sendPhoto upload [${res.status}]: ${json.description ?? "failed"}`);
   return Number(json.result?.message_id) || null;
 }
 export async function sendVideoUrl(chatId: number, videoUrl: string, thumbUrl: string | null, caption: string, token = TELEGRAM_BOT_TOKEN): Promise<number | null> {
@@ -178,7 +164,7 @@ export async function sendVideoFileUpload(chatId: number, video: Downloaded, thu
   if (thumb) form.append("thumb", new Blob([thumb.bytes], { type: thumb.contentType }), thumb.filename);
   const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, { method: "POST", body: form, signal: AbortSignal.timeout(120_000) });
   const json = (await res.json()) as { ok?: boolean; description?: string; result?: { message_id?: unknown } };
-  if (!res.ok || !json.ok) throw new Error(`Telegram sendVideo upload: ${json.description ?? "failed"}`);
+  if (!res.ok || !json.ok) throw new Error(`Telegram sendVideo upload [${res.status}]: ${json.description ?? "failed"}`);
   return Number(json.result?.message_id) || null;
 }
 
@@ -201,6 +187,7 @@ export async function sendPost(
       const midVideo = await sendVideoUrl(chatId, video, thumb, fitCaption(text), token);
       return { mode: "video", messageId: midVideo };
     } catch (err) {
+      if (isRateLimitFailure(err)) throw err;
       if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
       // Prefer a Cloudflare-cached copy (Telegram pulls bytes from R2, not
       // this function); only download bytes here as a last resort.
@@ -210,6 +197,7 @@ export async function sendPost(
           const midCached = await sendVideoUrl(chatId, cachedVideo, thumb, fitCaption(text), token);
           return { mode: "video", messageId: midCached };
         } catch (err) {
+          if (isRateLimitFailure(err)) throw err;
           if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
           /* fall through to byte download */
         }
@@ -221,6 +209,7 @@ export async function sendPost(
           const midUpload = await sendVideoFileUpload(chatId, downloadedVideo, downloadedThumb, fitCaption(text), token);
           return { mode: "video", messageId: midUpload };
         } catch (err) {
+          if (isRateLimitFailure(err)) throw err;
           if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
           /* fall through */
         }
@@ -238,6 +227,7 @@ export async function sendPost(
       const midPhoto = await telegramCall("sendPhoto", { chat_id: chatId, photo: post.imageUrl, caption: fitCaption(text), parse_mode: "HTML" }, token);
       return { mode: "photo", messageId: Number(midPhoto.message_id) || null };
     } catch (err) {
+      if (isRateLimitFailure(err)) throw err;
       if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
       // Cloudflare-cached copy first (R2 URL -> Telegram downloads from there),
       // byte download + re-upload only as a last resort.
@@ -247,6 +237,7 @@ export async function sendPost(
           const midCached = await telegramCall("sendPhoto", { chat_id: chatId, photo: cachedImage, caption: fitCaption(text), parse_mode: "HTML" }, token);
           return { mode: "photo", messageId: Number(midCached.message_id) || null };
         } catch (err) {
+          if (isRateLimitFailure(err)) throw err;
           if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
           /* fall through to byte download */
         }
@@ -257,6 +248,7 @@ export async function sendPost(
           const midFile = await sendPhotoFile(chatId, downloaded, fitCaption(text), token);
           return { mode: "photo", messageId: midFile };
         } catch (err) {
+          if (isRateLimitFailure(err)) throw err;
           if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
           /* fall through to text */
         }

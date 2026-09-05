@@ -27,7 +27,7 @@
 // The merged object keeps the exact field names the old getDashboard payload
 // used, so pages read data.settings / data.queue / … unchanged.
 
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useLocation } from "@tanstack/react-router";
 import { api, useAdminQuery } from "@/lib/supabaseAdminHooks";
 import { readStoredPin } from "@/lib/pinStorage";
@@ -35,6 +35,19 @@ import { readStoredPin } from "@/lib/pinStorage";
 export type NewsroomData = Record<string, any> | undefined;
 
 const NewsroomContext = createContext<NewsroomData>(undefined);
+
+// Pages dispatch this after a successful mutation (approve / reject / hold /
+// publish / delete / clear / edit) so every mounted resource refetches
+// immediately instead of waiting for its next interval (queue lists poll on a
+// 5-minute cadence; the feed on 10s). Without it, a row an editor just
+// rejected stays visible on /inbox for up to 5 minutes. The refetch is cheap:
+// unchanged resources answer with the ~100-byte state-hash envelope.
+export const NEWSROOM_REFRESH_EVENT = "newsroom:refresh";
+
+export function refreshNewsroomData() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(NEWSROOM_REFRESH_EVENT));
+}
 
 // Routes that render the queue resource (queueAll / history). Everything else
 // (aidesk, sources, settings) does not read it, so the 100+100-row poll is
@@ -44,8 +57,21 @@ const SETTINGS_RE = /^\/settings(\/|$)/;
 
 export function NewsroomProvider({ children }: { children: ReactNode }) {
   const pin = readStoredPin();
-  const args = pin ? { pin } : ("skip" as const);
   const { pathname } = useLocation();
+
+  // Mutation-triggered refresh: refreshNewsroomData() bumps this tick, which
+  // changes every query's argsKey → useAdminQuery refetches those resources
+  // on the next effect pass (server answers unchanged ones with the ~100-byte
+  // state-hash envelope, so the refetch costs egress only when rows changed).
+  const [refreshTick, setRefreshTick] = useState(0);
+  useEffect(() => {
+    const onRefresh = () => setRefreshTick((t) => t + 1);
+    window.addEventListener(NEWSROOM_REFRESH_EVENT, onRefresh);
+    return () => window.removeEventListener(NEWSROOM_REFRESH_EVENT, onRefresh);
+  }, []);
+
+  // The `v` key is ignored by the admin server (it reads pin + its own args).
+  const args = pin ? { pin, v: refreshTick } : ("skip" as const);
 
   // Mount-on-demand (egress fast-win): gated resources return "skip" off their
   // pages, which fires nothing (useAdminQuery) — so aidesk/sources/settings

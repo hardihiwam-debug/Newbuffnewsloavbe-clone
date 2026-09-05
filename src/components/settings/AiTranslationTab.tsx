@@ -932,7 +932,7 @@ function AiControlPlane({ pin, onError }: { pin: string; onError: (error: unknow
     try {
       const result = await adminActionsApi.testAiAction({
         pin,
-        action,
+        aiAction: action,
         input: { ...scenario, targetLength: Number(scenario.targetLength) || 500 },
       });
       setScenarioResult(result);

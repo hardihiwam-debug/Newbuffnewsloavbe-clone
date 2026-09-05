@@ -172,8 +172,12 @@ export function createAiControlHandlers(rest: Rest, logActivity: Activity): Reco
     return { ok: success, provider: safeProvider(provider), latencyMs: latency, status: result.status || null, detail: success ? "connection accepted" : message };
   };
 
-  const testAiAction = async (p: { action: string; providerIds?: string[]; input?: Record<string, unknown> }) => {
-    const action = String(p.action ?? "").trim();
+  const testAiAction = async (p: { aiAction?: string; action?: string; providerIds?: string[]; input?: Record<string, unknown> }) => {
+    // `aiAction` is the wire name: the dispatcher reads the outer `action`
+    // field to pick the handler, so an inner `action` key would collide and
+    // the request would 404 ("unknown action \"translation\""). The old
+    // inner `action` name is still accepted for backward compatibility.
+    const action = String(p.aiAction ?? p.action ?? "").trim();
     if (!AI_ACTIONS.some((item) => item.id === action)) throw httpError(400, `Unsupported AI action "${action}"`);
     const routeRows = await rest(`ai_action_routes`, { query: `action=eq.${encodeURIComponent(action)}&enabled=eq.true&order=position.asc&limit=100` }).catch(() => []);
     const providerIds = Array.isArray(p.providerIds) && p.providerIds.length > 0 ? p.providerIds : (routeRows as ActionRouteRow[]).map((row) => String(row.provider_id));

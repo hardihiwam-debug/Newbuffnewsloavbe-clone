@@ -1,4 +1,4 @@
-# Iran Desk — Full Architecture Reference (2026-08)
+# Iran Desk — Full Architecture Reference (2026-09)
 
 This document is the authoritative description of how the Iran Desk Bot
 actually works today. The backend runs entirely on **Supabase** (Postgres +
@@ -44,6 +44,9 @@ Bulletin feature is obsolete.
   `dist/`); Edge Functions deploy independently via the Supabase Management
   API (`scripts/_deploy_fn.mjs`); migrations apply via the Management API
   SQL endpoint (`scripts/apply_supabase_migrations.mjs`). See §15.
+- **PWA shell**: `index.html` ships `viewport-fit=cover`, Apple mobile-web-app
+  meta and a `theme-color`; `public/manifest.json` (standalone, `start_url`
+  `/overview`) makes the console installable, with safe-area padding utilities.
 
 The SPA is a static build. It talks to the cloud Supabase `admin` function
 (URL + anon key baked in by `vite.config.ts`), never a local backend, so
@@ -60,7 +63,7 @@ Routing is file-based under `src/routes/`.
 | --- | --- | --- |
 | `/` | `src/routes/index.tsx` | PIN sign-in (theme toggle, verify via `admin.verifyPin`) |
 | (layout) | `src/routes/_authenticated/route.tsx` | Auth guard + `AppShell` wrapper |
-| `/overview` | `_authenticated/overview.tsx` | Command bar, KPI strip, live newsroom feed |
+| `/overview` | `_authenticated/overview.tsx` | Command bar, KPI strip (horizontal-scroll chips on mobile, 4-col grid on desktop), live newsroom feed |
 | `/inbox` | `_authenticated/inbox.tsx` | Editorial queue with ALL/REVIEW/READY/HELD/FAILED tabs |
 | `/review` | `_authenticated/review.tsx` | 3-column editorial workspace (source · generated · facts) |
 | `/events` | `_authenticated/events.tsx` | Event clusters + timeline |
@@ -68,7 +71,7 @@ Routing is file-based under `src/routes/`.
 | `/sources` | `_authenticated/sources.tsx` | Source health + per-source profile |
 | `/aidesk` | `_authenticated/aidesk.tsx` | AI pipeline stages, usage, Gemini key health, translations |
 | `/analytics` | `_authenticated/analytics.tsx` | 14-day analytics (sparklines, deltas, channels, categories, scheduler health, activity) |
-| `/settings` | `_authenticated/settings.tsx` | Thin route → `SettingsShell` (8 tabs, see below) |
+| `/settings` | `_authenticated/settings.tsx` | Thin route → `SettingsShell` (9 tabs in 4 groups, see below) |
 
 `src/routes/index.tsx` is a **route file under the workspace sync layer**:
 edits to it (and to other route files) must be made via terminal/git, not the
@@ -78,8 +81,10 @@ file tools, or the sync scaffolder replaces them with a TanStack placeholder.
 
 - `src/components/AppShell.tsx` — wraps children in `NewsroomProvider`, then
   renders the sidebar (brand, nav, live Inbox badge, bot-status + last-run
-  footer, Lock console) + mobile top bar/drawer/bottom nav
-  (Overview / Inbox / Events / Sources / More).
+  footer, Lock console) + a condensed mobile top bar and bottom nav: the
+  primary slots are Overview / Inbox / Events / Published, with a **More**
+  sheet holding Sources / AI Desk / Analytics / Settings (closes on outside
+  click and on navigation).
 - `src/components/newsroom.tsx` — reusable primitives: `Kpi`, `StoryCard`,
   `StatusPill`, `CategoryPill`, `ConfirmAction`, `EditQueueItemDialog`,
   `SectionTitle`, `EmptyState`, relative-time helpers.
@@ -127,24 +132,33 @@ All polls **pause while the tab is hidden** (`visibilitychange` in
 The Settings page additionally polls `listTranslationKeys` (up to 5,000 usage
 rows) every **30s** while mounted, not the 5s default.
 
-### Settings tabs (8)
+### Settings tabs (9, grouped)
 
-`SettingsShell` renders one tab at a time (sidebar nav on desktop, horizontal
-scroll on mobile). Every control auto-saves through a **600 ms-debounced**
-`saveSettings` (camelCase key → `camelToSnake` → PATCH on the single
-`settings` row) with an optimistic overlay, and the debounce **flushes on
-unmount** so mid-debounce navigation never loses edits.
+`SettingsShell` renders one tab at a time, grouped into four job areas
+(Channels / Content / Delivery / Intelligence & System) with per-tab icons —
+stacked groups on desktop, a flat horizontal scroll on mobile. The shell
+owns everything shared: PIN handling, the debounced save, all admin
+mutations, dirty-dot tracking, the Lock-console button and the header's
+search button (⌘K / Ctrl+K opens SettingsSearch, which filters every card
+across tabs, switches tab, opens the owning collapsible section and scrolls
+the card into view; `/settings?tab=<id>&card=<id>` deep-links do the same on
+load). Every control auto-saves through a **600 ms-debounced** `saveSettings`
+(camelCase key → `camelToSnake` → PATCH on the single `settings` row) with an
+optimistic overlay, and the debounce **flushes on unmount** so mid-debounce
+navigation never loses edits. Every card is **collapsible** (`<details>`),
+and tabs with unsaved edits show a **dirty dot**.
 
-| Tab | Cards |
-| --- | --- |
-| **Telegram** | Bot Connection (env-token status, refresh info, webhooks) · Bots (primary-bot category blocklist + N additional bots with per-bot category whitelists) · Polls (test poll sender) · Recent Polls · Chats (grouped by assigned bot, per-row bot/language/active/remove) |
-| **Sources** | Providers (NewsData/RSS/Telegram sources, per-fetch-type toggles from 0022) · Telegram Channels · Source Quality (auto-pause settings) · Topic Queries |
-| **Editorial** | Breaking-News Criteria (breaking categories, max age, thresholds) · News quality (dedup threshold, update cadence) |
-| **Posting** | Publishing Speed (delays) · Post Format (footer, emoji, link label, per-source-type attribution toggles from 0021, footer hyperlinks) · Language (default + per-chat overrides, **Auto hashtags** toggle) · Posting Windows (day/night, breaking interrupt) · Telegram Video Handling |
-| **Scheduler** | Interval minutes for each job (ingest, Telegram signals, …) · Max queue size · Pipeline ticker (cron wake-up dropdown — live reschedule) · Freshness limits (breaking/news/analysis/Telegram max age in hours, live-editable) |
-| **AI & Translation** | AI Dedup (provider + enable) · Translation Provider · Translation model order (reorderable) · Translation API Keys · Gemini Key Usage · Translation History · Translation Failures · AI Rewrite Log (per-chunk attempts: provider/model, headline previews, error, status) · Translation Glossary (row-based editor: term/translation per row, reorder/import, counter) |
-| **System** | System Status (schema drift, bot token, NewsData key, queue/published/translation-fail counts) · Scheduler (pg_cron) health |
-| **Security** | PIN behavior, brute-force lockout description, Lock console |
+| Group (icon) | Tab (icon) | Cards |
+| --- | --- | --- |
+| **Channels** (RadioTower) | **Telegram** (Send) | Bot Connection (env-token status, refresh info, webhooks) · Bots (primary-bot category blocklist + N additional bots with per-bot category whitelists) · Polls (test poll sender) · Recent Polls · Chats (grouped by assigned bot, per-row bot/language/active/remove) |
+| | **Sources** (RadioTower) | Providers (NewsData/RSS/Telegram sources, per-fetch-type toggles from 0022) · Telegram Channels (monitored channels, per-source Normal/Fast/Instant speed) · Source Quality (auto-pause settings) · Topic Queries |
+| **Content** (Palette) | **Style** (Palette) | AI writing style (global tone, style by category, advanced editor) · Summary source (extractive lede / bounded AI compression) · Post Format (footer, emoji, link label, per-source-type attribution toggles from 0021, footer hyperlinks) · Language (default + per-chat overrides, **Auto hashtags** toggle) · Hashtag rules (category + topic tags) |
+| | **Editorial** (Flame) | Breaking-News Criteria (breaking categories, max age, thresholds) · News quality (dedup threshold, update cadence, cooldown) · Why-it-matters follow-ups · Telegram Video Handling |
+| | **Categories** (Settings2) | Category Policy (per-category status/priority/freshness/daily caps/keyword rules) |
+| **Delivery** (CalendarClock) | **Scheduling** (CalendarClock) | Scheduler (interval minutes per job, max queue size, pipeline ticker — cron wake-up dropdown, live reschedule, freshness limits) · Publishing Speed (delays) · Posting Windows (day/night, breaking interrupt) |
+| | **Campaigns** (Send) | Campaigns (manual multi-part campaigns: per-item scheduling, send now / skip / reset-retry, delivery history) |
+| **Intelligence & System** (Cpu) | **AI & Translation** (Cpu) | AI Control Plane (provider registry, per-action fallback routes, Scenario Laboratory, unified attempt log) · AI Dedup (provider + enable) · Translation Provider · Translation model order (reorderable) · Translation API Keys · Gemini Key Usage · Translation History · Translation Failures · AI Rewrite Log (per-chunk attempts: provider/model, headline previews, error, status) · Rewrite Analytics · Translation Glossary (row-based editor: term/translation per row, reorder/import, counter) |
+| | **System & Security** (Server) | System Status (schema drift, bot token, NewsData key, queue/published/translation-fail counts) · Scheduler (pg_cron) health · Security (PIN behavior, brute-force lockout description, Lock console) |
 
 ---
 
@@ -288,8 +302,12 @@ Each cycle:
    and is skipped on manual `force` (a forced publish must not drain a
    webhook-backed bot's pending updates).
 4. **Serialization lock** — `acquireLock` / `releaseLock` on
-   `settings.publish_run_lock_at`; a crashed run's stale lock is reclaimable
-   after **10 minutes**.
+   `settings.publish_run_lock_at` (an owner UUID is persisted so an older
+   invocation can never release a newer lease); a crashed run's stale lock
+   is reclaimable after **150 seconds** (`STALE_LOCK_MS` — must exceed the
+   worst legitimate cycle: work stops STARTING at 100s but in-flight AI
+   chunks + sends can push wall time past 120s, and a killed worker never
+   reaches its `finally`; 150s matches the Supabase worker kill ceiling).
 5. **Hard time budget** — Supabase kills the worker at ~150s, so the cycle
    budgets **100s** (`budgetLeft()`) and stops starting new work before the
    ceiling, guaranteeing the `finally` releases the lock.
@@ -297,10 +315,13 @@ Each cycle:
    (`telegram_signals_interval_minutes`, default **5**).
 7. **Web ingest** — `runIngest("all")` when due (`ingest_interval_minutes`,
    default **15**).
-8. **Instant Telegram channels** (per-source speed = "Instant") — every new
-   on-beat post from those channels is published immediately (no scoring
-   order, no window gap), capped by `INSTANT_PUBLISH_CAP` per cycle; overflow
-   stays queued and drains on later cycles.
+8. **Instant Telegram channels** (per-source speed = "Instant", boost 2) —
+   every newly ingested on-beat post from those channels is published in the
+   same cycle (no scoring order, no window gap, **no per-cycle cap** —
+   `INSTANT_PUBLISH_CAP` is `Infinity`). The queue row is kept only as a
+   durable outbox: retained Instant rows also drain on the next cycle even
+   when no new post arrived, so a failed send never waits indefinitely
+   behind the "new post" trigger. Drain stops only at the worker deadline.
 9. **Telegram fast-lane publish** — up to `AUTO_PUBLISH_BATCH_SIZE` (1/cycle)
    of freshly-queued Telegram items, 24/7, so the channel always feels live.
 10. **Normal publish** — the day/night window-gap cadence path
@@ -317,7 +338,8 @@ respect `botPaused` and the lock.
    "telegram"`), fetched from public `t.me/s/<channel>` pages (optionally
    relayed through the Cloudflare worker, §11), cleaned; non-English posts
    are translated to English first. Per-channel **boost** (0 normal / 1 fast /
-   2 instant) from the source row.
+   2 instant) from the source row — instant channels behave differently, see
+   the dedicated block below.
 2. **Web fetches** — NewsData.io (quota-aware), Google News RSS queries, and
    direct publisher feeds, each controllable by the 0022 toggles.
    **Capped at 100 fetched/cycle.**
@@ -349,8 +371,8 @@ respect `botPaused` and the lock.
    timestamps, so a feed pubDate that passed `freshnessGate` is not
    trustworthy; the verified page date replaces it (`original_published_at`),
    and an item whose real age exceeds the window is **dropped before it
-   reaches the queue**. Age windows are operator-editable (Settings →
-   Scheduler → Freshness limits → `max_age_breaking_hours` 14 /
+   reaches the queue**.   Age windows are operator-editable (Settings →
+   Scheduling → Scheduler → Freshness limits → `max_age_breaking_hours` 14 /
    `max_age_news_hours` 22 / `max_age_analysis_hours` 48 via
    `ageLimitsFrom(settings)`); invalid values fall back to those defaults.
    This is the first line of defense against aggregator re-crawl leaks.
@@ -387,6 +409,38 @@ respect `botPaused` and the lock.
    Breaking items trigger an immediate breaking publish.
 8. **Source-quality tally** — every accepted/rejected article is attributed
    back to its source row (`recordSourceQualityBatch`).
+
+### Instant Telegram sources (boost = 2)
+
+Per-source speed "Instant" is the operator's real-time feed: these channels
+bypass the queue wait and publish every new post immediately, while still
+honouring the general filters and dedup.
+
+- **Strict lookback, no re-crawl** — the fetch window is
+  `max(instant_watermark_at, fetchStart − 5 min)` → fetch-completion time;
+  posts outside it are dropped (`isInstantTelegramPostInWindow`). After a
+  successful fetch the source's `instant_watermark_at` (stored in
+  `sources.config`) advances to the completed-fetch boundary — even when the
+  channel had no posts in the window — so the next cycle continues strictly
+  later and can never reopen an older anonymous `t.me/s` snapshot.
+- **Related-post merging** — posts within the same newly-fetched set that
+  are about the same person / location / event (`areTelegramPostsRelated`,
+  ~0.52 similarity, mirroring the cluster logic) merge into ONE item: each
+  source sentence is preserved verbatim and the newest post becomes the
+  permalink + media. The next cycle's merge set is fresh again — nothing is
+  ever re-merged against older posts.
+- **Filters still apply** — junk/respect/sectarian/neutrality/editorial/Kurd
+  gates, canonical dedup against `raw_articles`, in-cycle `sameEvent` dedup
+  and cluster re-report detection all run as usual. Instant posts skip the
+  English-only and relevance gates at ingest (they may be Arabic), but
+  English instant posts still run the publish-time beat gate before queueing
+  (off-beat → dropped, `instantOffBeat`), excluded category keywords still
+  veto, and the incomplete-headline/summary guards are skipped (the "title"
+  is a 180-char slice of the same body).
+- **No queue wait** — non-English posts default to category `war` (or get
+  the keyword/AI classifiers); every instant item is `breaking` regardless
+  of age; `score_parts.instant = true` + 150 boost marks it for the cycle's
+  instant drain in `runPublish`.
 
 ### Relevance gate (strict conflict beat)
 
@@ -522,6 +576,42 @@ receive them.
     recorded message id and can only be removed manually in Telegram.
 9. Optional polls on breaking items (cadence + per-chat + hourly cap).
 
+### Instant-only drain
+
+`runPublish(..., { instantOnly: true })` is the cycle's §5-step-8 path: the
+candidate pool is filtered to rows with `score_parts.instant` (or
+`boost ≥ 150`), every candidate is sent (no `force`-style single-item cap),
+and sends stop only at the deadline.
+
+### Failed-send reservation cleanup
+
+Delivery-outcome classification is **shared** — `telegram.ts` exports
+`DeliveryUnknownError`, `isDefinitiveTelegramFailure` and
+`isRateLimitFailure`, consumed by BOTH the news pipeline (`publish.ts`) and
+the campaign engine (`scheduled/index.ts`) so the two send paths can never
+drift apart:
+
+- **Definitive failures** (4xx malformed-content rejections AND the 420/429
+  flood-control statuses) delete the `sending` reservation so the story can
+  be retried after the underlying cause clears. A rate-limit response means
+  the request was refused BEFORE any delivery, so dropping the reservation is
+  safe — and necessary: a burst (instant fast lane, manual force-publish)
+  that trips the per-chat limit would otherwise leave a permanent `sending`
+  row that is invisible to the dedup snapshot, skipped on retry, and wedged
+  until an operator reconciles it.
+- **Ambiguous failures** (timeout, 5xx, `fetch failed`) throw
+  `DeliveryUnknownError`: the API may have accepted the message even though
+  this invocation never saw confirmation, so the durable reservation is KEPT
+  and a retry can never double-deliver.
+- **Rate-limit bail-out**: `isRateLimitFailure` short-circuits the media
+  fallback cascade (cached URL → byte upload → text) when a chat is limited
+  — alternate strategies hit the SAME chat, each would be refused, and
+  Telegram escalates the penalty for repeated attempts while limited. The
+  caller drops the reservation and the still-queued item simply retries on
+  the next cycle (Telegram's own backoff).
+- If the cleanup DELETE itself fails, the error is logged (an invisible
+  `sending` row would otherwise make the story unsendable forever).
+
 ### Preview next batch (dry-run)
 
 `previewNextBatch` runs the same candidate selection/clustering/dedup with
@@ -550,17 +640,42 @@ candidate with `ready` / `duplicate` / `blocked` status + reason.
 | OpenRouter | `OPENROUTER_API_KEY` | rewrite + AI dedup (`meta-llama/llama-3.3-70b-instruct`) — dead (402) since 2026-08-16 |
 | Groq | `GROQ_API_KEY` | rewrite + AI dedup (`openai/gpt-oss-20b`, **first** choice) |
 | Mistral | `MISTRAL_API_KEY` | rewrite (`mistral-small-latest`, second choice) |
-| Google Gemini (direct REST) | `GEMINI_API_KEY_1..6` | rewrite last-resort (`gemini-2.5-flash`) + Sorani translation pool + Telegram→English |
+| Google Gemini (direct REST) | `GEMINI_API_KEY_1..6` | rewrite last-resort (`gemini-3.5-flash-lite`) + Sorani translation pool + Telegram→English |
 | MiniMax M3 / gateway Gemini | `MINIMAX_API_KEY` (Vercel AI Gateway) | Sorani translation fallback + `google/*` models |
+
+### Stale external notes — claim-by-claim audit (2026-09)
+
+A widely circulated summary of this pipeline (circa mid-2026) is still quoted
+in operator notes, but most of it no longer matches the code. Claims were
+re-verified against the current source; use this table to correct anything
+quoting the old text.
+
+| Old note says | Current reality (verified in code) |
+| --- | --- |
+| Telegram: default channels ajanews / insiderpaper / middle_east_spectator / thecradlemedia; 6h lookback; 12-min bulletin merge (max 1800 chars) | Channels come from `sources` rows (`kind = "telegram"`); per-source boost/speed (0 normal / 1 fast / 2 instant) drives everything. Instant channels use a strict `instant_watermark_at` lookback (5-min floor); related posts in one fetch merge via `areTelegramPostsRelated` (~0.52 similarity); non-English posts are translated before the gates. No fixed 6h/12-min/1800-char constants remain. |
+| NewsData: queries OR-batched to ≤95 chars, max 2 groups/day | OR-batching + `NEWSDATA_MAX_GROUPS` still exist, but quota is per-source (`daily_quota`, `used_today`, `quota_date`) via `bumpSourceQuota`; the group budget is config, not a hard-coded 2. |
+| RSS: Bing News per query; Google News RSS disabled (503s) | Google News RSS is active again (`fetchGoogleNewsRss`) with wrapper-URL decode machinery (`googleNewsDecode`, per-cycle decode budget). Bing is not referenced in the pipeline. |
+| Freshness: 10h default / 6h breaking / 24h analysis | `ageLimitsFrom(settings)`: breaking 14h, news 22h, analysis 48h (operator-editable), plus per-category policy overrides and a second breaking-age gate (`breaking_max_age_hours`, default 8). |
+| Rejected articles stored in `raw_articles` with `rejected: true` + reason | `raw_articles` is dedup memory only — minimal rows (`dedup_key`), no payload, pruned >48h. Rejections surface via `activity_log` + source-quality tallies. |
+| Event cooldown default 72h | `event_cooldown_hours` = 8h (migration 0006); 72 survives only as `aiDedupWindowHours`. |
+| Classification: batches of 40, llama-3.3-70b-versatile / gpt-5.6-sol | Keyword classifier first; `aiDecideCategory` rescues only ambiguous items (max 4 calls/cycle, 10s bound) through the AI Control Plane chain — no fixed model. |
+| Rewrite: one 40-article batch, single `rewriteBatch` prompt | Two-stage EXTRACT → COMPOSE (`groqExtractFacts`), chunks of ≤5 items AND ≤16k chars, per-stage provider chains; guards are `polishRewriteSummary` + `isIncompleteHeadline` + number-consistency. |
+| Score: priority + freshness − category-hour penalty + starvation bonus − source-3h penalty + 150 signal | ingest.ts:926: `priority + max(0, 60 − 5×ageHours) + SEVERITY_POINTS + leader 120 + breaking 42 + boost (instant 150 / fast 60)`. No starvation or per-source terms. |
+| Trust tiers 1–9 (Reuters 1 …) decide cluster leads | Replaced by `SOURCE_TIER_RULES` (state-media / analysis / wire bylines for display), not scoring. |
+| Publish: reserves `next_publish_at`, 14h shelf life, 24 candidates | Cadence is `windowGapOk` (random gap in day/night windows vs last post). Queue expiry is 24h (`pruneQueueAndRetain`). |
+| Translation: `GEMINI_API_KEY_1/2/3` + gemini-2.5-flash | Direct pool takes `GEMINI_API_KEY_1..6` with current 3.x flash models; `minimax/minimax-m3` + `google/*` via the Vercel AI Gateway; order operator-editable. |
 
 ### Rewrite chain (`groqExtractFacts` — two-stage EXTRACT → COMPOSE)
 
 Both stages share one provider-chain walker (`runRewriteChain`) with this
 order: **Groq → Gemini → Mistral → Cloudflare → OpenRouter** (Groq runs
-`openai/gpt-oss-20b`; Gemini 2.5-flash sits second so a quota-killed Groq
-hands off to a fast provider; Mistral's free tier is the steady carrier;
-Cloudflare fourth — its 10k-neuron daily allocation 429s once spent;
-OpenRouter runs `:free`). Each stage walks the chain independently:
+`openai/gpt-oss-20b`; Gemini 3.5-flash-lite sits second so a quota-killed
+Groq hands off to a fast provider — `gemini-2.5-flash` was the prior
+fallback until Google retired it, shutting 2.5 Flash down Oct 2026, so the
+chain targets the current 3.x flash catalog; Mistral's free tier is the
+steady carrier; Cloudflare fourth — its 10k-neuron daily allocation 429s
+once spent; OpenRouter runs `:free`). Each stage walks the chain
+independently:
 
 - **Stage A EXTRACT** gets ≤60% of the chunk deadline (min 20s) and returns
   the strict facts JSON per item (see §6 step 5).
@@ -682,21 +797,28 @@ the model's attention.
   per destination chat), **Top Categories**, **Scheduler (pg_cron) health**,
   **Activity timeline** (last 15 pipeline events), consistent empty states.
   All pure frontend over the shared store.
-- **Settings** — 8 tabs (see §2). Every control persists in Postgres.
+- **Settings** — 9 tabs in four icon-grouped areas (see §2). Every control
+  persists in Postgres; cards are collapsible and searchable (⌘K).
 
 ### `admin` function actions
 
 `verifyPin`, `getDashboard`, `dashboardSummary`, `dashboardFeed`,
-`dashboardQueue`, `dashboardSources`, `dashboardAnalytics`, `dashboardAi`,
-`dashboardEvents`, `dashboardPublished`, `getPipelineRun`, `saveSettings`,
-`setPauseState`, `setTranslationModel`, `setCronSchedule`, `updateChat`,
-`addChat`, `saveBot`, `deleteBot`, `upsertTopic`, `upsertSource`,
+`dashboardQueue`, `dashboardChats`, `dashboardSources`, `dashboardAnalytics`,
+`dashboardAi`, `dashboardEvents`, `dashboardPublished`, `getPipelineRun`,
+`saveSettings`, `setPauseState`, `setTranslationModel`, `setCronSchedule`,
+`updateChat`, `addChat`, `saveBot`, `deleteBot`, `upsertTopic`, `upsertSource`,
 `listTranslationKeys`, `upsertTranslationKey`, `listTranslationModels`,
 `testTranslationKey`, `testSource`, `refreshBotInfo`, `setWebhook`,
 `enableChatWebhooks`, `syncBotChats`, `sendTestMessage`, `testPoll`,
 `testGeminiKeys`, `runPipeline`, `clearQueue`, `previewNextBatch`,
 `editQueueItem`, `publishQueueItem`, `setQueueStatus`, `deleteQueueItem`,
-`resolveSending`, `deletePublishedPost`, `getRewriteLog`.
+`resolveSending`, `deletePublishedPost`, `getRewriteLog`,
+`getRewriteAnalytics`, `listScheduled`, `saveScheduledCampaign`,
+`saveScheduledItem`, `deleteScheduledCampaign`, `deleteScheduledItem`,
+`setScheduledCampaignStatus`, `scheduledSkipNext`, `scheduledSendNext`,
+`scheduledSendItem`, `scheduledResetItem`, `listAiControlPlane`,
+`saveAiProvider`, `deleteAiProvider`, `saveAiActionRoutes`, `listAiAttempts`,
+`testAiProviderConnection`, `testAiAction`.
 
 - **`setCronSchedule`** — validates against the whitelist
   (`*`, `*/2`, `*/5`, `*/10`, `*/15`), calls the SQL RPC to re-arm the
@@ -930,8 +1052,16 @@ Edge functions are additionally verified by esbuild bundling
 - **PostgREST + new RPCs**: any migration creating an RPC function needs a
   PostgREST schema reload (`NOTIFY pgrst, 'reload schema'`) — the migration
   runner does this automatically now; ad-hoc SQL must do it itself.
-- `sendTestMessage` and `clearQueue` remain in the `admin` API; `clearQueue`
-  has no button in the UI yet (reachable via the API only).
+- **Stop-everything recipe**: `clearQueue` is wired to the Inbox **Clear
+  queue** button (clears the queued backlog, optionally including breaking
+  items). Pause (`bot_paused`) blocks the cron cycle and every publish path
+  (including manual runs) and the `scheduled` function; there is no separate
+  "full stop" state — a total stop = Pause + Clear queue. A direct manual
+  "Fetch now" still fetches while paused (nothing is published).
+- **Surfaced failures**: cluster upsert failures (`PATCH`/`POST` on
+  `clusters`) and failed-send reservation-cleanup failures are now logged to
+  `activity_log` instead of being silently swallowed, so follow-up coverage
+  and retry-ability problems show up in the Overview feed / Inbox FAILED tab.
 - **Route files** (`src/routes/*`) are pinned by the workspace sync layer —
   edit them via terminal/git, not the file tools.
 - **Credential handling**: deployment credentials are process environment

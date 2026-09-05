@@ -15,7 +15,7 @@ export const PROVIDER_CATALOG = [
   { slug: "openrouter", label: "OpenRouter", kind: "openai_compatible", baseUrl: "https://openrouter.ai/api/v1", envKey: "OPENROUTER_API_KEY", defaultModel: "meta-llama/llama-3.3-70b-instruct" },
   { slug: "cloudflare", label: "Cloudflare Workers AI", kind: "cloudflare", baseUrl: "", envKey: "CLOUDFLARE_API_TOKEN", defaultModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" },
   { slug: "mistral", label: "Mistral", kind: "openai_compatible", baseUrl: "https://api.mistral.ai/v1", envKey: "MISTRAL_API_KEY", defaultModel: "mistral-small-latest" },
-  { slug: "gemini", label: "Google Gemini", kind: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", envKey: "GEMINI_API_KEY_1", defaultModel: "gemini-2.5-flash" },
+  { slug: "gemini", label: "Google Gemini", kind: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", envKey: "GEMINI_API_KEY_1", defaultModel: "gemini-3.5-flash-lite" },
   { slug: "cerebras", label: "Cerebras", kind: "openai_compatible", baseUrl: "https://api.cerebras.ai/v1", envKey: "CEREBRAS_API_KEY", defaultModel: "llama-3.3-70b" },
   { slug: "openai", label: "OpenAI", kind: "openai_compatible", baseUrl: "https://api.openai.com/v1", envKey: "OPENAI_API_KEY", defaultModel: "gpt-4o-mini" },
   { slug: "minimax", label: "MiniMax", kind: "openai_compatible", baseUrl: "https://api.minimax.chat/v1", envKey: "MINIMAX_API_KEY", defaultModel: "MiniMax-M2" },

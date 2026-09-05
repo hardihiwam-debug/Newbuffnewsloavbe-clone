@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { adminApi } from "@/lib/adminApi";
 import { readStoredPin } from "@/routes/index";
-import { useNewsroomData } from "@/components/AppShell";
+import { useNewsroomData, refreshNewsroomData } from "@/components/AppShell";
 import {
   EmptyState,
   SectionTitle,
@@ -103,6 +103,7 @@ function Inbox() {
     try {
       await adminApi.setQueueStatus({ pin, id, status });
       toast.success(status === "rejected" ? "Rejected — removed from the queue" : status === "held" ? "Held for review" : "Requeued");
+      refreshNewsroomData();
     } catch (e) {
       onError(e);
     } finally {
@@ -123,6 +124,7 @@ function Inbox() {
     try {
       await adminApi.deleteQueueItem({ pin, id });
       toast.success("Deleted");
+      refreshNewsroomData();
     } catch (e) {
       setRemovedIds((prev) => {
         const next = new Set(prev);
@@ -159,7 +161,9 @@ function Inbox() {
         );
       else toast.info("Nothing to clear — queue is empty");
       setClearOpen(false);
-      // The dashboard re-polls every 5s, so the list refreshes on its own.
+      // Refresh immediately (not on the next 5-minute queue poll) so cleared
+      // rows and the summary counts update right away.
+      refreshNewsroomData();
     } catch (e) {
       toast.dismiss(t);
       onError(e);
@@ -181,6 +185,7 @@ function Inbox() {
         throw new Error(String(res?.error ?? res?.skipped ?? "Publish failed"));
       }
       toast.success("Published to all active chats");
+      refreshNewsroomData();
     } catch (e) {
       toast.dismiss(t);
       onError(e);
@@ -317,7 +322,7 @@ function Inbox() {
         </div>
       ) : null}
 
-      <EditQueueItemDialog item={editing} pin={pin} onClose={() => setEditing(null)} />
+      <EditQueueItemDialog item={editing} pin={pin} onClose={() => setEditing(null)} onSaved={() => refreshNewsroomData()} />
 
       {/* Clear queue: all vs. N lowest-score */}
       <AlertDialog open={clearOpen} onOpenChange={setClearOpen}>

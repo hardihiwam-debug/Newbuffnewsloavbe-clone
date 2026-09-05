@@ -2002,6 +2002,7 @@ export function cleanGeminiTranslation(raw: string): string {
 // and the MiniMax model id as surfaced in Settings → Translation model order.
 // Kept in sync with migration 0017's seed and the Settings page default.
 export const GEMINI_DIRECT_MODELS = [
+  "gemini-3.8-flash",
   "gemini-3.7-flash",
   "gemini-3.6-flash",
   "gemini-3.5-flash",

@@ -328,7 +328,7 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   eventSimilarityThreshold: 0.52,
   sendDelayMs: 3000,
   translationMode: "gemini_first",
-  translationModel: "google/gemini-1.5-flash-latest",
+  translationModel: "google/gemini-3.6-flash",
   pollsEnabled: true,
   pollsMaxPerHour: 1,
   pollsAutoCloseMinutes: 60,
@@ -1620,13 +1620,23 @@ async function testTranslationKey(p: { id: string }): Promise<unknown> {
 // Costs real Gemini quota: 18 calls per click (6 keys × 3 models). The promise
 // of the admin UI is to show exactly which (key, model) pairs are still
 // usable. The dashboard already shows a confirm-style button.
-async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
+async function testGeminiKeys(p: Record<string, unknown>): Promise<unknown> {
   const GEMINI_DIRECT_MODELS = [
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
   ];
+  // Optional model filter (e.g. { models: ["gemini-3.5-flash-lite"] }): the
+  // full 6-key × 4-model sweep paces at 13s/call ≈ 312s, which EXCEEDS the
+  // ~150s Supabase worker ceiling (the UI call 504s). A single-model sweep
+  // (6 calls ≈ 90s) fits, and per-key health on one live model is what the
+  // operator actually needs. Unknown names are silently dropped.
+  const requested = Array.isArray(p.models)
+    ? (p.models as unknown[]).map(String).filter((m) => GEMINI_DIRECT_MODELS.includes(m))
+    : [];
+  const modelsToTest = requested.length > 0 ? requested : GEMINI_DIRECT_MODELS;
   // Pace the live check under 5 RPM total (same global rule as the pipeline
   // translator): 13 seconds between request starts across all keys/models.
   const GEMINI_TEST_INTERVAL_MS = 13_000;
@@ -1654,7 +1664,7 @@ async function testGeminiKeys(_p: Record<string, unknown>): Promise<unknown> {
 
   for (const { index, key, email } of keys) {
     const models: Array<{ model: string; status: "ok" | "rate_limited" | "auth_error" | "error"; code: number; detail: string }> = [];
-    for (const model of GEMINI_DIRECT_MODELS) {
+    for (const model of modelsToTest) {
       let status: "ok" | "rate_limited" | "auth_error" | "error" = "error";
       let code = 0;
       let detail = "";

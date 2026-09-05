@@ -14,7 +14,7 @@
 //   - media scope v1: text + optional image (no video/buttons).
 
 import { INTERNAL_SECRET, SERVICE_KEY, SUPABASE_URL, TELEGRAM_BOT_TOKEN } from "../pipeline/config.ts";
-import { telegramCall } from "../pipeline/telegram.ts";
+import { DeliveryUnknownError, isDefinitiveTelegramFailure, isRateLimitFailure, telegramCall } from "../pipeline/telegram.ts";
 import { fitCaption } from "../pipeline/_shared.ts";
 import { computeDueItems, recurringNextDueMs, seriesPartDueMs, seriesTerminalStatus } from "./_shared.ts";
 
@@ -103,17 +103,6 @@ type ItemRow = {
 const CYCLE_BUDGET_MS = 90_000;
 const MAX_SENDS_PER_CYCLE = 12;
 
-class DeliveryUnknownError extends Error {
-  constructor(cause: unknown) {
-    super(`Telegram delivery outcome is unknown: ${cause instanceof Error ? cause.message : String(cause)}`);
-    this.name = "DeliveryUnknownError";
-  }
-}
-
-function isDefinitiveTelegramFailure(err: unknown): boolean {
-  return /Telegram .* \[(400|401|403|404|413)\]/i.test(err instanceof Error ? err.message : String(err));
-}
-
 // ── Send path ──────────────────────────────────────────────────────────────
 // Campaign content is sent EXACTLY as authored (no news-post template: no
 // footer, no source line, no "read more" link). HTML parse mode preserves any
@@ -125,6 +114,7 @@ async function sendText(chatId: number, token: string, body: string): Promise<vo
   try {
     await telegramCall("sendMessage", { chat_id: chatId, text: body, parse_mode: "HTML", disable_web_page_preview: false }, token);
   } catch (err) {
+    if (isRateLimitFailure(err)) throw err;
     if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
     // A known Telegram 4xx content error is safe to retry without HTML.
     await telegramCall("sendMessage", { chat_id: chatId, text: body, disable_web_page_preview: true }, token);
@@ -137,12 +127,14 @@ async function sendCampaignItem(chatId: number, token: string, body: string, ima
       await telegramCall("sendPhoto", { chat_id: chatId, photo: imageUrl, caption: fitCaption(body, 1024), parse_mode: "HTML" }, token);
       return;
     } catch (err) {
+      if (isRateLimitFailure(err)) throw err;
       if (!isDefinitiveTelegramFailure(err)) throw new DeliveryUnknownError(err);
       // A known 4xx parse/media error is safe to retry without HTML.
       try {
         await telegramCall("sendPhoto", { chat_id: chatId, photo: imageUrl, caption: fitCaption(body, 1024) }, token);
         return;
       } catch (retryErr) {
+        if (isRateLimitFailure(retryErr)) throw retryErr;
         if (!isDefinitiveTelegramFailure(retryErr)) throw new DeliveryUnknownError(retryErr);
         /* fall through to text */
       }

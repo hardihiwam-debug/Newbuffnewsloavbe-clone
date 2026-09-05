@@ -16,6 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import { adminApi } from "@/lib/adminApi";
 import { readStoredPin } from "@/routes/index";
+import { refreshNewsroomData } from "@/components/AppShell";
 import { useNewsroomData } from "@/components/AppShell";
 import { CategoryPill, StatusPill, clockTime, EmptyState, EDIT_CATEGORIES } from "@/components/newsroom";
 
@@ -64,6 +65,7 @@ function Review() {
       await adminApi.editQueueItem({ pin, id: rowId, headline, summary, category, breaking });
       toast.success("Story updated");
       setDirty(false);
+      refreshNewsroomData();
     } catch (e) {
       onError(e);
     } finally {
@@ -78,6 +80,7 @@ function Review() {
     try {
       await adminApi.setQueueStatus({ pin, id: rowId, status });
       toast.success(status === "held" ? "Held — excluded from auto-publish" : status === "rejected" ? "Rejected — removed from queue" : "Requeued");
+      refreshNewsroomData();
       navigate({ to: "/inbox" });
     } catch (e) {
       onError(e);
@@ -99,6 +102,7 @@ function Review() {
         throw new Error(String(res?.error ?? res?.skipped ?? "Publish failed"));
       }
       toast.success("Published to all active chats");
+      refreshNewsroomData();
       navigate({ to: "/published" });
     } catch (e) {
       toast.dismiss(t);

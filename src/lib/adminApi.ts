@@ -262,7 +262,7 @@ export const adminApi = {
 export const adminActionsApi = {
   testAiProviderConnection: (args: { pin: string; providerId: string }) =>
     callAdmin<Record<string, unknown>>("testAiProviderConnection", args),
-  testAiAction: (args: { pin: string; action: string; providerIds?: string[]; input?: Record<string, unknown> }) =>
+  testAiAction: (args: { pin: string; aiAction: string; providerIds?: string[]; input?: Record<string, unknown> }) =>
     callAdmin<Record<string, unknown>>("testAiAction", args),
   listTranslationModels: (args: { pin: string }) =>
     callAdmin<{ supported: string[]; current: string; models: string[] }>(

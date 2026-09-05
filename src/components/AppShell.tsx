@@ -48,7 +48,7 @@ const MORE_ITEMS = [
 // The shell badge, bot status and every page read the same live payload from
 // the shared NewsroomProvider (one set of fetches on per-resource cadences,
 // instead of every mounted component polling the whole dashboard).
-export { useNewsroomData } from "@/lib/newsroomStore";
+export { useNewsroomData, refreshNewsroomData } from "@/lib/newsroomStore";
 
 export function AppShell({ children }: { children?: ReactNode }) {
   return (

@@ -7,7 +7,7 @@ import { api, useAdminAction, useAdminMutation, useAdminQuery } from "@/lib/supa
 import { adminApi } from "@/lib/adminApi";
 import { isSupabaseConfigured } from "@/lib/supabase";
 import { readStoredPin, clearStoredPin } from "@/routes/index";
-import { useNewsroomData } from "@/components/AppShell";
+import { useNewsroomData, refreshNewsroomData } from "@/components/AppShell";
 import { ConfirmAction, Kpi, StoryCard, SectionTitle, EmptyState, relTime, clockTime } from "@/components/newsroom";
 import { EditQueueItemDialog } from "@/components/newsroom";
 
@@ -145,6 +145,7 @@ function Overview() {
         throw new Error(String(res?.error ?? res?.skipped ?? "Publish failed"));
       }
       toast.success("Published to all active chats");
+      refreshNewsroomData();
     } catch (e) {
       toast.dismiss(id);
       toast.error(e instanceof Error ? e.message : "Publish failed");
@@ -340,7 +341,7 @@ function Overview() {
       {/* ── Pipeline run progress (live) ────────────── */}
       <PipelineProgress run={(s as any).pipelineRun} />
 
-      <EditQueueItemDialog item={editing} pin={pin} onClose={() => setEditing(null)} />
+      <EditQueueItemDialog item={editing} pin={pin} onClose={() => setEditing(null)} onSaved={() => refreshNewsroomData()} />
 
       {/* Preview dialog */}
       <PreviewDialog open={previewOpen} onOpenChange={setPreviewOpen} preview={preview} />

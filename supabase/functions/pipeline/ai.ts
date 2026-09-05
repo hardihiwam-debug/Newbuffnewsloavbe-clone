@@ -221,8 +221,10 @@ async function routedProviders(action: string): Promise<RoutedProvider[] | null>
 // Cloudflare → OpenRouter (:free). First usable response wins; order is by
 // measured latency + free-tier generosity. Groq retired llama-3.3-70b — its
 // current text model is openai/gpt-oss-20b (verified against /models on this
-// key). Gemini 2.5-flash sits second so a quota-killed Groq hands the load to
-// a FAST provider, not Mistral's slower free tier. OpenRouter runs a :free
+// key). Gemini 3.5-flash-lite sits second so a quota-killed Groq hands the
+// load to a FAST provider, not Mistral's slower free tier. (gemini-2.5-flash
+// was the prior fallback; Google retired it — 2.5 Flash shuts down Oct 2026,
+// so the chain targets the current 3.x flash catalog.) OpenRouter runs a :free
 // model verified live 2026-08-19 (accepts response_format json_object).
 // Test hook: unit tests inject a stub provider list so they never depend on
 // which env happened to be visible when config.ts was first evaluated.
@@ -238,7 +240,7 @@ function rewriteProviders(action = "rewrite"): ProviderSpec[] {
   if (GROQ_API_KEY) providers.push({ name: "groq", url: "https://api.groq.com/openai/v1/chat/completions", key: GROQ_API_KEY, model: "openai/gpt-oss-20b" });
   const gKeys = geminiKeys();
   if (gKeys.length > 0) {
-    providers.push({ name: "gemini", url: `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`, key: gKeys[0]!.key, model: "gemini-2.5-flash" });
+    providers.push({ name: "gemini", url: `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`, key: gKeys[0]!.key, model: "gemini-3.5-flash-lite" });
   }
   if (MISTRAL_API_KEY) providers.push({ name: "mistral", url: "https://api.mistral.ai/v1/chat/completions", key: MISTRAL_API_KEY, model: "mistral-small-latest" });
   if (CLOUDFLARE_API_TOKEN && CLOUDFLARE_ACCOUNT_ID) providers.push({ name: "cloudflare", url: `https://api.cloudflare.com/client/v4/accounts/${enc(CLOUDFLARE_ACCOUNT_ID)}/ai/v1/chat/completions`, key: CLOUDFLARE_API_TOKEN, model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast" });
